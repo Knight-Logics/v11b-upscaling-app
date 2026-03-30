@@ -29,7 +29,9 @@ from pathlib import Path
 from queue import Empty, Queue
 from tkinter import BOTH, END, LEFT, RIGHT, W, X, Y, NW, filedialog, messagebox, simpledialog
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+import http.server
+import socketserver
+from urllib.parse import urlencode, urlparse, parse_qs
 from urllib.request import Request, urlopen
 import tkinter as tk
 from tkinter import ttk
@@ -49,6 +51,22 @@ try:
 except ImportError:
     stripe = None
     STRIPE_AVAILABLE = False
+
+try:
+    import certifi
+
+    CERTIFI_AVAILABLE = True
+except ImportError:
+    certifi = None
+    CERTIFI_AVAILABLE = False
+
+try:
+    import webview
+
+    WEBVIEW_AVAILABLE = True
+except Exception:
+    webview = None
+    WEBVIEW_AVAILABLE = False
 
 try:
     from PIL import Image, ImageDraw, ImageTk
@@ -94,13 +112,219 @@ ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "mediu
 IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
 TOKEN_PATTERN = re.compile(r"^v11b[-_][A-Za-z0-9]{12,128}$")
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Prefer bundled runtime files from PyInstaller extraction (_MEIPASS), then fall back
 # to the app folder when running from source or with sidecar tools.
 _APP_DIR: Path = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 _BUNDLE_DIR: Path = Path(getattr(sys, "_MEIPASS", _APP_DIR))
+
+
+def _persistent_data_dir() -> Path:
+    appdata_root = (os.environ.get("APPDATA") or "").strip()
+    if appdata_root:
+        data_dir = Path(appdata_root) / "KnightLogics" / "PixelForgeAI"
+    else:
+        data_dir = _APP_DIR / "user_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
+_PERSISTENT_DATA_DIR: Path = _persistent_data_dir()
+
+
+def _migrate_legacy_data_file(new_path: Path, legacy_candidates: list[Path]) -> None:
+    if new_path.exists():
+        return
+    for legacy_path in legacy_candidates:
+        if not legacy_path.exists() or not legacy_path.is_file():
+            continue
+        try:
+            new_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
+            return
+        except Exception:
+            continue
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return data
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            data[key] = value
+    return data
+
+
+def _upsert_env_file(path: Path, updates: dict[str, str]) -> None:
+    existing: dict[str, str] = _parse_env_file(path)
+    existing.update({k: str(v) for k, v in updates.items()})
+    lines = [
+        "# PixelForge AI billing/runtime config",
+        "# Auto-managed by Billing Debug / Test Mode",
+    ]
+    for key in sorted(existing.keys()):
+        lines.append(f"{key}={existing[key]}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _load_runtime_env_overrides() -> None:
+    appdata_root = Path(os.environ.get("APPDATA", "").strip()) if os.environ.get("APPDATA") else None
+    candidates: list[Path] = [
+        _APP_DIR / ".env",
+        _APP_DIR / "billing.env",
+    ]
+    if appdata_root:
+        candidates.extend(
+            [
+                appdata_root / "KnightLogics" / "shared_billing.env",
+                appdata_root / "KnightLogics" / "PixelForgeAI" / "billing.env",
+                appdata_root / "KnightLogics" / "PixelForgeAI" / "billing_dev.env",
+            ]
+        )
+
+    for candidate in candidates:
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        for key, value in _parse_env_file(candidate).items():
+            if key not in os.environ or not str(os.environ.get(key, "")).strip():
+                os.environ[key] = value
+
+
+def _env_first(keys: list[str], default: str = "") -> str:
+    for key in keys:
+        value = str(os.environ.get(key, "")).strip()
+        if value:
+            return value
+    return default
+
+
+def _env_is_truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_loopback_url(url: str) -> bool:
+    try:
+        parsed = urlparse((url or "").strip())
+    except Exception:
+        return False
+    return (parsed.hostname or "").strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+_load_runtime_env_overrides()
+
+# ---------------------------------------------------------------------------
+# Payment result HTML pages (served by local intercept server)
+# ---------------------------------------------------------------------------
+_PAYMENT_SUCCESS_HTML = b"""<!DOCTYPE html><html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Payment Successful</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:#0a1220;font-family:'Segoe UI',Arial,sans-serif;color:#e6f0ff;}
+  .card{background:#0e1c30;border:1px solid #2b4870;border-radius:16px;
+        padding:48px 60px;text-align:center;max-width:460px;box-shadow:0 8px 32px rgba(0,0,0,.4);}
+  .icon{font-size:64px;margin-bottom:16px;}
+  h1{font-size:26px;margin:0 0 12px;color:#7df6c7;}
+  p{color:#abd4ff;font-size:15px;margin:0 0 8px;line-height:1.6;}
+  .sub{color:#5a7aaa;font-size:13px;margin-top:20px;}
+</style></head>
+<body><div class="card">
+  <div class="icon">&#10003;</div>
+  <h1>Payment Successful!</h1>
+  <p>Your credits are being added to your account.</p>
+  <p>Return to <strong>PixelForge AI</strong> &mdash; it will confirm automatically.</p>
+  <p class="sub">You may close this window.</p>
+</div></body></html>"""
+
+_PAYMENT_CANCEL_HTML = b"""<!DOCTYPE html><html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Payment Cancelled</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:#0a1220;font-family:'Segoe UI',Arial,sans-serif;color:#e6f0ff;}
+  .card{background:#0e1c30;border:1px solid #2b4870;border-radius:16px;
+        padding:48px 60px;text-align:center;max-width:460px;box-shadow:0 8px 32px rgba(0,0,0,.4);}
+  .icon{font-size:64px;margin-bottom:16px;}
+  h1{font-size:24px;margin:0 0 12px;color:#f0c060;}
+  p{color:#abd4ff;font-size:15px;margin:0;line-height:1.6;}
+</style></head>
+<body><div class="card">
+  <div class="icon">&#8629;</div>
+  <h1>Payment Cancelled</h1>
+  <p>No charges were made.<br>Close this window and try again from PixelForge AI.</p>
+</div></body></html>"""
+
+
+class _PaymentResultServer:
+    """Tiny localhost HTTP server that intercepts the Stripe checkout redirect.
+
+    Stripe redirects to http://127.0.0.1:<port>/payment_success?session_id=...
+    after a successful payment. The server serves a nice HTML page in the checkout
+    window and queues the session_id back to the main app for auto-confirmation.
+    """
+
+    def __init__(self) -> None:
+        self.result_queue: Queue[dict] = Queue()
+        self._server: socketserver.TCPServer | None = None
+        self._thread: threading.Thread | None = None
+        self.port: int = 0
+
+    def start(self) -> int:
+        """Start the server in a daemon thread. Returns the bound port."""
+        result_queue = self.result_queue
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                try:
+                    parsed = urlparse(self.path)
+                    qs = parse_qs(parsed.query)
+                    if parsed.path == "/payment_success":
+                        session_id = (qs.get("session_id", [""])[0] or "").strip()
+                        result_queue.put({"status": "success", "session_id": session_id})
+                        body = _PAYMENT_SUCCESS_HTML
+                    elif parsed.path == "/payment_cancel":
+                        result_queue.put({"status": "cancel"})
+                        body = _PAYMENT_CANCEL_HTML
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception:
+                    pass
+
+            def log_message(self, *args: object) -> None:
+                pass  # suppress server stdout
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+        srv.allow_reuse_address = True
+        self._server = srv
+        self.port = srv.server_address[1]
+        self._thread = threading.Thread(target=srv.serve_forever, name="payment-result-server", daemon=True)
+        self._thread.start()
+        return self.port
+
+    def stop(self) -> None:
+        try:
+            if self._server:
+                self._server.shutdown()
+        except Exception:
+            pass
 
 
 def _resolve_runtime_path(relative_path: str) -> Path:
@@ -115,6 +339,62 @@ def _resolve_runtime_path(relative_path: str) -> Path:
 
 _REALESRGAN_EXE: Path = _resolve_runtime_path("realesrgan-ncnn-vulkan.exe")
 _REALESRGAN_MODELS_DIR: Path = _resolve_runtime_path("models")
+
+
+def _configure_stripe_tls_bundle() -> None:
+    if not STRIPE_AVAILABLE:
+        return
+
+    candidates: list[Path] = []
+    if CERTIFI_AVAILABLE:
+        try:
+            candidates.append(Path(certifi.where()))
+        except Exception:
+            pass
+
+    candidates.extend(
+        [
+            _resolve_runtime_path("stripe/data/ca-certificates.crt"),
+            _resolve_runtime_path("certifi/cacert.pem"),
+            _APP_DIR / "ca-certificates.crt",
+            _APP_DIR / "cacert.pem",
+        ]
+    )
+
+    for candidate in candidates:
+        try:
+            if candidate and candidate.exists() and candidate.is_file():
+                stripe.ca_bundle_path = str(candidate)
+                os.environ["SSL_CERT_FILE"] = str(candidate)
+                return
+        except Exception:
+            continue
+
+
+def _run_checkout_window_only(checkout_url: str) -> int:
+    url = (checkout_url or "").strip()
+    if not url:
+        print("[ERROR] Missing checkout URL for checkout-window mode.")
+        return 2
+    if not WEBVIEW_AVAILABLE:
+        print("[ERROR] pywebview runtime is unavailable in checkout-window mode.")
+        return 3
+    try:
+        webview.create_window("PixelForge AI Checkout", url, width=1100, height=820, min_size=(900, 680))
+        webview.start(debug=False, private_mode=False)
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] Failed to open checkout window: {exc}")
+        return 1
+
+
+def _get_checkout_window_arg(argv: list[str]) -> str | None:
+    if len(argv) >= 3 and argv[1] == "--checkout-window":
+        return argv[2]
+    for arg in argv[1:]:
+        if arg.startswith("--checkout-window="):
+            return arg.split("=", 1)[1]
+    return None
 
 
 def is_valid_paid_access_token(token: str) -> bool:
@@ -408,20 +688,70 @@ class BillingStore:
 class EmbeddedBillingBackend:
     def __init__(self, store: BillingStore):
         self.store = store
-        self.stripe_secret_key = (os.environ.get("V11B_STRIPE_SECRET_KEY") or os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+        _configure_stripe_tls_bundle()
+        self.stripe_secret_key = _env_first(
+            [
+                "V11B_STRIPE_SECRET_KEY",
+                "STRIPE_SECRET_KEY",
+                "PIXELFORGE_STRIPE_SECRET_KEY",
+                "VIDEOFORGE_STRIPE_SECRET_KEY",
+                "DISPLAY_CONTROL_PLUS_STRIPE_SECRET_KEY",
+                "KNIGHTLOGICS_STRIPE_SECRET_KEY",
+            ]
+        )
+        success_url_default = "https://knightlogics.com/?v11b_payment=success&session_id={CHECKOUT_SESSION_ID}"
+        cancel_url_default = "https://knightlogics.com/?v11b_payment=cancel"
         self.success_url = (
-            os.environ.get("V11B_STRIPE_SUCCESS_URL")
-            or os.environ.get("STRIPE_SUCCESS_URL")
-            or "https://knightlogics.com/?v11b_payment=success&session_id={CHECKOUT_SESSION_ID}"
+            _env_first(
+                [
+                    "V11B_STRIPE_SUCCESS_URL",
+                    "STRIPE_SUCCESS_URL",
+                    "PIXELFORGE_STRIPE_SUCCESS_URL",
+                    "VIDEOFORGE_STRIPE_SUCCESS_URL",
+                    "DISPLAY_CONTROL_PLUS_STRIPE_SUCCESS_URL",
+                ],
+                success_url_default,
+            )
         ).strip()
         self.cancel_url = (
-            os.environ.get("V11B_STRIPE_CANCEL_URL")
-            or os.environ.get("STRIPE_CANCEL_URL")
-            or "https://knightlogics.com/?v11b_payment=cancel"
+            _env_first(
+                [
+                    "V11B_STRIPE_CANCEL_URL",
+                    "STRIPE_CANCEL_URL",
+                    "PIXELFORGE_STRIPE_CANCEL_URL",
+                    "VIDEOFORGE_STRIPE_CANCEL_URL",
+                    "DISPLAY_CONTROL_PLUS_STRIPE_CANCEL_URL",
+                ],
+                cancel_url_default,
+            )
         ).strip()
-        self.currency = (os.environ.get("V11B_STRIPE_CURRENCY") or os.environ.get("STRIPE_CURRENCY") or "usd").strip().lower()
-        self.price_per_credit_cents = max(1, int(os.environ.get("V11B_PRICE_PER_CREDIT_CENTS", os.environ.get("STRIPE_PRICE_1_CREDIT_CENTS", "28"))))
-        self.max_checkout_credits = max(1, int(os.environ.get("V11B_MAX_CHECKOUT_CREDITS", os.environ.get("MAX_CHECKOUT_CREDITS", "500"))))
+        self.allow_loopback_redirect_urls = _env_is_truthy(
+            _env_first(["V11B_STRIPE_ALLOW_LOCALHOST_URLS", "STRIPE_ALLOW_LOCALHOST_URLS"], "0")
+        )
+        if not self.allow_loopback_redirect_urls:
+            if _is_loopback_url(self.success_url):
+                self.success_url = success_url_default
+            if _is_loopback_url(self.cancel_url):
+                self.cancel_url = cancel_url_default
+        self.stripe_mode = "test" if self.stripe_secret_key.startswith("sk_test_") else "live"
+        self.currency = _env_first(["V11B_STRIPE_CURRENCY", "STRIPE_CURRENCY", "PIXELFORGE_STRIPE_CURRENCY"], "usd").lower()
+        self.price_per_credit_cents = max(
+            1,
+            int(
+                _env_first(
+                    [
+                        "V11B_PRICE_PER_CREDIT_CENTS",
+                        "STRIPE_PRICE_1_CREDIT_CENTS",
+                        "PIXELFORGE_PRICE_PER_CREDIT_CENTS",
+                    ],
+                    "28",
+                )
+            ),
+        )
+        self.max_checkout_credits = max(
+            1,
+            int(_env_first(["V11B_MAX_CHECKOUT_CREDITS", "MAX_CHECKOUT_CREDITS", "PIXELFORGE_MAX_CHECKOUT_CREDITS"], "500")),
+        )
         if STRIPE_AVAILABLE and self.stripe_secret_key:
             stripe.api_key = self.stripe_secret_key
 
@@ -437,6 +767,8 @@ class EmbeddedBillingBackend:
         credits: int,
         charge_cents: int | None = None,
         package_name: str | None = None,
+        success_url_override: str | None = None,
+        cancel_url_override: str | None = None,
     ) -> dict:
         if not self.stripe_configured():
             raise RuntimeError("Stripe is not configured in this app environment yet.")
@@ -456,8 +788,8 @@ class EmbeddedBillingBackend:
 
         session = stripe.checkout.Session.create(
             mode="payment",
-            success_url=self.success_url,
-            cancel_url=self.cancel_url,
+            success_url=success_url_override or self.success_url,
+            cancel_url=cancel_url_override or self.cancel_url,
             client_reference_id=token[:200],
             line_items=[
                 {
@@ -486,12 +818,25 @@ class EmbeddedBillingBackend:
         if not self.stripe_configured():
             raise RuntimeError("Stripe is not configured in this app environment yet.")
         session = stripe.checkout.Session.retrieve(session_id)
-        if session.get("payment_status") != "paid":
+
+        def _field(obj, key: str, default=None):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            try:
+                return getattr(obj, key)
+            except Exception:
+                return default
+
+        payment_status = str(_field(session, "payment_status", "") or "").strip().lower()
+        if payment_status != "paid":
             raise RuntimeError("Checkout session is not paid yet.")
-        metadata = session.get("metadata") or {}
-        token = str(metadata.get("token") or session.get("client_reference_id") or "").strip()
+
+        metadata_raw = _field(session, "metadata", {}) or {}
+        metadata = metadata_raw if isinstance(metadata_raw, dict) else dict(metadata_raw)
+        token = str(metadata.get("token") or _field(session, "client_reference_id", "") or "").strip()
         credits = int(metadata.get("credits") or "0")
-        already_processed, balance = self.store.apply_purchase_once(str(session.get("id") or ""), token, credits)
+        purchase_id = str(_field(session, "id", "") or "")
+        already_processed, balance = self.store.apply_purchase_once(purchase_id, token, credits)
         return {
             "ok": True,
             "session_id": session_id,
@@ -1129,43 +1474,7 @@ class PipelineRunner:
             output_frame_count = 0
 
         output_size_mb = output_path.stat().st_size / (1024 * 1024)
-        report_payload = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "input": str(input_path),
-            "output": str(output_path),
-            "settings": {
-                "model": self.settings.model,
-                "scale": self.settings.scale,
-                "image_format": self.settings.image_format,
-                "threads": self.settings.threads,
-                "interpolation": bool(self.settings.enable_interpolation),
-                "target_fps": int(self.settings.target_fps),
-                "encode_preset": self.settings.encode_preset,
-                "crf": int(self.settings.crf),
-                "include_audio": bool(self.settings.include_audio),
-            },
-            "timing": {
-                "work_duration_seconds": round(float(work_duration), 6),
-                "output_duration_seconds": round(float(output_duration), 6),
-                "duration_drift_seconds": round(float(duration_drift), 6),
-                "duration_drift_percent": round(float(duration_drift_pct), 4),
-                "effective_source_fps": round(float(effective_source_fps), 6),
-                "output_fps": round(float(output_fps), 6),
-            },
-            "frames": {
-                "initial_estimated": int(initial_frame_count),
-                "extracted": int(frame_count),
-                "output_count": int(output_frame_count),
-            },
-            "output_size_mb": round(float(output_size_mb), 4),
-            "stage_weights": {str(k): round(float(v), 6) for k, v in self.stage_weight_map.items()},
-        }
-        report_path = output_path.with_suffix(output_path.suffix + ".v11b_report.json")
-        try:
-            report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
-            self.log(f"Run report: {report_path}")
-        except Exception as exc:
-            self.log(f"[WARN] Could not write run report: {exc}")
+        self.log("[INFO] Run report sidecar output is disabled.")
 
         self.log("=" * 78)
         self.log("Completed successfully")
@@ -1206,9 +1515,11 @@ class V11BApp(tk.Tk):
         self.compare_photo_large: ImageTk.PhotoImage | None = None
         self.header_logo_photo: tk.PhotoImage | None = None
         self.knightlogics_logo_photo: tk.PhotoImage | None = None
+        self.header_registration_label: tk.Label | None = None
         self.window_icon_photo: tk.PhotoImage | None = None
         self.compare_window: tk.Toplevel | None = None
         self.billing_window: tk.Toplevel | None = None
+        self.billing_debug_window: tk.Toplevel | None = None
         self.compare_canvas_large: tk.Canvas | None = None
         self._estimate_after_id: str | None = None
         self._compare_after_id: str | None = None
@@ -1225,6 +1536,11 @@ class V11BApp(tk.Tk):
         self._system_profile_cache: dict[str, object] | None = None
         self._system_detection_started: bool = False
         self._update_check_after_id: str | None = None
+        self._backup_email_prompt_shown_this_session: bool = False
+        self._backup_email_prompt_active: bool = False
+        self._checkout_pending: bool = False
+        self._payment_poll_id: str | None = None
+        self._payment_result_server: _PaymentResultServer | None = None
         self.stage_timing_profile_file = Path(__file__).with_name("v11b_stage_timing_profile.json")
         self.stage_timing_profile = self._load_stage_timing_profile()
 
@@ -1233,28 +1549,56 @@ class V11BApp(tk.Tk):
         self.selected_speed_profile: str = "balanced"
         self.selected_upscaling_profile: str = "animation"
 
+        self.app_data_dir = _PERSISTENT_DATA_DIR
+        self.billing_tokens_file = self.app_data_dir / "pixelforge_billing_tokens.json"
+        self.billing_audit_file = self.app_data_dir / "pixelforge_billing_audit.jsonl"
+        self.billing_state_file = self.app_data_dir / "pixelforge_billing_state.json"
+        _migrate_legacy_data_file(
+            self.billing_tokens_file,
+            [
+                Path(__file__).with_name("v11b_billing_tokens.json"),
+                _APP_DIR / "v11b_billing_tokens.json",
+            ],
+        )
+        _migrate_legacy_data_file(
+            self.billing_audit_file,
+            [
+                Path(__file__).with_name("v11b_billing_audit.jsonl"),
+                _APP_DIR / "v11b_billing_audit.jsonl",
+            ],
+        )
+        _migrate_legacy_data_file(
+            self.billing_state_file,
+            [
+                Path(__file__).with_name("v11b_billing_state.json"),
+                _APP_DIR / "v11b_billing_state.json",
+            ],
+        )
+
         self.billing_store = BillingStore(
-            Path(__file__).with_name("v11b_billing_tokens.json"),
-            Path(__file__).with_name("v11b_billing_audit.jsonl"),
+            self.billing_tokens_file,
+            self.billing_audit_file,
         )
         self.billing_backend = EmbeddedBillingBackend(self.billing_store)
         self.free_trial_credits = max(0, int(os.environ.get("V11B_FREE_TRIAL_CREDITS", "10")))
-
-        self.smtp_host = (os.environ.get("V11B_SMTP_HOST") or os.environ.get("SMTP_HOST") or "").strip()
-        self.smtp_port = int(os.environ.get("V11B_SMTP_PORT", os.environ.get("SMTP_PORT", "587")))
-        self.smtp_user = (os.environ.get("V11B_SMTP_USER") or os.environ.get("SMTP_USER") or "").strip()
-        self.smtp_pass = (os.environ.get("V11B_SMTP_PASS") or os.environ.get("SMTP_PASS") or "").strip()
-        self.smtp_from = (os.environ.get("V11B_SMTP_FROM") or os.environ.get("SMTP_FROM") or "").strip()
-        self.smtp_configured = bool(self.smtp_host and self.smtp_user and self.smtp_pass and self.smtp_from)
+        self.smtp_host = ""
+        self.smtp_port = 587
+        self.smtp_user = ""
+        self.smtp_pass = ""
+        self.smtp_from = ""
+        self.smtp_configured = False
+        self._refresh_smtp_config()
 
         self._build_variables()
         self._configure_theme()
         self._configure_window_icons()
         self._build_ui()
+        self._configure_window_icons()
         self._fit_window_to_content()
         self._start_system_detection()
         self.after(120, self._poll_log_queue)
         self.after(1200, self._start_update_checks)
+        self.after(1800, self._prompt_backup_email_on_login)
 
     def _set_initial_window_size(self) -> None:
         screen_w = self.winfo_screenwidth()
@@ -1353,6 +1697,14 @@ class V11BApp(tk.Tk):
         self.checkout_url_var = tk.StringVar(value="")
         self.checkout_amount_cents_override: int | None = None
         self.checkout_package_name_override: str = ""
+        self.debug_dev_bypass_var = tk.BooleanVar(
+            value=_env_is_truthy(_env_first(["V11B_DEV_MODE", "PIXELFORGE_DEV_MODE"], "0"))
+        )
+        self.debug_stripe_mode_var = tk.StringVar(value=f"mode={getattr(self.billing_backend, 'stripe_mode', 'unknown')}")
+        self.debug_key_hint_var = tk.StringVar(value="key=not loaded")
+        self.debug_smtp_status_var = tk.StringVar(value="smtp=unknown")
+        self.header_registration_var = tk.StringVar(value="X Not Registered")
+        self._header_email_registered: bool = False
         self.billing_status_var = tk.StringVar(value="Billing: Ready. Select a package and click Start Checkout.")
         self.available_credits_var = tk.StringVar(value="0")
         self.credit_quote_var = tk.StringVar(value="Render cost: select an input video to estimate credits.")
@@ -1372,7 +1724,6 @@ class V11BApp(tk.Tk):
         self._advanced_window_snapshot: dict[str, object] | None = None
         self._advanced_window_previous_override_state = False
 
-        self.billing_state_file = Path(__file__).with_name("v11b_billing_state.json")
         self._load_billing_state()
         if not self.billing_token_var.get().strip():
             self.billing_token_var.set(self._generate_billing_token())
@@ -1550,9 +1901,11 @@ class V11BApp(tk.Tk):
         self._build_footer(top)
 
     def _configure_window_icons(self) -> None:
-        icon_base = Path(__file__).with_name("assets") / "icons"
+        icon_base = _resolve_runtime_path("assets/icons")
         icon_ico_candidates = [
             icon_base / "pixelforge_app.ico",
+            _resolve_runtime_path("pixelforge_app.ico"),
+            _APP_DIR / "assets" / "icons" / "pixelforge_app.ico",
         ]
         for ico_path in icon_ico_candidates:
             if not ico_path.exists():
@@ -1572,6 +1925,7 @@ class V11BApp(tk.Tk):
         self.window_icon_photo = self._load_logo_photo(icon_photo_candidates, max_width=64, max_height=64)
         if self.window_icon_photo is not None:
             try:
+                self.iconphoto(False, self.window_icon_photo)
                 self.iconphoto(True, self.window_icon_photo)
             except Exception:
                 pass
@@ -1600,6 +1954,72 @@ class V11BApp(tk.Tk):
                 continue
         return None
 
+    def _set_header_registration_state(self, is_registered: bool, linked_email: str = "") -> None:
+        self._header_email_registered = bool(is_registered)
+        if linked_email:
+            self.recovery_email_var.set(linked_email)
+
+        if self._header_email_registered:
+            self.header_registration_var.set("✓ Registered")
+        else:
+            self.header_registration_var.set("X Not Registered")
+
+        if self.header_registration_label is None:
+            return
+
+        if self._header_email_registered:
+            self.header_registration_label.configure(
+                fg="#39d98a",
+                cursor="arrow",
+                font=("Segoe UI", 8, "bold"),
+            )
+            self.header_registration_label.unbind("<Button-1>")
+        else:
+            self.header_registration_label.configure(
+                fg="#ff6b6b",
+                cursor="hand2",
+                font=("Segoe UI", 8, "underline"),
+            )
+            self.header_registration_label.bind("<Button-1>", self._manual_register_email_from_header)
+
+    def _manual_register_email_from_header(self, _event=None) -> None:
+        token = self.billing_token_var.get().strip()
+        if not token:
+            token = self._generate_billing_token()
+            self.billing_token_var.set(token)
+
+        if not is_valid_paid_access_token(token):
+            messagebox.showwarning(
+                "Invalid Token",
+                "Generate or enter a valid access token first, then register your email.",
+            )
+            return
+
+        parent = self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self
+        default_email = self.recovery_email_var.get().strip()
+        email = simpledialog.askstring(
+            "Register Email",
+            "Enter your email to register this account for restore/recovery:",
+            initialvalue=default_email,
+            parent=parent,
+        )
+        if email is None:
+            return
+
+        normalized = self._normalize_email(email)
+        if not normalized:
+            messagebox.showwarning("Email Required", "Enter a valid email address.", parent=parent)
+            return
+
+        self.recovery_email_var.set(normalized)
+        ok, msg = self._link_email_to_current_token(email_override=normalized, show_feedback=False)
+        if not ok:
+            messagebox.showwarning("Registration Failed", msg, parent=parent)
+            return
+
+        self._set_header_registration_state(True, normalized)
+        messagebox.showinfo("Registered", "Email registered successfully for this account.", parent=parent)
+
     def _build_app_header(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent, style="Panel.TFrame")
         header.pack(fill=X)
@@ -1612,7 +2032,6 @@ class V11BApp(tk.Tk):
             Path(__file__).with_name("assets") / "icons" / "pixelforge_logo_header_cropped.png",
             Path(__file__).with_name("assets") / "pixelforge_logo.png",
             Path(__file__).with_name("pixelforge_logo.png"),
-            Path(r"E:\ZIP BACKUPS\.github\projects\ChatGPT Image Mar 29, 2026, 10_49_58 AM.png"),
         ]
         self.header_logo_photo = self._load_logo_photo(logo_candidates, max_width=250, max_height=78)
         if self.header_logo_photo is not None:
@@ -1656,7 +2075,6 @@ class V11BApp(tk.Tk):
 
         knight_logo_candidates = [
             Path(__file__).with_name("knightlogics-logo.png"),
-            Path(r"E:\YouTube Backups\AutoTop5_Showcase_App\static\knightlogics-logo.png"),
         ]
         self.knightlogics_logo_photo = self._load_logo_photo(knight_logo_candidates, max_width=22, max_height=20)
         if self.knightlogics_logo_photo is not None:
@@ -1682,6 +2100,19 @@ class V11BApp(tk.Tk):
             font=("Segoe UI", 8),
             anchor="e",
         ).pack(anchor="e", pady=(1, 0))
+
+        self.header_registration_label = tk.Label(
+            built_by,
+            textvariable=self.header_registration_var,
+            fg="#ff6b6b",
+            bg="#111b2f",
+            font=("Segoe UI", 8, "underline"),
+            anchor="e",
+            cursor="hand2",
+        )
+        self.header_registration_label.pack(anchor="e", pady=(1, 0))
+
+        self._set_header_registration_state(self._header_email_registered, self.recovery_email_var.get().strip())
 
         ttk.Separator(parent).pack(fill=X, pady=(6, 0))
 
@@ -2865,6 +3296,7 @@ class V11BApp(tk.Tk):
         token = self.billing_token_var.get().strip()
         if not token:
             self.available_credits_var.set("0")
+            self._set_header_registration_state(False)
             if not silent:
                 self.billing_status_var.set("Billing: generate or enter a token first.")
             return
@@ -2880,14 +3312,58 @@ class V11BApp(tk.Tk):
             credits = int(status.get("credits", 0) or 0)
             paid = int(status.get("paid_credits", 0) or 0)
             trial = int(status.get("free_trial_remaining", 0) or 0)
+            email_linked = bool(status.get("email_linked", False))
+            linked_email = str(status.get("linked_email") or "").strip()
+            self._set_header_registration_state(email_linked, linked_email)
             self.available_credits_var.set(str(credits))
             self.billing_status_var.set(
                 f"Billing: token {token[:12]}... has {credits} credits available (paid: {paid}, trial: {trial})."
             )
         except Exception as exc:
             self.available_credits_var.set("--")
+            self._set_header_registration_state(False)
             if not silent:
                 self.billing_status_var.set(f"Billing status check failed: {exc}")
+
+    def _prompt_backup_email_on_login(self) -> None:
+        self._maybe_prompt_backup_email(trigger="login")
+
+    def _maybe_prompt_backup_email(self, trigger: str = "manual") -> None:
+        if self._backup_email_prompt_shown_this_session or self._backup_email_prompt_active:
+            return
+
+        token = self.billing_token_var.get().strip()
+        if not token or not is_valid_paid_access_token(token):
+            return
+
+        status: dict = {}
+        try:
+            if self._use_embedded_billing():
+                status = self.billing_backend.get_status(token)
+            else:
+                url = self._billing_endpoint("/api/billing/status") + "?" + urlencode({"token": token})
+                request = Request(url, method="GET")
+                with urlopen(request, timeout=15) as response:
+                    status = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+        except Exception as exc:
+            self.log_queue.put(f"[WARN] Backup email prompt status check failed: {exc}")
+            return
+
+        credits = int(status.get("credits", 0) or 0)
+        email_linked = bool(status.get("email_linked", False))
+        linked_email = str(status.get("linked_email") or "").strip()
+        if linked_email:
+            self.recovery_email_var.set(linked_email)
+
+        if credits <= 10 or email_linked:
+            return
+
+        self._backup_email_prompt_shown_this_session = True
+        self._backup_email_prompt_active = True
+        try:
+            self._prompt_email_backup_after_purchase(trigger=trigger)
+        finally:
+            self._backup_email_prompt_active = False
 
     def _cleanup_output_if_canceled(self) -> None:
         if not self._stop_requested_by_user:
@@ -2918,16 +3394,19 @@ class V11BApp(tk.Tk):
         return (email or "").strip().lower()
 
     def _send_recovery_email(self, to_email: str, token: str) -> tuple[bool, str]:
+        # Reload env overrides first so newly saved billing.env values are picked up immediately.
+        _load_runtime_env_overrides()
+        self._refresh_smtp_config()
         if not self.smtp_configured:
             return False, "SMTP is not configured. Set V11B_SMTP_* env vars to enable email recovery."
         try:
             body = (
-                "Your v11b access code is:\n\n"
+                "Your PixelForge AI access code is:\n\n"
                 f"  {token}\n\n"
-                "Use Billing > Have an Access Code? to restore your account.\n"
+                "Use Access Codes -> Have an Access Code? to restore your account and credits on a reinstall.\n"
             )
             msg = MIMEText(body, "plain", "utf-8")
-            msg["Subject"] = "v11b Access Code Recovery"
+            msg["Subject"] = "PixelForge AI Access Code Backup"
             msg["From"] = self.smtp_from
             msg["To"] = to_email
             with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
@@ -2939,20 +3418,26 @@ class V11BApp(tk.Tk):
         except Exception as exc:
             return False, f"Failed to send recovery email: {exc}"
 
-    def _link_email_to_current_token(self) -> None:
+    def _link_email_to_current_token(self, email_override: str | None = None, show_feedback: bool = True) -> tuple[bool, str]:
         token = self.billing_token_var.get().strip()
-        email = self._normalize_email(self.recovery_email_var.get())
+        email_source = self.recovery_email_var.get() if email_override is None else email_override
+        email = self._normalize_email(email_source)
         if not token or not is_valid_paid_access_token(token):
-            messagebox.showwarning("Invalid Token", "A valid access token is required first.")
-            return
+            msg = "A valid access token is required first."
+            if show_feedback:
+                messagebox.showwarning("Invalid Token", msg)
+            return False, msg
         ok, msg = self.billing_store.link_email(token, email)
         if ok:
             self.billing_status_var.set(msg)
             self.log_queue.put(f"[INFO] {msg}")
+            self._set_header_registration_state(True, email)
             self._save_billing_state()
             self._refresh_billing_status(silent=True)
         else:
-            messagebox.showwarning("Email Link Failed", msg)
+            if show_feedback:
+                messagebox.showwarning("Email Link Failed", msg)
+        return ok, msg
 
     def _recover_access_code_by_email(self) -> None:
         email = self._normalize_email(self.recovery_email_var.get())
@@ -3124,32 +3609,395 @@ class V11BApp(tk.Tk):
         except URLError as exc:
             return 0, {"error": str(exc)}
 
-    def _open_checkout_window(self, checkout_url: str) -> None:
+    def _open_checkout_window(self, checkout_url: str) -> bool:
         url = checkout_url.strip()
         if not url:
             messagebox.showwarning("Missing URL", "No checkout URL is available.")
-            return
+            return False
 
-        webview_script = (
-            "import webview\n"
-            f"webview.create_window('v11b Checkout', {url!r}, width=1100, height=820, min_size=(900, 680))\n"
-            "webview.start(gui='edgechromium', debug=False, private_mode=False)\n"
-        )
-
-        if importlib.util.find_spec("webview") is None:
-            webbrowser.open(url)
-            self.log_queue.put("[WARN] pywebview not installed; checkout opened in browser.")
-            return
+        if not WEBVIEW_AVAILABLE:
+            messagebox.showerror(
+                "Checkout Unavailable",
+                "In-app checkout requires pywebview runtime, which is missing from this build.",
+            )
+            self.log_queue.put("[ERROR] In-app checkout unavailable: pywebview runtime missing.")
+            return False
 
         try:
-            subprocess.Popen([sys.executable, "-c", webview_script], creationflags=_NO_WINDOW)
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--checkout-window", url]
+            else:
+                cmd = [sys.executable, str(Path(__file__)), "--checkout-window", url]
+            subprocess.Popen(cmd, creationflags=_NO_WINDOW)
+            self.billing_status_var.set(
+                "Checkout opened in a new app window. Complete payment there, then return and click Confirm Payment."
+            )
             self.log_queue.put("[INFO] Checkout opened in app window (pywebview).")
-        except Exception:
-            webbrowser.open(url)
-            self.log_queue.put("[WARN] pywebview not available; checkout opened in browser.")
+            return True
+        except Exception as exc:
+            messagebox.showerror("Checkout Failed", f"Could not open in-app checkout window: {exc}")
+            self.log_queue.put(f"[ERROR] Could not open in-app checkout window: {exc}")
+            return False
 
     def _open_checkout_from_field(self) -> None:
         self._open_checkout_window(self.checkout_url_var.get())
+
+    @staticmethod
+    def _mask_secret_key(secret_key: str) -> str:
+        key = str(secret_key or "").strip()
+        if not key:
+            return "(missing)"
+        if len(key) <= 10:
+            return "*" * len(key)
+        return f"{key[:7]}...{key[-4:]}"
+
+    def _is_dev_bypass_enabled(self) -> bool:
+        return bool(self.debug_dev_bypass_var.get())
+
+    def _refresh_billing_debug_snapshot(self) -> None:
+        if not hasattr(self, "debug_stripe_mode_var"):
+            return
+        mode = getattr(self.billing_backend, "stripe_mode", "unknown")
+        secret = getattr(self.billing_backend, "stripe_secret_key", "")
+        self.debug_stripe_mode_var.set(f"mode={str(mode).upper()}")
+        self.debug_key_hint_var.set(f"key={self._mask_secret_key(secret)}")
+        self.debug_smtp_status_var.set("smtp=CONFIGURED" if self.smtp_configured else "smtp=MISSING (set V11B_SMTP_*)")
+
+    def _refresh_smtp_config(self) -> None:
+        self.smtp_host = _env_first(["V11B_SMTP_HOST", "PIXELFORGE_SMTP_HOST", "VIDEOFORGE_SMTP_HOST", "SMTP_HOST"])
+        try:
+            self.smtp_port = int(_env_first(["V11B_SMTP_PORT", "PIXELFORGE_SMTP_PORT", "VIDEOFORGE_SMTP_PORT", "SMTP_PORT"], "587"))
+        except Exception:
+            self.smtp_port = 587
+        self.smtp_user = _env_first(["V11B_SMTP_USER", "PIXELFORGE_SMTP_USER", "VIDEOFORGE_SMTP_USER", "SMTP_USER"])
+        self.smtp_pass = _env_first(["V11B_SMTP_PASS", "PIXELFORGE_SMTP_PASS", "VIDEOFORGE_SMTP_PASS", "SMTP_PASS"])
+        self.smtp_from = _env_first(["V11B_SMTP_FROM", "PIXELFORGE_SMTP_FROM", "VIDEOFORGE_SMTP_FROM", "SMTP_FROM"])
+        self.smtp_configured = bool(self.smtp_host and self.smtp_user and self.smtp_pass and self.smtp_from)
+
+        # If SMTP is still missing, try importing from a local VideoForge .env (same machine/dev setup).
+        if not self.smtp_configured:
+            self._try_import_smtp_from_videoforge_env(silent=True)
+
+    def _try_import_smtp_from_videoforge_env(self, silent: bool = False) -> bool:
+        configured_now = bool(self.smtp_host and self.smtp_user and self.smtp_pass and self.smtp_from)
+        if configured_now:
+            return True
+
+        custom_env_path = _env_first(["V11B_VIDEOFORGE_ENV_PATH"], "")
+        candidates: list[Path] = []
+        if custom_env_path:
+            candidates.append(Path(custom_env_path))
+
+        appdata_root = Path(os.environ.get("APPDATA", "").strip()) if os.environ.get("APPDATA") else None
+        if appdata_root:
+            candidates.append(appdata_root / "KnightLogics" / "shared_billing.env")
+        candidates.append(_APP_DIR / ".env")
+
+        vf_env = None
+        for path in candidates:
+            try:
+                if path.exists() and path.is_file():
+                    vf_env = path
+                    break
+            except Exception:
+                continue
+
+        if vf_env is None:
+            return False
+
+        data = _parse_env_file(vf_env)
+        host = str(data.get("SMTP_HOST", "")).strip()
+        port = str(data.get("SMTP_PORT", "")).strip() or "587"
+        user = str(data.get("SMTP_USER", "")).strip()
+        secret = str(data.get("SMTP_PASS", "")).strip()
+        sender = str(data.get("SMTP_FROM", "")).strip()
+        if not (host and user and secret and sender):
+            return False
+
+        updates = {
+            "V11B_SMTP_HOST": host,
+            "V11B_SMTP_PORT": port,
+            "V11B_SMTP_USER": user,
+            "V11B_SMTP_PASS": secret,
+            "V11B_SMTP_FROM": sender,
+            # Keep plain SMTP aliases too, matching VideoForge style.
+            "SMTP_HOST": host,
+            "SMTP_PORT": port,
+            "SMTP_USER": user,
+            "SMTP_PASS": secret,
+            "SMTP_FROM": sender,
+        }
+        try:
+            target_env = _PERSISTENT_DATA_DIR / "billing.env"
+            _upsert_env_file(target_env, updates)
+            for key, value in updates.items():
+                os.environ[key] = value
+            self.smtp_host = host
+            try:
+                self.smtp_port = int(port)
+            except Exception:
+                self.smtp_port = 587
+            self.smtp_user = user
+            self.smtp_pass = secret
+            self.smtp_from = sender
+            self.smtp_configured = True
+            self._refresh_billing_debug_snapshot()
+            if not silent:
+                messagebox.showinfo(
+                    "SMTP Imported",
+                    f"Imported SMTP settings from VideoForge env:\n{vf_env}",
+                    parent=self.billing_debug_window if self.billing_debug_window and self.billing_debug_window.winfo_exists() else self,
+                )
+            self.log_queue.put(f"[INFO] Imported SMTP settings from VideoForge env: {vf_env}")
+            return True
+        except Exception as exc:
+            self.log_queue.put(f"[WARN] Failed to import SMTP from VideoForge env: {exc}")
+            return False
+
+    def _open_smtp_setup_dialog(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("SMTP Setup")
+        dialog.minsize(560, 300)
+        dialog.configure(bg="#0a1220")
+        dialog.transient(self.billing_debug_window if self.billing_debug_window and self.billing_debug_window.winfo_exists() else self)
+
+        frame = ttk.Frame(dialog, padding=12, style="Root.TFrame")
+        frame.pack(fill=BOTH, expand=True)
+
+        ttk.Label(frame, text="Configure SMTP For Recovery Emails", style="BillingSectionTitle.TLabel").pack(anchor=W)
+        ttk.Label(
+            frame,
+            text="Enter your SMTP settings once. They will be saved in AppData billing.env.",
+            style="Hint.TLabel",
+            wraplength=520,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(4, 10))
+
+        host_var = tk.StringVar(value=self.smtp_host or "smtp.zoho.com")
+        port_var = tk.StringVar(value=str(self.smtp_port or 587))
+        user_var = tk.StringVar(value=self.smtp_user)
+        pass_var = tk.StringVar(value=self.smtp_pass)
+        from_var = tk.StringVar(value=self.smtp_from or self.smtp_user)
+
+        self._labeled_entry(frame, "SMTP Host", host_var)
+        self._labeled_entry(frame, "SMTP Port", port_var)
+        self._labeled_entry(frame, "SMTP User (email)", user_var)
+
+        pass_row = ttk.Frame(frame)
+        pass_row.pack(fill=X, pady=2)
+        ttk.Label(pass_row, text="SMTP App Password", width=26).pack(side=LEFT)
+        ttk.Entry(pass_row, textvariable=pass_var, show="*").pack(side=LEFT, fill=X, expand=True)
+
+        self._labeled_entry(frame, "SMTP From", from_var)
+
+        def _save_smtp() -> None:
+            host = host_var.get().strip()
+            port_text = port_var.get().strip() or "587"
+            user = user_var.get().strip()
+            secret = pass_var.get().strip()
+            sender = from_var.get().strip() or user
+
+            if not host or not user or not secret or not sender:
+                messagebox.showwarning("Missing Fields", "Host, User, Password, and From are required.", parent=dialog)
+                return
+            try:
+                port = int(port_text)
+            except Exception:
+                messagebox.showwarning("Invalid Port", "SMTP Port must be a number.", parent=dialog)
+                return
+
+            updates = {
+                "V11B_SMTP_HOST": host,
+                "V11B_SMTP_PORT": str(port),
+                "V11B_SMTP_USER": user,
+                "V11B_SMTP_PASS": secret,
+                "V11B_SMTP_FROM": sender,
+            }
+            target_env = _PERSISTENT_DATA_DIR / "billing.env"
+            try:
+                _upsert_env_file(target_env, updates)
+                for key, value in updates.items():
+                    os.environ[key] = value
+                self._refresh_smtp_config()
+                self._refresh_billing_debug_snapshot()
+                self.billing_status_var.set("SMTP settings saved. You can now send recovery emails.")
+                self.log_queue.put(f"[INFO] SMTP settings saved to {target_env}.")
+                messagebox.showinfo("SMTP Saved", "SMTP settings saved successfully.", parent=dialog)
+                dialog.destroy()
+            except Exception as exc:
+                messagebox.showerror("Save Failed", f"Could not save SMTP settings: {exc}", parent=dialog)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=X, pady=(10, 0))
+        ttk.Button(btn_row, text="Save SMTP", command=_save_smtp, style="Accent.TButton").pack(side=LEFT)
+        ttk.Button(btn_row, text="Cancel", command=dialog.destroy).pack(side=RIGHT)
+
+        dialog.lift()
+        dialog.focus_force()
+
+    def _apply_stripe_key_override(self, secret_key: str, source_label: str) -> bool:
+        normalized = str(secret_key or "").strip()
+        if not normalized:
+            messagebox.showwarning("Missing Key", f"No Stripe key found for {source_label}.")
+            return False
+        self.billing_backend.stripe_secret_key = normalized
+        self.billing_backend.stripe_mode = "test" if normalized.startswith("sk_test_") else "live"
+        if STRIPE_AVAILABLE:
+            stripe.api_key = normalized
+        self._refresh_billing_debug_snapshot()
+        self.billing_status_var.set(
+            f"Stripe key switched to {source_label}. Active mode: {self.billing_backend.stripe_mode.upper()}."
+        )
+        self.log_queue.put(f"[INFO] Stripe key switched via billing debug ({source_label}).")
+        return True
+
+    def _switch_to_live_key(self) -> None:
+        live_key = _env_first(
+            [
+                "V11B_STRIPE_SECRET_KEY",
+                "STRIPE_SECRET_KEY",
+                "PIXELFORGE_STRIPE_SECRET_KEY",
+                "VIDEOFORGE_STRIPE_SECRET_KEY",
+                "DISPLAY_CONTROL_PLUS_STRIPE_SECRET_KEY",
+                "KNIGHTLOGICS_STRIPE_SECRET_KEY",
+            ]
+        )
+        self._apply_stripe_key_override(live_key, "LIVE env key")
+
+    def _switch_to_test_key(self) -> None:
+        test_key = _env_first(
+            [
+                "V11B_STRIPE_TEST_SECRET_KEY",
+                "STRIPE_TEST_SECRET_KEY",
+                "PIXELFORGE_STRIPE_TEST_SECRET_KEY",
+                "VIDEOFORGE_STRIPE_TEST_SECRET_KEY",
+            ]
+        )
+        if not test_key:
+            messagebox.showwarning(
+                "Test Key Missing",
+                "Set V11B_STRIPE_TEST_SECRET_KEY (or STRIPE_TEST_SECRET_KEY) in your billing env first.",
+            )
+            return
+        self._apply_stripe_key_override(test_key, "TEST env key")
+
+    def _simulate_debug_credit_add(self) -> None:
+        token = self.billing_token_var.get().strip()
+        if not token:
+            messagebox.showwarning("Missing Token", "Generate or enter an access token first.")
+            return
+        if not is_valid_paid_access_token(token):
+            messagebox.showwarning("Invalid Token", "Billing token format is invalid.")
+            return
+        credits = int(self.checkout_credits_var.get() or 0)
+        if credits <= 0:
+            credits = 1
+        fake_id = f"dbg_{uuid.uuid4().hex}"
+        _, balance = self.billing_store.apply_purchase_once(fake_id, token, credits)
+        self._save_billing_state()
+        self._refresh_billing_status(silent=True)
+        self.log_queue.put(f"[DEBUG] Simulated credit add: +{credits}, balance={balance}, id={fake_id}")
+        self._on_payment_confirmed({"credited_credits": credits, "already_processed": False})
+
+    def _open_billing_debug_window(self) -> None:
+        if self.billing_debug_window and self.billing_debug_window.winfo_exists():
+            self._refresh_billing_debug_snapshot()
+            self.billing_debug_window.deiconify()
+            self.billing_debug_window.lift()
+            self.billing_debug_window.focus_force()
+            try:
+                self.billing_debug_window.grab_set()
+            except tk.TclError:
+                pass
+            return
+
+        if self.billing_window and self.billing_window.winfo_exists():
+            try:
+                self.billing_window.grab_release()
+            except tk.TclError:
+                pass
+
+        window = tk.Toplevel(self)
+        window.title("Billing Debug / Test Mode")
+        window.minsize(620, 360)
+        window.configure(bg="#0a1220")
+        window.transient(self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self)
+        self.billing_debug_window = window
+        window.protocol("WM_DELETE_WINDOW", self._close_billing_debug_window)
+
+        frame = ttk.Frame(window, padding=14, style="Root.TFrame")
+        frame.pack(fill=BOTH, expand=True)
+
+        ttk.Label(frame, text="Billing Debug / Test Mode", style="BillingSectionTitle.TLabel").pack(anchor=W)
+        ttk.Label(
+            frame,
+            text=(
+                "Use this panel to switch LIVE/TEST Stripe keys and run safe local tests. "
+                "Dev bypass adds credits directly without Stripe charges."
+            ),
+            style="Hint.TLabel",
+            wraplength=560,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(6, 10))
+
+        self._refresh_billing_debug_snapshot()
+        ttk.Label(frame, textvariable=self.debug_stripe_mode_var, style="Hint.TLabel").pack(anchor=W)
+        ttk.Label(frame, textvariable=self.debug_key_hint_var, style="Hint.TLabel").pack(anchor=W, pady=(2, 10))
+        ttk.Label(frame, textvariable=self.debug_smtp_status_var, style="Hint.TLabel").pack(anchor=W, pady=(0, 10))
+
+        key_row = ttk.Frame(frame, style="Panel.TFrame")
+        key_row.pack(fill=X, pady=(0, 8))
+        ttk.Button(key_row, text="Switch To TEST Key", command=self._switch_to_test_key).pack(side=LEFT)
+        ttk.Button(key_row, text="Switch To LIVE Key", command=self._switch_to_live_key).pack(side=LEFT, padx=6)
+        ttk.Button(key_row, text="Configure SMTP", command=self._open_smtp_setup_dialog).pack(side=LEFT, padx=6)
+        ttk.Button(key_row, text="Import SMTP From VideoForge", command=self._try_import_smtp_from_videoforge_env).pack(side=LEFT, padx=6)
+
+        ttk.Checkbutton(
+            frame,
+            text="Enable session Dev Bypass (no Stripe charge; credits added locally)",
+            variable=self.debug_dev_bypass_var,
+        ).pack(anchor=W, pady=(2, 10))
+
+        actions = ttk.Frame(frame, style="Panel.TFrame")
+        actions.pack(fill=X)
+        ttk.Button(actions, text="Simulate Payment Success", command=self._simulate_debug_credit_add).pack(side=LEFT)
+        ttk.Button(actions, text="Close", command=self._close_billing_debug_window).pack(side=RIGHT)
+
+        ttk.Label(
+            frame,
+            text=(
+                "Tip: Set V11B_STRIPE_TEST_SECRET_KEY in billing.env, then click 'Switch To TEST Key'. "
+                "Use card 4242 4242 4242 4242 for Stripe test checkouts. Configure SMTP here for email tests."
+            ),
+            style="Hint.TLabel",
+            wraplength=560,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(12, 0))
+
+        try:
+            window.grab_set()
+        except tk.TclError:
+            pass
+        window.lift()
+        window.focus_force()
+
+    def _close_billing_debug_window(self) -> None:
+        window = self.billing_debug_window
+        self.billing_debug_window = None
+        if window and window.winfo_exists():
+            try:
+                window.grab_release()
+            except tk.TclError:
+                pass
+            window.destroy()
+
+        if self.billing_window and self.billing_window.winfo_exists():
+            try:
+                self.billing_window.grab_set()
+            except tk.TclError:
+                pass
+            self.billing_window.lift()
+            self.billing_window.focus_force()
 
     def _open_billing_window(self) -> None:
         if self.billing_window and self.billing_window.winfo_exists():
@@ -3187,7 +4035,7 @@ class V11BApp(tk.Tk):
         ttk.Label(hero_left, text="Purchase Processing Credits", style="BillingHeroTitle.TLabel").pack(anchor=W)
         ttk.Label(
             hero_left,
-            text="Secure checkout opens in your browser. Pick a package, complete payment, then return here to confirm and refresh your balance.",
+            text="Secure checkout opens inside the app window. Pick a package, complete payment, then return here to confirm and refresh your balance.",
             style="BillingHeroSub.TLabel",
             wraplength=520,
             justify=LEFT,
@@ -3232,36 +4080,17 @@ class V11BApp(tk.Tk):
                 pady=(0, 12),
             )
 
-        footer = ttk.Frame(frame, style="Root.TFrame")
-        footer.pack(fill=X, pady=(4, 0))
-
-        status_card = ttk.Frame(footer, padding=(14, 12), style="BillingStatus.TFrame")
-        status_card.pack(side=LEFT, fill=BOTH, expand=True)
-        ttk.Label(status_card, text="Billing Status", style="BillingSectionTitle.TLabel").pack(anchor=W)
-        ttk.Label(
-            status_card,
-            textvariable=self.billing_status_var,
-            style="BillingStatus.TLabel",
-            wraplength=520,
-            justify=LEFT,
-        ).pack(anchor=W, pady=(8, 0))
-
-        actions = ttk.Frame(footer, padding=(14, 12), style="BillingActions.TFrame")
-        actions.pack(side=RIGHT, fill=Y, padx=(12, 0))
-        ttk.Label(actions, text="After Payment", style="BillingSectionTitle.TLabel").pack(anchor=W)
-        ttk.Label(
-            actions,
-            text="1. Complete checkout\n2. Click Confirm Purchase\n3. Refresh Balance if needed",
-            style="BillingMuted.TLabel",
-            justify=LEFT,
-        ).pack(anchor=W, pady=(6, 10))
-        ttk.Button(actions, text="Confirm Purchase", command=self._confirm_checkout, style="Accent.TButton", width=20).pack(anchor=E)
-        ttk.Button(actions, text="Refresh Balance", command=self._refresh_billing_status, width=20).pack(anchor=E, pady=(8, 0))
-        ttk.Button(actions, text="Close", command=self._close_billing_window, width=20).pack(anchor=E, pady=(8, 0))
+        action_row = ttk.Frame(frame, style="Root.TFrame")
+        action_row.pack(fill=X, pady=(2, 0))
+        ttk.Button(action_row, text="Confirm Purchase", command=self._confirm_checkout, style="Accent.TButton", width=20).pack(side=RIGHT)
+        ttk.Button(action_row, text="Refresh Balance", command=self._refresh_billing_status, width=18).pack(side=RIGHT, padx=(0, 8))
+        ttk.Button(action_row, text="Close", command=self._close_billing_window, width=14).pack(side=RIGHT, padx=(0, 8))
 
     def _close_billing_window(self) -> None:
         window = self.billing_window
         self.billing_window = None
+        if self.billing_debug_window and self.billing_debug_window.winfo_exists():
+            self._close_billing_debug_window()
         if window and window.winfo_exists():
             try:
                 window.grab_release()
@@ -3275,24 +4104,24 @@ class V11BApp(tk.Tk):
     def _get_billing_package_definitions(self) -> list[dict[str, object]]:
         return [
             {
-                "title": "$5 Package",
-                "credits": 16,
+                "title": "32 Credits",
+                "credits": 32,
                 "price_cents": 500,
                 "accent": False,
                 "badge": "Starter",
                 "summary": "Great for one focused job or quick testing runs with reliable enhancement quality.",
             },
             {
-                "title": "$10 Package",
-                "credits": 34,
+                "title": "68 Credits",
+                "credits": 68,
                 "price_cents": 1000,
-                "accent": True,
+                "accent": False,
                 "badge": "Most Popular",
                 "summary": "Better value per credit for regular creators handling multiple clips per session.",
             },
             {
-                "title": "$20 Package",
-                "credits": 72,
+                "title": "144 Credits",
+                "credits": 144,
                 "price_cents": 2000,
                 "accent": False,
                 "badge": "Best Value",
@@ -3322,7 +4151,6 @@ class V11BApp(tk.Tk):
         header.pack(fill=X)
         tk.Label(header, text=badge, bg=bg, fg="#6de1ff", font=("Segoe UI", 9, "bold")).pack(anchor="w")
         tk.Label(header, text=title, bg=bg, fg=title_fg, font=("Segoe UI", 15, "bold")).pack(anchor="w", pady=(6, 0))
-        tk.Label(header, text=f"{credits} credits", bg=bg, fg=meta_fg, font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
 
         ttk.Separator(card).pack(fill=X, pady=12)
 
@@ -3346,7 +4174,7 @@ class V11BApp(tk.Tk):
 
         ttk.Button(
             card,
-            text=f"Buy {title}",
+            text="Buy Now",
             command=lambda: self._purchase_credit_package(credits, package_price_cents, title),
             style="Accent.TButton" if accent else "TButton",
         ).pack(fill=X, pady=(16, 0))
@@ -3359,6 +4187,13 @@ class V11BApp(tk.Tk):
         self._start_checkout()
 
     def _start_checkout(self) -> None:
+        if self._checkout_pending:
+            messagebox.showinfo(
+                "Checkout In Progress",
+                "A checkout session is already open in the checkout window. Complete payment, then click Confirm Payment.",
+            )
+            return
+
         token = self.billing_token_var.get().strip()
         if not token:
             token = self._generate_billing_token()
@@ -3375,6 +4210,33 @@ class V11BApp(tk.Tk):
         charge_cents = self.checkout_amount_cents_override
         package_name = self.checkout_package_name_override
 
+        # ── DEV MODE: bypass Stripe and add credits directly for local testing ──
+        if self._is_dev_bypass_enabled():
+            if not messagebox.askyesno(
+                "Dev Mode",
+                f"DEV MODE is active — no real payment will occur.\n\nAdd {credits} credits to token directly?",
+                parent=self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self,
+            ):
+                return
+            fake_id = f"dev_{uuid.uuid4().hex}"
+            _, balance = self.billing_store.apply_purchase_once(fake_id, token, credits)
+            self._save_billing_state()
+            self._refresh_billing_status(silent=True)
+            self.checkout_amount_cents_override = None
+            self.checkout_package_name_override = ""
+            self.log_queue.put(f"[DEV] Bypassed payment — added {credits} credits. Balance={balance}.")
+            self._on_payment_confirmed({"credited_credits": credits, "already_processed": False})
+            return
+
+        # ── Start local result-intercept server ──
+        if self._payment_result_server is not None:
+            self._payment_result_server.stop()
+        server = _PaymentResultServer()
+        port = server.start()
+        self._payment_result_server = server
+        local_success = f"http://127.0.0.1:{port}/payment_success?session_id={{CHECKOUT_SESSION_ID}}"
+        local_cancel  = f"http://127.0.0.1:{port}/payment_cancel"
+
         try:
             if self._use_embedded_billing():
                 data = self.billing_backend.create_checkout_session(
@@ -3382,6 +4244,8 @@ class V11BApp(tk.Tk):
                     credits,
                     charge_cents=charge_cents,
                     package_name=package_name,
+                    success_url_override=local_success,
+                    cancel_url_override=local_cancel,
                 )
             else:
                 url = self._billing_endpoint("/api/payments/create-checkout-session")
@@ -3404,19 +4268,144 @@ class V11BApp(tk.Tk):
             self.log_queue.put(f"[ERROR] Checkout failed: {err}")
             self.checkout_amount_cents_override = None
             self.checkout_package_name_override = ""
+            server.stop()
+            self._payment_result_server = None
             return
 
         self.checkout_url_var.set(checkout_url)
         self.checkout_session_var.set(session_id)
         self._save_billing_state()
 
-        self.billing_status_var.set("Checkout created. Complete payment, then click Confirm Payment.")
-        self.log_queue.put(f"[INFO] Checkout session created: {session_id}")
-        self._open_checkout_window(checkout_url)
+        stripe_mode = getattr(self.billing_backend, "stripe_mode", "unknown")
+        self.billing_status_var.set(
+            f"[{stripe_mode.upper()}] Checkout opened — complete payment in the new window, it will confirm automatically."
+        )
+        self.log_queue.put(f"[INFO] Checkout session created: {session_id} (mode={stripe_mode})")
+
+        opened = self._open_checkout_window(checkout_url)
+        self._checkout_pending = bool(opened)
         self.checkout_amount_cents_override = None
         self.checkout_package_name_override = ""
 
+        if opened:
+            # Start polling for payment result
+            if self._payment_poll_id is not None:
+                self.after_cancel(self._payment_poll_id)
+            self._payment_poll_id = self.after(600, self._poll_payment_result)
+
+    def _cancel_payment_poll(self) -> None:
+        """Cancel any pending payment poll and clean up result server."""
+        if self._payment_poll_id is not None:
+            try:
+                self.after_cancel(self._payment_poll_id)
+            except Exception:
+                pass
+            self._payment_poll_id = None
+        if self._payment_result_server is not None:
+            self._payment_result_server.stop()
+            self._payment_result_server = None
+
+    def _poll_payment_result(self) -> None:
+        """Polls the local payment result server queue every 500ms (runs in main Tkinter thread)."""
+        server = self._payment_result_server
+        if server is None or not self._checkout_pending:
+            self._payment_poll_id = None
+            return
+
+        try:
+            result = server.result_queue.get_nowait()
+        except Empty:
+            # Nothing yet — reschedule
+            self._payment_poll_id = self.after(500, self._poll_payment_result)
+            return
+
+        # Got a result — clean up server
+        self._payment_poll_id = None
+        server.stop()
+        self._payment_result_server = None
+
+        status = result.get("status", "")
+        if status == "cancel":
+            self._checkout_pending = False
+            self.billing_status_var.set("Checkout cancelled. No payment was made.")
+            self.log_queue.put("[INFO] Checkout cancelled by user.")
+            return
+
+        if status == "success":
+            session_id = result.get("session_id", "").strip()
+            if not session_id:
+                # Fallback: use the stored session ID from when the session was created
+                session_id = self.checkout_session_var.get().strip()
+            self.billing_status_var.set("Payment received — confirming credits, please wait...")
+            self.log_queue.put(f"[INFO] Payment success received for session: {session_id}")
+
+            def _confirm_worker() -> None:
+                try:
+                    if self._use_embedded_billing():
+                        data = self.billing_backend.confirm_checkout_session(session_id)
+                    else:
+                        api_url = self._billing_endpoint("/api/payments/confirm-session")
+                        status_code, data = self._post_form_json(api_url, {"session_id": session_id})
+                        if status_code != 200:
+                            raise RuntimeError(str(data.get("error", f"HTTP {status_code}")))
+                    self.after(0, lambda: self._on_payment_confirmed(data))
+                except Exception as exc:
+                    self.after(0, lambda _e=exc: self._on_payment_confirm_failed(str(_e)))
+
+            threading.Thread(target=_confirm_worker, name="confirm-payment", daemon=True).start()
+
+    def _on_payment_confirmed(self, data: dict) -> None:
+        """Called in main thread after auto-confirm succeeds."""
+        self._checkout_pending = False
+        credited = int(data.get("credited_credits", 0) or 0)
+        already_processed = bool(data.get("already_processed", False))
+        token = self.billing_token_var.get().strip()
+        self._save_billing_state()
+        self._refresh_billing_status(silent=True)
+
+        msg = f"Payment confirmed. {credited} credits added." if not already_processed else "Payment confirmed (already processed)."
+        self.log_queue.put(f"[INFO] {msg}")
+        self.billing_status_var.set(msg)
+
+        parent = self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self
+        messagebox.showinfo(
+            "Payment Complete",
+            f"Payment successful!\n\n{credited} credit{'s' if credited != 1 else ''} have been added to your account.\n\nYou can now start processing videos.",
+            parent=parent,
+        )
+
+        should_prompt_email = False
+        if (not already_processed) and credited > 0 and token:
+            try:
+                status = self.billing_backend.get_status(token)
+                should_prompt_email = not bool(status.get("email_linked", False))
+            except Exception:
+                # Fallback to prompting if status fetch fails.
+                should_prompt_email = True
+
+        if should_prompt_email:
+            self._backup_email_prompt_shown_this_session = True
+            self._backup_email_prompt_active = True
+            try:
+                self._prompt_email_backup_after_purchase(trigger="purchase")
+            finally:
+                self._backup_email_prompt_active = False
+
+    def _on_payment_confirm_failed(self, error: str) -> None:
+        """Called in main thread when auto-confirm network call fails."""
+        self._checkout_pending = False
+        self.billing_status_var.set(f"Auto-confirm failed: {error}")
+        self.log_queue.put(f"[ERROR] Auto-confirm failed: {error}")
+        parent = self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self
+        messagebox.showwarning(
+            "Confirm Failed",
+            f"Payment may have gone through, but auto-confirm failed:\n\n{error}\n\n"
+            "Your session ID is saved. Use 'Confirm Payment' in the billing tab to retry.",
+            parent=parent,
+        )
+
     def _confirm_checkout(self) -> None:
+        """Manual fallback confirm — useful if auto-confirm failed or user closed checkout early."""
         session_id = self.checkout_session_var.get().strip()
         if not session_id:
             messagebox.showwarning("Session Required", "Paste or generate a checkout session ID first.")
@@ -3436,8 +4425,11 @@ class V11BApp(tk.Tk):
             self.log_queue.put(f"[ERROR] Confirm failed: {err}")
             return
 
+        self._checkout_pending = False
+
         credited = int(data.get("credited_credits", 0) or 0)
         already_processed = bool(data.get("already_processed", False))
+        token = self.billing_token_var.get().strip()
         if already_processed:
             msg = f"Payment already processed earlier. Session: {session_id}"
         else:
@@ -3448,36 +4440,123 @@ class V11BApp(tk.Tk):
         self._save_billing_state()
         self._refresh_billing_status(silent=True)
 
-        if (not already_processed) and credited > 0:
-            self._prompt_email_backup_after_purchase()
+        parent = self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self
+        if already_processed:
+            messagebox.showinfo(
+                "Payment Already Applied",
+                "This payment session was already processed earlier.\n\nNo additional credits were added.",
+                parent=parent,
+            )
+        else:
+            messagebox.showinfo(
+                "Payment Complete",
+                f"Payment successful!\n\n{credited} credit{'s' if credited != 1 else ''} have been added to your account.",
+                parent=parent,
+            )
 
-    def _prompt_email_backup_after_purchase(self) -> None:
+        should_prompt_email = False
+        if (not already_processed) and credited > 0 and token:
+            try:
+                status = self.billing_backend.get_status(token)
+                should_prompt_email = not bool(status.get("email_linked", False))
+            except Exception:
+                should_prompt_email = True
+
+        if should_prompt_email:
+            self._backup_email_prompt_shown_this_session = True
+            self._backup_email_prompt_active = True
+            try:
+                self._prompt_email_backup_after_purchase(trigger="purchase")
+            finally:
+                self._backup_email_prompt_active = False
+
+    def _prompt_email_backup_after_purchase(self, trigger: str = "purchase") -> None:
+        parent_window = self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self
         default_email = self.recovery_email_var.get().strip()
-        email = simpledialog.askstring(
-            "Email Backup",
-            "Enter your email to receive your access code backup:",
-            initialvalue=default_email,
-            parent=self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self,
-        )
-        if email is None:
-            self.log_queue.put("[INFO] User skipped backup email prompt.")
-            return
+        if trigger == "purchase":
+            prompt_text = "Payment succeeded. Enter your email to back up your access code for account restore:"
+        else:
+            prompt_text = (
+                "You have more than 10 credits and no backup email linked yet. "
+                "Enter your email to back up your access code:"
+            )
 
-        normalized = self._normalize_email(email)
-        if not normalized:
-            messagebox.showwarning("Email Required", "Email was empty. You can set it later from billing/account recovery.")
-            return
+        while True:
+            email = simpledialog.askstring(
+                "Email Backup",
+                prompt_text,
+                initialvalue=default_email,
+                parent=parent_window,
+            )
+            if email is None:
+                if trigger == "purchase":
+                    self.billing_status_var.set(
+                        "Purchase confirmed. You can link recovery email later from Buy Credits > Account Recovery."
+                    )
+                else:
+                    self.billing_status_var.set(
+                        "Backup email skipped for this session. You can link it later from Buy Credits > Account Recovery."
+                    )
+                self.log_queue.put(f"[INFO] User skipped backup email prompt ({trigger}).")
+                return
 
-        self.recovery_email_var.set(normalized)
-        self._link_email_to_current_token()
-        token = self.billing_token_var.get().strip()
-        if token and is_valid_paid_access_token(token):
+            normalized = self._normalize_email(email)
+            if not normalized:
+                messagebox.showwarning(
+                    "Email Required",
+                    "Email was empty. Enter a valid email or Cancel to skip for now.",
+                    parent=parent_window,
+                )
+                default_email = ""
+                continue
+
+            self.recovery_email_var.set(normalized)
+            linked, link_msg = self._link_email_to_current_token(email_override=normalized, show_feedback=False)
+            if not linked:
+                messagebox.showwarning("Email Link Failed", link_msg, parent=parent_window)
+                self.log_queue.put(f"[WARN] Could not link backup email {normalized}: {link_msg}")
+                default_email = normalized
+                continue
+
+            token = self.billing_token_var.get().strip()
+            if not token or not is_valid_paid_access_token(token):
+                self.log_queue.put("[WARN] Purchase succeeded but no valid token was available for backup email send.")
+                return
+
             ok, msg = self._send_recovery_email(normalized, token)
-            self.billing_status_var.set(msg)
             if ok:
+                if trigger == "purchase":
+                    self.billing_status_var.set(f"Purchase confirmed. Backup email sent to {normalized}.")
+                else:
+                    self.billing_status_var.set(f"Backup email sent to {normalized}.")
                 self.log_queue.put(f"[INFO] Access code backup email sent to {normalized}.")
+                messagebox.showinfo(
+                    "Backup Email Sent",
+                    "Access code backup email sent successfully. Keep this email for account restore.",
+                    parent=parent_window,
+                )
             else:
-                self.log_queue.put(f"[WARN] {msg}")
+                if "SMTP is not configured" in msg:
+                    self.billing_status_var.set(
+                        "Purchase confirmed. Email linked successfully. SMTP is not configured yet, so backup email was skipped."
+                    )
+                    self.log_queue.put("[INFO] Email linked; SMTP not configured so backup send was skipped.")
+                    messagebox.showinfo(
+                        "Email Linked",
+                        "Payment is confirmed and your email is linked.\n\n"
+                        "SMTP is not configured yet, so backup email was skipped for now.\n"
+                        "Set V11B_SMTP_* vars to enable automatic email sending.",
+                        parent=parent_window,
+                    )
+                else:
+                    self.billing_status_var.set(f"Purchase confirmed. Email linked, but backup send failed: {msg}")
+                    self.log_queue.put(f"[WARN] {msg}")
+                    messagebox.showwarning(
+                        "Backup Email Failed",
+                        f"Payment is confirmed and email is linked, but sending failed:\n\n{msg}",
+                        parent=parent_window,
+                    )
+            return
 
     def _set_selected_button_group(self, buttons: dict[str, ttk.Button], selected_name: str) -> None:
         for name, btn in buttons.items():
@@ -4573,6 +5652,10 @@ class V11BApp(tk.Tk):
 
 
 def main() -> None:
+    checkout_url = _get_checkout_window_arg(sys.argv)
+    if checkout_url is not None:
+        raise SystemExit(_run_checkout_window_only(checkout_url))
+
     app = V11BApp()
     app._register_auto_estimate_watchers()
     app._register_auto_compare_watchers()
