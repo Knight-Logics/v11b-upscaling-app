@@ -152,14 +152,22 @@ set OLD_EXE={old_exe}
 set NEW_EXE={new_exe}
 
 timeout /t 2 /nobreak >nul
+set RETRIES=0
 :retry_copy
-copy /Y "%NEW_EXE%" "%OLD_EXE%" >nul
+powershell -NoProfile -Command "$ok=$false; try {{ Copy-Item -LiteralPath $env:NEW_EXE -Destination $env:OLD_EXE -Force; $ok=((Get-Item -LiteralPath $env:NEW_EXE).Length -eq (Get-Item -LiteralPath $env:OLD_EXE).Length) }} catch {{ $ok=$false }}; if(-not $ok) {{ exit 1 }}"
 if errorlevel 1 (
-  timeout /t 1 /nobreak >nul
-  goto retry_copy
+    set /a RETRIES+=1
+    if %RETRIES% GEQ 12 goto copy_failed
+    timeout /t 1 /nobreak >nul
+    goto retry_copy
 )
 start "" "%OLD_EXE%" {args_str}
 endlocal
+exit /b 0
+
+:copy_failed
+endlocal
+exit /b 1
 """
     fd, path = tempfile.mkstemp(prefix="pixelforge_update_", suffix=".cmd")
     os.close(fd)
