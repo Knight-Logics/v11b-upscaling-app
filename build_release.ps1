@@ -25,14 +25,14 @@ if (Test-Path (Join-Path $root "assets\app.ico")) {
 }
 
 & "$root\.venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed `
-  --name "v11b-upscaling-app" `
+  --name "PixelForge-AI" `
   --collect-data PIL `
   --add-data "assets;assets" `
   --add-data "models;models" `
   @iconArg `
   process_full_video_ultimate.py
 
-Copy-Item (Join-Path $root "dist\v11b-upscaling-app.exe") (Join-Path $releaseDir "v11b-upscaling-app.exe") -Force
+Copy-Item (Join-Path $root "dist\PixelForge-AI.exe") (Join-Path $releaseDir "PixelForge-AI.exe") -Force
 
 # Bundle runtime model/tool files needed by app pipeline
 if (Test-Path (Join-Path $root "realesrgan-ncnn-vulkan.exe")) {
@@ -48,7 +48,7 @@ if (Test-Path (Join-Path $root "vcomp140d.dll")) {
   Copy-Item (Join-Path $root "vcomp140d.dll") (Join-Path $releaseDir "vcomp140d.dll") -Force
 }
 
-$zipName = "v11b-upscaling-app_${Version}_windows_x64.zip"
+$zipName = "PixelForge-AI_${Version}_windows_x64.zip"
 $zipPath = Join-Path $releaseDir $zipName
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Compress-Archive -Path (Join-Path $releaseDir "*") -DestinationPath $zipPath

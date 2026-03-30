@@ -1,4 +1,4 @@
-"""v11b Upscaling Application.
+"""PixelForge AI - Video Upscaling Application.
 
 Single-file desktop app for Real-ESRGAN upscaling with configurable preprocessing,
 sharpening, interpolation, scaling, encoding, and runtime estimation.

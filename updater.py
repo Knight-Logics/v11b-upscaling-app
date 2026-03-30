@@ -1,4 +1,4 @@
-"""Auto-update helper for v11b Upscaling App.
+"""Auto-update helper for PixelForge AI.
 
 Checks GitHub Releases for newer versions. If found, shows a dialog that
 downloads the latest Windows EXE asset directly and applies the update
@@ -18,11 +18,11 @@ import tkinter as tk
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-APP_NAME = "v11b Upscaling App"
+APP_NAME = "PixelForge AI"
 GITHUB_REPO = os.environ.get("V11B_UPDATE_REPO", "Knight-Logics/v11b-upscaling-app").strip()
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 APPDATA_ROOT = os.environ.get("APPDATA", os.path.expanduser("~"))
-RUNTIME_DIR = os.path.join(APPDATA_ROOT, "KnightLogics", "v11bUpscaling")
+RUNTIME_DIR = os.path.join(APPDATA_ROOT, "KnightLogics", "PixelForgeAI")
 UPDATES_DIR = os.path.join(RUNTIME_DIR, "updates")
 PENDING_UPDATE_PATH = os.path.join(RUNTIME_DIR, "pending_update.json")
 
@@ -149,7 +149,7 @@ if errorlevel 1 (
 start "" "%OLD_EXE%" {args_str}
 endlocal
 """
-    fd, path = tempfile.mkstemp(prefix="v11b_update_", suffix=".cmd")
+    fd, path = tempfile.mkstemp(prefix="pixelforge_update_", suffix=".cmd")
     os.close(fd)
     Path(path).write_text(script, encoding="utf-8")
     return path
