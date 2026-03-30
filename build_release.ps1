@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "1.0.0"
+  [string]$Version = "1.0.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,8 +20,9 @@ if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
 New-Item -ItemType Directory -Path $releaseDir | Out-Null
 
 $iconArg = @()
-if (Test-Path (Join-Path $root "assets\app.ico")) {
-  $iconArg = @("--icon", (Join-Path $root "assets\app.ico"))
+$iconPath = Join-Path $root "assets\icons\pixelforge_app.ico"
+if (Test-Path $iconPath) {
+  $iconArg = @("--icon", $iconPath)
 }
 
 & "$root\.venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed `
