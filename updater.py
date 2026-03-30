@@ -87,7 +87,7 @@ def _should_suppress_prompt(current_version: str, latest_tag: str) -> bool:
     return False
 
 
-def _select_windows_exe_asset(release_payload: dict) -> tuple[str | None, str | None]:
+def _select_windows_exe_asset(release_payload: dict) -> tuple[str | None, str | None, int]:
     assets = release_payload.get("assets", [])
     tag_clean = str(release_payload.get("tag_name", "")).strip().lower().lstrip("v")
 
@@ -99,19 +99,19 @@ def _select_windows_exe_asset(release_payload: dict) -> tuple[str | None, str | 
         if not url or not lname.endswith(".exe"):
             continue
         if "v11b" in lname and (tag_clean and tag_clean in lname):
-            return url, name
+            return url, name, int(asset.get("size", 0) or 0)
 
     # Fallback: first .exe asset.
     for asset in assets:
         name = str(asset.get("name", "")).strip()
         url = str(asset.get("browser_download_url", "")).strip()
         if url and name.lower().endswith(".exe"):
-            return url, name
+                return url, name, int(asset.get("size", 0) or 0)
 
-    return None, None
+            return None, None, 0
 
 
-def _download_asset(url: str, filename: str, status_cb=None) -> str:
+def _download_asset(url: str, filename: str, expected_size: int = 0, status_cb=None) -> str:
     target_path = os.path.join(UPDATES_DIR, filename)
     temp_path = f"{target_path}.part"
     req = Request(url, headers={"User-Agent": "v11b-updater/1.0"})
@@ -127,6 +127,18 @@ def _download_asset(url: str, filename: str, status_cb=None) -> str:
             if status_cb and total > 0:
                 pct = int((downloaded / total) * 100)
                 status_cb(f"Downloading update... {pct}%")
+    if expected_size > 0 and downloaded != expected_size:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+        raise RuntimeError(f"Downloaded file size mismatch (got {downloaded}, expected {expected_size}).")
+    if downloaded < 50 * 1024 * 1024:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+        raise RuntimeError("Downloaded executable is unexpectedly small; aborting update.")
     os.replace(temp_path, target_path)
     return target_path
 
@@ -155,7 +167,7 @@ endlocal
     return path
 
 
-def _show_update_dialog(parent: tk.Tk, current_version: str, latest_tag: str, asset_url: str | None, asset_name: str | None) -> None:
+def _show_update_dialog(parent: tk.Tk, current_version: str, latest_tag: str, asset_url: str | None, asset_name: str | None, asset_size: int = 0) -> None:
     dlg = tk.Toplevel(parent)
     dlg.title("Update Available")
     dlg.configure(bg="#0f1115")
@@ -207,7 +219,20 @@ def _show_update_dialog(parent: tk.Tk, current_version: str, latest_tag: str, as
 
         def _worker() -> None:
             try:
-                new_path = _download_asset(resolved_url, resolved_name, status_cb=_set_status)
+                attempts = 0
+                last_exc: Exception | None = None
+                new_path = ""
+                while attempts < 3:
+                    attempts += 1
+                    try:
+                        if attempts > 1:
+                            _set_status(f"Retrying download ({attempts}/3)...")
+                        new_path = _download_asset(resolved_url, resolved_name, expected_size=asset_size, status_cb=_set_status)
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                if not new_path:
+                    raise RuntimeError(f"Update download failed after 3 attempts: {last_exc}")
                 _write_pending_update(latest_tag)
 
                 if getattr(sys, "frozen", False):
@@ -274,8 +299,8 @@ def check_for_updates(parent: tk.Tk, current_version: str, *, silent: bool = Tru
             if _should_suppress_prompt(current_version, latest_tag):
                 return
             if _parse_version(latest_tag) > _parse_version(current_version):
-                asset_url, asset_name = _select_windows_exe_asset(payload)
-                parent.after(0, lambda: _show_update_dialog(parent, current_version, latest_tag, asset_url, asset_name))
+                asset_url, asset_name, asset_size = _select_windows_exe_asset(payload)
+                parent.after(0, lambda: _show_update_dialog(parent, current_version, latest_tag, asset_url, asset_name, asset_size))
         except Exception:
             if not silent:
                 raise
