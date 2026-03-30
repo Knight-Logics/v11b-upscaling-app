@@ -106,9 +106,9 @@ def _select_windows_exe_asset(release_payload: dict) -> tuple[str | None, str | 
         name = str(asset.get("name", "")).strip()
         url = str(asset.get("browser_download_url", "")).strip()
         if url and name.lower().endswith(".exe"):
-                return url, name, int(asset.get("size", 0) or 0)
+            return url, name, int(asset.get("size", 0) or 0)
 
-            return None, None, 0
+    return None, None, 0
 
 
 def _download_asset(url: str, filename: str, expected_size: int = 0, status_cb=None) -> str:

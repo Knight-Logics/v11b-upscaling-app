@@ -94,13 +94,27 @@ ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "mediu
 IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
 TOKEN_PATTERN = re.compile(r"^v11b[-_][A-Za-z0-9]{12,128}$")
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-# When frozen by PyInstaller, runtime tools (realesrgan, models) live next to the .exe.
-# When running from source, they live next to this script.
+# Prefer bundled runtime files from PyInstaller extraction (_MEIPASS), then fall back
+# to the app folder when running from source or with sidecar tools.
 _APP_DIR: Path = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-_REALESRGAN_EXE: Path = _APP_DIR / "realesrgan-ncnn-vulkan.exe"
+_BUNDLE_DIR: Path = Path(getattr(sys, "_MEIPASS", _APP_DIR))
+
+
+def _resolve_runtime_path(relative_path: str) -> Path:
+    bundle_candidate = _BUNDLE_DIR / relative_path
+    if bundle_candidate.exists():
+        return bundle_candidate
+    app_candidate = _APP_DIR / relative_path
+    if app_candidate.exists():
+        return app_candidate
+    return bundle_candidate
+
+
+_REALESRGAN_EXE: Path = _resolve_runtime_path("realesrgan-ncnn-vulkan.exe")
+_REALESRGAN_MODELS_DIR: Path = _resolve_runtime_path("models")
 
 
 def is_valid_paid_access_token(token: str) -> bool:
@@ -849,7 +863,9 @@ class PipelineRunner:
         if not input_path.exists():
             raise FileNotFoundError(f"Input video not found: {input_path}")
         if not exe_path.exists():
-            raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (looked in: {exe_path.parent})")
+            raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (looked in bundled/app paths; final candidate: {exe_path})")
+        if not _REALESRGAN_MODELS_DIR.exists():
+            raise FileNotFoundError(f"Real-ESRGAN models folder not found (looked in bundled/app paths; final candidate: {_REALESRGAN_MODELS_DIR})")
 
         duration_full = self.get_video_duration(input_path)
         source_fps = self.get_fps(input_path)
@@ -954,6 +970,8 @@ class PipelineRunner:
             str(frames_in),
             "-o",
             str(frames_out),
+            "-m",
+            str(_REALESRGAN_MODELS_DIR),
             "-n",
             self.settings.model,
             "-s",
@@ -3759,7 +3777,9 @@ class V11BApp(tk.Tk):
         try:
             exe_path = _REALESRGAN_EXE
             if not exe_path.exists():
-                raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (looked in: {exe_path.parent})")
+                raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (looked in bundled/app paths; final candidate: {exe_path})")
+            if not _REALESRGAN_MODELS_DIR.exists():
+                raise FileNotFoundError(f"Real-ESRGAN models folder not found (looked in bundled/app paths; final candidate: {_REALESRGAN_MODELS_DIR})")
 
             compare_root = Path(tempfile.gettempdir()) / "pixelforge_compare" / self._safe_name(settings.input_video.stem)
             compare_root.mkdir(parents=True, exist_ok=True)
@@ -3802,6 +3822,8 @@ class V11BApp(tk.Tk):
                 str(source_for_upscale),
                 "-o",
                 str(upscaled_frame),
+                "-m",
+                str(_REALESRGAN_MODELS_DIR),
                 "-n",
                 settings.model,
                 "-s",
@@ -4045,7 +4067,9 @@ class V11BApp(tk.Tk):
         if "ffprobe" in text and "not found" in text:
             hints.append("ffprobe is missing from PATH. Ensure FFmpeg tools are installed correctly.")
         if "realesrgan-ncnn-vulkan.exe" in text and "not found" in text:
-            hints.append("Keep realesrgan-ncnn-vulkan.exe in the same folder as this script.")
+            hints.append("Reinstall the latest app build; Real-ESRGAN runtime is bundled and should not require manual sidecar files.")
+        if "models folder not found" in text:
+            hints.append("Reinstall the latest app build; bundled Real-ESRGAN model files are missing or inaccessible.")
         if "permission denied" in text:
             hints.append("Check file/folder permissions and verify output path is writable.")
         if "out of memory" in text or "cannot allocate" in text:

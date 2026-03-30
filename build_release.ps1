@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "1.0.3"
+  [string]$Version = "1.0.4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +28,7 @@ if (Test-Path $iconPath) {
 & "$root\.venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed `
   --name "PixelForge-AI" `
   --collect-data PIL `
+  --add-binary "realesrgan-ncnn-vulkan.exe;." `
   --add-data "assets;assets" `
   --add-data "models;models" `
   @iconArg `
