@@ -97,6 +97,11 @@ TOKEN_PATTERN = re.compile(r"^v11b[-_][A-Za-z0-9]{12,128}$")
 APP_VERSION = "1.0.0"
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+# When frozen by PyInstaller, runtime tools (realesrgan, models) live next to the .exe.
+# When running from source, they live next to this script.
+_APP_DIR: Path = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+_REALESRGAN_EXE: Path = _APP_DIR / "realesrgan-ncnn-vulkan.exe"
+
 
 def is_valid_paid_access_token(token: str) -> bool:
     return bool(TOKEN_PATTERN.fullmatch(token or ""))
@@ -839,12 +844,12 @@ class PipelineRunner:
     def run(self) -> None:
         input_path = self.settings.input_video
         output_path = self.settings.output_video
-        exe_path = Path("realesrgan-ncnn-vulkan.exe")
+        exe_path = _REALESRGAN_EXE
 
         if not input_path.exists():
             raise FileNotFoundError(f"Input video not found: {input_path}")
         if not exe_path.exists():
-            raise FileNotFoundError("realesrgan-ncnn-vulkan.exe not found in the working folder")
+            raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (looked in: {exe_path.parent})")
 
         duration_full = self.get_video_duration(input_path)
         source_fps = self.get_fps(input_path)
@@ -3752,9 +3757,9 @@ class V11BApp(tk.Tk):
 
     def _generate_compare_worker(self, settings: PipelineSettings) -> None:
         try:
-            exe_path = Path("realesrgan-ncnn-vulkan.exe")
+            exe_path = _REALESRGAN_EXE
             if not exe_path.exists():
-                raise FileNotFoundError("realesrgan-ncnn-vulkan.exe not found in v11b folder")
+                raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (looked in: {exe_path.parent})")
 
             compare_root = Path(tempfile.gettempdir()) / "pixelforge_compare" / self._safe_name(settings.input_video.stem)
             compare_root.mkdir(parents=True, exist_ok=True)
