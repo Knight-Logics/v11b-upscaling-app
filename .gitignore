@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+build/
+dist/
+release/
+*.spec
+*.log
+*.tmp
+_diag_new/
+_diag_old/
+_diag_out/
+_test_out/
+v11b_compare_preview/
+*.mp4
+*.zip
+updates/
+v11b_billing_audit.jsonl
+v11b_billing_state.json
+v11b_billing_tokens.json
+v11b_stage_timing_profile.json
+ChatGPT Image Mar 29, 2026, 08_32_35 PM.png
+_copy_test.txt
