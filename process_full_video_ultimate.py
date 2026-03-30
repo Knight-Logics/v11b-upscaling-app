@@ -95,6 +95,7 @@ IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
 TOKEN_PATTERN = re.compile(r"^v11b[-_][A-Za-z0-9]{12,128}$")
 APP_VERSION = "1.0.0"
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def is_valid_paid_access_token(token: str) -> bool:
@@ -714,6 +715,7 @@ class PipelineRunner:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                creationflags=_NO_WINDOW,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(f"{stage_name} failed because required executable was not found: {exc}") from exc
@@ -757,7 +759,7 @@ class PipelineRunner:
             "default=noprint_wrappers=1:nokey=1",
             PipelineRunner._cli_path(video_path),
         ]
-        out = subprocess.check_output(cmd, text=True, encoding="utf-8", errors="replace")
+        out = subprocess.check_output(cmd, text=True, encoding="utf-8", errors="replace", creationflags=_NO_WINDOW)
         return out.strip()
 
     @staticmethod
@@ -772,7 +774,7 @@ class PipelineRunner:
             "default=noprint_wrappers=1:nokey=1",
             PipelineRunner._cli_path(video_path),
         ]
-        out = subprocess.check_output(cmd, text=True, encoding="utf-8", errors="replace")
+        out = subprocess.check_output(cmd, text=True, encoding="utf-8", errors="replace", creationflags=_NO_WINDOW)
         return float(out.strip())
 
     @classmethod
@@ -1165,7 +1167,7 @@ class PipelineRunner:
 class V11BApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("v11b Upscaling App")
+        self.title("PixelForge AI")
         self._set_initial_window_size()
         self.minsize(1040, 520)
 
@@ -1651,7 +1653,7 @@ class V11BApp(tk.Tk):
 
         tk.Label(
             built_by,
-            text="Release: vX.X.X (placeholder)",
+            text=f"Release: v{APP_VERSION}",
             fg="#9ab6d9",
             bg="#111b2f",
             font=("Segoe UI", 8),
@@ -3117,7 +3119,7 @@ class V11BApp(tk.Tk):
             return
 
         try:
-            subprocess.Popen([sys.executable, "-c", webview_script])
+            subprocess.Popen([sys.executable, "-c", webview_script], creationflags=_NO_WINDOW)
             self.log_queue.put("[INFO] Checkout opened in app window (pywebview).")
         except Exception:
             webbrowser.open(url)
@@ -3769,7 +3771,7 @@ class V11BApp(tk.Tk):
             extract_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
             extract_cmd += trim_args
             extract_cmd += ["-i", str(settings.input_video), "-frames:v", "1", str(before_frame)]
-            subprocess.run(extract_cmd, check=True)
+            subprocess.run(extract_cmd, check=True, creationflags=_NO_WINDOW)
 
             pre_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_pre_filter()
             source_for_upscale = before_frame
@@ -3786,7 +3788,7 @@ class V11BApp(tk.Tk):
                     pre_filter,
                     str(pre_frame),
                 ]
-                subprocess.run(pre_cmd, check=True)
+                subprocess.run(pre_cmd, check=True, creationflags=_NO_WINDOW)
                 source_for_upscale = pre_frame
 
             upscale_cmd = [
@@ -3804,7 +3806,7 @@ class V11BApp(tk.Tk):
                 "-j",
                 settings.threads,
             ]
-            subprocess.run(upscale_cmd, check=True)
+            subprocess.run(upscale_cmd, check=True, creationflags=_NO_WINDOW)
 
             post_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_post_filter()
             if post_filter:
@@ -3820,7 +3822,7 @@ class V11BApp(tk.Tk):
                     post_filter,
                     str(after_frame),
                 ]
-                subprocess.run(post_cmd, check=True)
+                subprocess.run(post_cmd, check=True, creationflags=_NO_WINDOW)
             else:
                 after_frame.write_bytes(upscaled_frame.read_bytes())
 
@@ -4076,7 +4078,7 @@ class V11BApp(tk.Tk):
                 "default=noprint_wrappers=1:nokey=1",
                 PipelineRunner._cli_path(input_path),
             ]
-            probe_out = subprocess.check_output(probe, text=True, encoding="utf-8", errors="replace").strip()
+            probe_out = subprocess.check_output(probe, text=True, encoding="utf-8", errors="replace", creationflags=_NO_WINDOW).strip()
             if not probe_out:
                 raise ValueError("Input does not contain a readable video stream")
         except subprocess.CalledProcessError as exc:
@@ -4248,6 +4250,7 @@ class V11BApp(tk.Tk):
                     errors="replace",
                     timeout=3,
                     check=False,
+                    creationflags=_NO_WINDOW,
                 )
                 lines = [line.strip() for line in result.stdout.splitlines() if line.strip() and line.strip().lower() != "name"]
                 if lines:
@@ -4269,6 +4272,7 @@ class V11BApp(tk.Tk):
                     errors="replace",
                     timeout=4,
                     check=False,
+                    creationflags=_NO_WINDOW,
                 )
                 value = (result.stdout or "").strip()
                 if value:
@@ -4319,6 +4323,7 @@ class V11BApp(tk.Tk):
                 errors="replace",
                 timeout=2,
                 check=False,
+                creationflags=_NO_WINDOW,
             )
             lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
             if lines:
@@ -4335,6 +4340,7 @@ class V11BApp(tk.Tk):
                 errors="replace",
                 timeout=3,
                 check=False,
+                creationflags=_NO_WINDOW,
             )
             lines = [line.strip() for line in result.stdout.splitlines() if line.strip() and line.strip().lower() != "name"]
             if lines:
@@ -4357,6 +4363,7 @@ class V11BApp(tk.Tk):
                 errors="replace",
                 timeout=4,
                 check=False,
+                creationflags=_NO_WINDOW,
             )
             lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
             if lines:
