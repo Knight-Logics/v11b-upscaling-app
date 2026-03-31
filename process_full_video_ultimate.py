@@ -112,7 +112,7 @@ ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "mediu
 IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
 TOKEN_PATTERN = re.compile(r"^v11b[-_][A-Za-z0-9]{12,128}$")
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Prefer bundled runtime files from PyInstaller extraction (_MEIPASS), then fall back
@@ -832,9 +832,20 @@ class EmbeddedBillingBackend:
             raise RuntimeError("Checkout session is not paid yet.")
 
         metadata_raw = _field(session, "metadata", {}) or {}
-        metadata = metadata_raw if isinstance(metadata_raw, dict) else dict(metadata_raw)
+        if isinstance(metadata_raw, dict):
+            metadata = metadata_raw
+        elif hasattr(metadata_raw, "to_dict_recursive"):
+            metadata = metadata_raw.to_dict_recursive() or {}
+        elif hasattr(metadata_raw, "items"):
+            metadata = dict(metadata_raw.items())
+        else:
+            metadata = {}
         token = str(metadata.get("token") or _field(session, "client_reference_id", "") or "").strip()
         credits = int(metadata.get("credits") or "0")
+        if credits <= 0:
+            credits = self._infer_credits_for_paid_session(session_id, session, metadata)
+        if credits <= 0:
+            raise RuntimeError("Could not determine purchased credits for this paid checkout session.")
         purchase_id = str(_field(session, "id", "") or "")
         already_processed, balance = self.store.apply_purchase_once(purchase_id, token, credits)
         return {
@@ -846,6 +857,43 @@ class EmbeddedBillingBackend:
             "status": self.store.get_status(token),
             "balance": balance,
         }
+
+    def _infer_credits_for_paid_session(self, session_id: str, session, metadata: dict) -> int:
+        """Best-effort fallback when Stripe metadata lacks explicit credits."""
+        package_hint = str(metadata.get("package_name") or "")
+        package_match = re.search(r"(\d+)", package_hint)
+        if package_match:
+            return max(0, int(package_match.group(1)))
+
+        def _field(obj, key: str, default=None):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            try:
+                return getattr(obj, key)
+            except Exception:
+                return default
+
+        try:
+            line_items = stripe.checkout.Session.list_line_items(session_id, limit=10)
+            data_items = _field(line_items, "data", []) or []
+            for item in data_items:
+                description = str(_field(item, "description", "") or "")
+                desc_match = re.search(r"(\d+)\s+credits?", description, re.IGNORECASE)
+                if desc_match:
+                    return max(0, int(desc_match.group(1)))
+
+                price_obj = _field(item, "price", {}) or {}
+                unit_amount = int(_field(price_obj, "unit_amount", 0) or 0)
+                quantity = int(_field(item, "quantity", 0) or 0)
+                if unit_amount > 0 and quantity > 0 and unit_amount == self.price_per_credit_cents:
+                    return quantity
+        except Exception:
+            pass
+
+        amount_total = int(_field(session, "amount_total", 0) or 0)
+        if amount_total > 0 and self.price_per_credit_cents > 0:
+            return max(1, int(round(amount_total / self.price_per_credit_cents)))
+        return 0
 
 
 @dataclass
@@ -4035,7 +4083,7 @@ class V11BApp(tk.Tk):
         ttk.Label(hero_left, text="Purchase Processing Credits", style="BillingHeroTitle.TLabel").pack(anchor=W)
         ttk.Label(
             hero_left,
-            text="Secure checkout opens inside the app window. Pick a package, complete payment, then return here to confirm and refresh your balance.",
+            text="Secure checkout opens inside the app window. Pick a package and complete payment — credits are confirmed automatically.",
             style="BillingHeroSub.TLabel",
             wraplength=520,
             justify=LEFT,
@@ -4079,12 +4127,6 @@ class V11BApp(tk.Tk):
                 padx=(0, 8) if column == 0 else (8, 8) if column == 1 else (8, 0),
                 pady=(0, 12),
             )
-
-        action_row = ttk.Frame(frame, style="Root.TFrame")
-        action_row.pack(fill=X, pady=(2, 0))
-        ttk.Button(action_row, text="Confirm Purchase", command=self._confirm_checkout, style="Accent.TButton", width=20).pack(side=RIGHT)
-        ttk.Button(action_row, text="Refresh Balance", command=self._refresh_billing_status, width=18).pack(side=RIGHT, padx=(0, 8))
-        ttk.Button(action_row, text="Close", command=self._close_billing_window, width=14).pack(side=RIGHT, padx=(0, 8))
 
     def _close_billing_window(self) -> None:
         window = self.billing_window
@@ -4184,15 +4226,17 @@ class V11BApp(tk.Tk):
         self.checkout_credits_var.set(int(credits))
         self.checkout_amount_cents_override = max(1, int(charge_cents)) if charge_cents is not None else None
         self.checkout_package_name_override = str(package_name or "").strip()
-        self._start_checkout()
+        started = self._start_checkout()
+        if started:
+            self._close_billing_window()
 
-    def _start_checkout(self) -> None:
+    def _start_checkout(self) -> bool:
         if self._checkout_pending:
             messagebox.showinfo(
                 "Checkout In Progress",
                 "A checkout session is already open in the checkout window. Complete payment, then click Confirm Payment.",
             )
-            return
+            return False
 
         token = self.billing_token_var.get().strip()
         if not token:
@@ -4200,12 +4244,12 @@ class V11BApp(tk.Tk):
             self.billing_token_var.set(token)
         if not is_valid_paid_access_token(token):
             messagebox.showwarning("Invalid Token", "Billing token format is invalid. Generate a new token or fix the current one.")
-            return
+            return False
 
         credits = int(self.checkout_credits_var.get())
         if credits <= 0:
             messagebox.showwarning("Invalid Credits", "Credits must be greater than 0.")
-            return
+            return False
 
         charge_cents = self.checkout_amount_cents_override
         package_name = self.checkout_package_name_override
@@ -4217,7 +4261,7 @@ class V11BApp(tk.Tk):
                 f"DEV MODE is active — no real payment will occur.\n\nAdd {credits} credits to token directly?",
                 parent=self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self,
             ):
-                return
+                return False
             fake_id = f"dev_{uuid.uuid4().hex}"
             _, balance = self.billing_store.apply_purchase_once(fake_id, token, credits)
             self._save_billing_state()
@@ -4226,7 +4270,7 @@ class V11BApp(tk.Tk):
             self.checkout_package_name_override = ""
             self.log_queue.put(f"[DEV] Bypassed payment — added {credits} credits. Balance={balance}.")
             self._on_payment_confirmed({"credited_credits": credits, "already_processed": False})
-            return
+            return True
 
         # ── Start local result-intercept server ──
         if self._payment_result_server is not None:
@@ -4270,7 +4314,7 @@ class V11BApp(tk.Tk):
             self.checkout_package_name_override = ""
             server.stop()
             self._payment_result_server = None
-            return
+            return False
 
         self.checkout_url_var.set(checkout_url)
         self.checkout_session_var.set(session_id)
@@ -4292,6 +4336,8 @@ class V11BApp(tk.Tk):
             if self._payment_poll_id is not None:
                 self.after_cancel(self._payment_poll_id)
             self._payment_poll_id = self.after(600, self._poll_payment_result)
+            return True
+        return False
 
     def _cancel_payment_poll(self) -> None:
         """Cancel any pending payment poll and clean up result server."""
@@ -4350,6 +4396,7 @@ class V11BApp(tk.Tk):
                             raise RuntimeError(str(data.get("error", f"HTTP {status_code}")))
                     self.after(0, lambda: self._on_payment_confirmed(data))
                 except Exception as exc:
+                    self.log_queue.put("[ERROR] Auto-confirm exception details:\n" + traceback.format_exc())
                     self.after(0, lambda _e=exc: self._on_payment_confirm_failed(str(_e)))
 
             threading.Thread(target=_confirm_worker, name="confirm-payment", daemon=True).start()
@@ -4395,7 +4442,7 @@ class V11BApp(tk.Tk):
         """Called in main thread when auto-confirm network call fails."""
         self._checkout_pending = False
         self.billing_status_var.set(f"Auto-confirm failed: {error}")
-        self.log_queue.put(f"[ERROR] Auto-confirm failed: {error}")
+        self.log_queue.put(f"[ERROR] Auto-confirm failed: {error!r}")
         parent = self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self
         messagebox.showwarning(
             "Confirm Failed",
