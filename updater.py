@@ -389,9 +389,14 @@ def _show_update_dialog(
                 if getattr(sys, "frozen", False):
                     old_exe = os.path.abspath(sys.executable)
                     _log_update(f"Frozen staged update mode active. current_exe={old_exe} downloaded_asset={new_path}")
-                    _set_status("Preparing updated runtime and relaunching...")
+                    _set_status("Replacing installed executable and relaunching...")
                     staged_exe = _prepare_staged_runtime(new_path, latest_tag)
-                    _launch_staged_runtime(staged_exe)
+                    swap_script = _create_swap_script(old_exe, staged_exe, UPDATE_LOG_PATH)
+                    subprocess.Popen(
+                        ["cmd.exe", "/c", swap_script],
+                        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                        close_fds=True,
+                    )
                     parent.after(500, parent.destroy)
                 else:
                     _set_status("Update downloaded. Running downloaded executable...")

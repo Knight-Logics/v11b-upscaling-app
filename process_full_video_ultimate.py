@@ -115,7 +115,7 @@ ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "mediu
 IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
 TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.15"
 
 # ---------------------------------------------------------------------------
 # Recovery token helpers (cross-device restore)
@@ -1663,7 +1663,7 @@ class V11BApp(tk.Tk):
             self.billing_audit_file,
         )
         self.billing_backend = EmbeddedBillingBackend(self.billing_store)
-        self.free_trial_credits = max(0, int(os.environ.get("V11B_FREE_TRIAL_CREDITS", "10")))
+        self.free_trial_credits = max(0, int(os.environ.get("V11B_FREE_TRIAL_CREDITS", "20")))
         self.smtp_host = ""
         self.smtp_port = 587
         self.smtp_user = ""
@@ -2186,8 +2186,22 @@ class V11BApp(tk.Tk):
             anchor="e",
         ).pack(anchor="e", pady=(1, 0))
 
+        demo_row = tk.Frame(built_by, bg="#111b2f")
+        demo_row.pack(anchor="e", pady=(1, 0))
+        demo_link = tk.Label(
+            demo_row,
+            text="▶ Watch Demo",
+            fg="#7df6c7",
+            bg="#111b2f",
+            font=("Segoe UI", 8, "underline"),
+            anchor="e",
+            cursor="hand2",
+        )
+        demo_link.pack(side=LEFT)
+        demo_link.bind("<Button-1>", lambda _event: webbrowser.open("https://youtu.be/6Rk3b037s8o"))
+        tk.Label(demo_row, text="|", fg="#3a5070", bg="#111b2f", font=("Segoe UI", 8)).pack(side=LEFT, padx=(6, 6))
         self.header_registration_label = tk.Label(
-            built_by,
+            demo_row,
             textvariable=self.header_registration_var,
             fg="#ff6b6b",
             bg="#111b2f",
@@ -2195,7 +2209,7 @@ class V11BApp(tk.Tk):
             anchor="e",
             cursor="hand2",
         )
-        self.header_registration_label.pack(anchor="e", pady=(1, 0))
+        self.header_registration_label.pack(side=LEFT)
 
         self._set_header_registration_state(self._header_email_registered, self.recovery_email_var.get().strip())
 
@@ -3249,11 +3263,9 @@ class V11BApp(tk.Tk):
         if not file_path:
             return
         self.input_video_var.set(file_path)
-        current_output = self.output_video_var.get().strip()
-        if not current_output:
-            input_path = Path(file_path)
-            output_name = f"{input_path.stem}_v11b_upscaled.mp4"
-            self.output_video_var.set(str(input_path.with_name(output_name)))
+        input_path = Path(file_path)
+        output_name = f"{input_path.stem}_v11b_upscaled.mp4"
+        self.output_video_var.set(str(input_path.with_name(output_name)))
 
         self._sync_target_fps_to_source_if_needed(file_path)
         self._normalize_interpolation_choice(show_feedback=True)
@@ -3593,44 +3605,44 @@ class V11BApp(tk.Tk):
 
     def _apply_access_code(self, code: str) -> None:
         token = (code or "").strip()
-        if not is_valid_paid_access_token(token):
-            messagebox.showwarning("Invalid Access Code", "Access code format is invalid.")
-            return
 
-        # New signed recovery token — verify HMAC, extract credits, apply to current session
+        # Only signed recovery tokens (v11b2.xxx) are valid here.
         payload = _verify_recovery_token(token)
-        if payload is not None:
-            credits = int(payload.get("c", 0))
-            email = str(payload.get("e") or "").strip()
-            if credits <= 0:
-                messagebox.showwarning("Invalid Recovery Token", "Recovery token contains no credits to restore.")
-                return
-            current = self.billing_token_var.get().strip()
-            if not current or not is_valid_paid_access_token(current):
-                current = self._generate_billing_token()
-                self.billing_token_var.set(current)
-            self.billing_store.add_credits(current, credits, source="recovery_token")
-            if email:
-                self.billing_store.link_email(current, email)
-                self.recovery_email_var.set(email)
-            self._save_billing_state()
-            self._refresh_billing_status(silent=True)
-            self.billing_status_var.set(f"Recovery token applied. {credits} paid credit(s) restored.")
-            self.log_queue.put(f"[INFO] Recovery token applied: {credits} credits restored.")
-            messagebox.showinfo(
-                "Credits Restored",
-                f"{credits} paid credit{'s' if credits != 1 else ''} have been restored to your account."
-                + (f"\n\nEmail {email} has been linked." if email else ""),
+        if payload is None:
+            messagebox.showwarning(
+                "Invalid Recovery Code",
+                "That code is not a valid PixelForge AI recovery code.\n\n"
+                "Recovery codes start with 'v11b2.' and are sent to your email when you back up your account.\n\n"
+                "Check your inbox for a 'PixelForge AI Access Code Backup' email.",
             )
             return
 
-        # Legacy opaque token — set as session key (backward compat for pre-v1.0.14 recovery emails)
-        self.billing_token_var.set(token)
-        self._ensure_free_trial_for_token(token)
+        credits = int(payload.get("c", 0))
+        email = str(payload.get("e") or "").strip()
+        if credits <= 0:
+            messagebox.showwarning("Invalid Recovery Code", "This recovery code contains no credits to restore.")
+            return
+
+        current = self.billing_token_var.get().strip()
+        if not current or not is_valid_paid_access_token(current):
+            current = self._generate_billing_token()
+            self.billing_token_var.set(current)
+        self.billing_store.add_credits(current, credits, source="recovery_token")
+        if email:
+            self.billing_store.link_email(current, email)
+            self.recovery_email_var.set(email)
+            self._set_header_registration_state(True, email)
         self._save_billing_state()
         self._refresh_billing_status(silent=True)
-        self.billing_status_var.set("Access code restored for this app session.")
-        self.log_queue.put("[INFO] Access code restored.")
+        self.billing_status_var.set(f"Recovery code applied. {credits} paid credit(s) restored.")
+        self.log_queue.put(f"[INFO] Recovery code applied: {credits} paid credits restored to your account.")
+        if email:
+            self.log_queue.put(f"[INFO] Account email confirmed: {email}")
+        messagebox.showinfo(
+            "Credits Restored",
+            f"{credits} paid credit{'s' if credits != 1 else ''} have been restored to your account."
+            + (f"\n\nEmail {email} has been linked to this installation." if email else ""),
+        )
 
     def _redeem_credit_code(self) -> None:
         token = self.billing_token_var.get().strip()
@@ -5708,8 +5720,9 @@ class V11BApp(tk.Tk):
             messagebox.showerror("Billing estimate failed", f"Could not calculate processing credits: {exc}")
             return
 
-        consumed, remaining = self.billing_store.consume_credits(token, required_credits, source="v11b_render_start")
-        if not consumed:
+        _bal_check = self.billing_store.get_status(token)
+        remaining = _bal_check["credits"]
+        if remaining < required_credits:
             self._refresh_billing_status(silent=True)
             messagebox.showwarning(
                 "Insufficient Credits",
@@ -5725,8 +5738,8 @@ class V11BApp(tk.Tk):
         self._reset_progress_state()
         self.credit_quote_var.set(f"Render cost locked: {required_credits} credit(s). Basis: {breakdown}.")
         self.start_button_credit_var.set(f"({required_credits} credits)")
-        self.billing_status_var.set(f"Billing: charged {required_credits} credits for this run. Remaining balance: {remaining}.")
-        self.log_queue.put(f"[INFO] Charged {required_credits} credits for processing. Remaining balance: {remaining}.")
+        self.billing_status_var.set(f"Billing: {required_credits} credits will be charged on successful completion. Current balance: {remaining}.")
+        self.log_queue.put(f"[INFO] {required_credits} credits reserved for this run. Credits are charged only after a successful output is confirmed.")
 
         self.stop_event.clear()
         self._set_progress_visible(True)
@@ -5751,8 +5764,20 @@ class V11BApp(tk.Tk):
             self.runner.run()
             self._cleanup_output_if_canceled()
             was_canceled = self._stop_requested_by_user
+            output_path = self._current_run_output
+            output_exists = (
+                output_path is not None
+                and output_path.exists()
+                and output_path.is_file()
+            )
             if was_canceled:
-                self.log_queue.put("[WARN] Processing canceled by user. No output file was kept.")
+                self.log_queue.put("[WARN] Processing canceled by user. No output file was kept. No credits were charged.")
+            elif output_exists and self._charged_token and self._charged_credits > 0:
+                consumed, new_balance = self.billing_store.consume_credits(
+                    self._charged_token, self._charged_credits, source="v11b_render_complete"
+                )
+                self.log_queue.put(f"[INFO] Processing completed. Charged {self._charged_credits} credits. Remaining balance: {new_balance}.")
+                self.after(0, lambda b=new_balance: self.billing_status_var.set(f"Billing: charged {self._charged_credits} credits for completed render. Remaining balance: {b}."))
             else:
                 self.log_queue.put("[INFO] Processing completed successfully.")
             self._charged_token = None
@@ -5765,13 +5790,8 @@ class V11BApp(tk.Tk):
             self.after(0, lambda: self._set_processing_controls_active(False))
             self.after(0, lambda: self._refresh_billing_status(silent=True))
         except Exception as exc:
-            if self._charged_token and self._charged_credits > 0:
-                refunded = self.billing_store.restore_credits(self._charged_token, self._charged_credits, source="v11b_render_refund")
-                self.log_queue.put(
-                    f"[WARN] Refunded {self._charged_credits} credits because processing did not complete. Balance: {refunded}."
-                )
-                self._charged_token = None
-                self._charged_credits = 0
+            self._charged_token = None
+            self._charged_credits = 0
             self._cleanup_output_if_canceled()
             self._current_run_output = None
             self._stop_requested_by_user = False
