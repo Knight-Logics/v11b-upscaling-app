@@ -1634,6 +1634,8 @@ class V11BApp(tk.Tk):
         self.smtp_user = ""
         self.smtp_pass = ""
         self.smtp_from = ""
+        self.smtp_retry_attempts = 3
+        self.smtp_retry_delay_sec = 1.5
         self.smtp_configured = False
         self._refresh_smtp_config()
 
@@ -3447,6 +3449,7 @@ class V11BApp(tk.Tk):
         self._refresh_smtp_config()
         if not self.smtp_configured:
             return False, "SMTP is not configured. Set V11B_SMTP_* env vars to enable email recovery."
+        
         try:
             body = (
                 "Your PixelForge AI access code is:\n\n"
@@ -3457,12 +3460,26 @@ class V11BApp(tk.Tk):
             msg["Subject"] = "PixelForge AI Access Code Backup"
             msg["From"] = self.smtp_from
             msg["To"] = to_email
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
-                server.starttls()
-                server.login(self.smtp_user, self.smtp_pass)
-                server.send_message(msg)
-            self.billing_store.record_recovery_sent(to_email)
-            return True, "Access code email sent."
+            
+            # Retry logic matching Display Control+ implementation
+            last_error = "unknown"
+            for attempt in range(1, self.smtp_retry_attempts + 1):
+                try:
+                    with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=20) as server:
+                        server.ehlo()
+                        if server.has_extn("starttls"):
+                            server.starttls()
+                            server.ehlo()
+                        server.login(self.smtp_user, self.smtp_pass)
+                        server.sendmail(self.smtp_from, [to_email], msg.as_string())
+                    self.billing_store.record_recovery_sent(to_email)
+                    return True, "Access code email sent."
+                except Exception as exc:
+                    last_error = str(exc)
+                    if attempt < self.smtp_retry_attempts:
+                        time.sleep(self.smtp_retry_delay_sec)
+            
+            return False, f"Failed to send recovery email after {self.smtp_retry_attempts} attempt(s): {last_error}"
         except Exception as exc:
             return False, f"Failed to send recovery email: {exc}"
 
@@ -3712,14 +3729,23 @@ class V11BApp(tk.Tk):
         self.debug_smtp_status_var.set("smtp=CONFIGURED" if self.smtp_configured else "smtp=MISSING (set V11B_SMTP_*)")
 
     def _refresh_smtp_config(self) -> None:
+        # Try to load SMTP config from env vars (same as Display Control+)
         self.smtp_host = _env_first(["V11B_SMTP_HOST", "PIXELFORGE_SMTP_HOST", "VIDEOFORGE_SMTP_HOST", "SMTP_HOST"])
         try:
             self.smtp_port = int(_env_first(["V11B_SMTP_PORT", "PIXELFORGE_SMTP_PORT", "VIDEOFORGE_SMTP_PORT", "SMTP_PORT"], "587"))
         except Exception:
             self.smtp_port = 587
         self.smtp_user = _env_first(["V11B_SMTP_USER", "PIXELFORGE_SMTP_USER", "VIDEOFORGE_SMTP_USER", "SMTP_USER"])
-        self.smtp_pass = _env_first(["V11B_SMTP_PASS", "PIXELFORGE_SMTP_PASS", "VIDEOFORGE_SMTP_PASS", "SMTP_PASS"])
+        self.smtp_pass = _env_first(["V11B_SMTP_PASS", "PIXELFORGE_SMTP_PASS", "VIDEOFORGE_SMTP_PASS", "SMTP_PASS"]).replace(" ", "")
         self.smtp_from = _env_first(["V11B_SMTP_FROM", "PIXELFORGE_SMTP_FROM", "VIDEOFORGE_SMTP_FROM", "SMTP_FROM"])
+        try:
+            self.smtp_retry_attempts = max(1, int(os.environ.get("SMTP_RETRY_ATTEMPTS", "3")))
+        except Exception:
+            self.smtp_retry_attempts = 3
+        try:
+            self.smtp_retry_delay_sec = max(0.5, float(os.environ.get("SMTP_RETRY_DELAY_SEC", "1.5")))
+        except Exception:
+            self.smtp_retry_delay_sec = 1.5
         self.smtp_configured = bool(self.smtp_host and self.smtp_user and self.smtp_pass and self.smtp_from)
 
     def _try_import_smtp_from_env_file(self, silent: bool = False) -> bool:
