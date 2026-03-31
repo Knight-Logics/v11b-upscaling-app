@@ -213,7 +213,7 @@ if errorlevel 1 (
 >> "%LOG_FILE%" echo [%date% %time%] Update copy verified.
 
 >> "%LOG_FILE%" echo [%date% %time%] Launching updated executable.
-powershell -NoProfile -Command "$p = if ($env:LAUNCH_ARGS) {{ Start-Process -FilePath $env:OLD_EXE -ArgumentList $env:LAUNCH_ARGS -PassThru }} else {{ Start-Process -FilePath $env:OLD_EXE -PassThru }}; Start-Sleep -Seconds 8; if (-not $p -or $p.HasExited) {{ Write-Output ('EXITED:' + ($p.ExitCode -as [string])); exit 2 }}; Write-Output ('RUNNING:' + $p.Id)" > "%TEMP%\\pixelforge_launch_result.txt"
+powershell -NoProfile -Command "Remove-Item Env:_MEIPASS2 -ErrorAction SilentlyContinue; Get-ChildItem Env: | Where-Object {{ $_.Name -like '_PYI*' }} | ForEach-Object {{ Remove-Item -Path ('Env:' + $_.Name) -ErrorAction SilentlyContinue }}; Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue; Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue; $p = if ($env:LAUNCH_ARGS) {{ Start-Process -FilePath $env:OLD_EXE -ArgumentList $env:LAUNCH_ARGS -UseNewEnvironment -PassThru }} else {{ Start-Process -FilePath $env:OLD_EXE -UseNewEnvironment -PassThru }}; Start-Sleep -Seconds 20; if (-not $p -or $p.HasExited) {{ Write-Output ('EXITED:' + ($p.ExitCode -as [string])); exit 2 }}; Write-Output ('RUNNING:' + $p.Id)" > "%TEMP%\\pixelforge_launch_result.txt"
 if errorlevel 2 goto launch_failed
 for /f "usebackq delims=" %%L in ("%TEMP%\\pixelforge_launch_result.txt") do >> "%LOG_FILE%" echo [%date% %time%] %%L
 
@@ -333,7 +333,18 @@ def _show_update_dialog(
                     _log_update(f"Frozen update mode active. current_exe={old_exe} downloaded_exe={new_path}")
                     swap_script = _create_swap_script(old_exe, new_path, UPDATE_LOG_PATH)
                     _set_status("Applying update and restarting...")
-                    subprocess.Popen(["cmd", "/c", swap_script], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    clean_env = dict(os.environ)
+                    clean_env.pop("_MEIPASS2", None)
+                    clean_env.pop("PYTHONHOME", None)
+                    clean_env.pop("PYTHONPATH", None)
+                    for env_key in list(clean_env.keys()):
+                        if str(env_key).startswith("_PYI"):
+                            clean_env.pop(env_key, None)
+                    subprocess.Popen(
+                        ["cmd", "/c", swap_script],
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        env=clean_env,
+                    )
                     parent.after(500, parent.destroy)
                 else:
                     _set_status("Update downloaded. Running downloaded executable...")
