@@ -6,6 +6,9 @@ sharpening, interpolation, scaling, encoding, and runtime estimation.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import importlib.util
 import json
 import math
@@ -111,8 +114,40 @@ MODEL_LABEL_TO_KEY = {label: key for key, label in MODEL_DETAILS}
 ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
-TOKEN_PATTERN = re.compile(r"^v11b[-_][A-Za-z0-9]{12,128}$")
-APP_VERSION = "1.0.13"
+TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
+APP_VERSION = "1.0.14"
+
+# ---------------------------------------------------------------------------
+# Recovery token helpers (cross-device restore)
+# ---------------------------------------------------------------------------
+_RECOVERY_HMAC_SECRET = b"v11b-pixelforge-ai-recovery-key-2026-xK9mQ2rL7n"
+
+
+def _build_recovery_token(paid_credits: int, email: str) -> str:
+    """Generate a self-contained signed recovery token for cross-device credit restore."""
+    payload = json.dumps(
+        {"c": int(paid_credits), "e": (email or "").strip().lower(), "t": int(time.time()), "v": 2},
+        separators=(",", ":"),
+    )
+    b64 = base64.urlsafe_b64encode(payload.encode()).rstrip(b"=").decode()
+    sig = hmac.new(_RECOVERY_HMAC_SECRET, b64.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"v11b2.{b64}.{sig}"
+
+
+def _verify_recovery_token(token: str) -> dict | None:
+    """Verify a signed recovery token. Returns the payload dict, or None if invalid."""
+    parts = (token or "").split(".")
+    if len(parts) != 3 or parts[0] != "v11b2":
+        return None
+    _, b64, given_sig = parts
+    expected_sig = hmac.new(_RECOVERY_HMAC_SECRET, b64.encode(), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(expected_sig, given_sig):
+        return None
+    try:
+        padded = b64 + "=" * (-len(b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded).decode())
+    except Exception:
+        return None
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Prefer bundled runtime files from PyInstaller extraction (_MEIPASS), then fall back
@@ -3451,10 +3486,17 @@ class V11BApp(tk.Tk):
             return False, "SMTP is not configured. Set V11B_SMTP_* env vars to enable email recovery."
         
         try:
+            # Build a signed recovery token so credits can be restored on any device
+            try:
+                paid_credits = int(self.billing_store.get_status(token).get("paid_credits", 0))
+            except Exception:
+                paid_credits = 0
+            recovery_token = _build_recovery_token(paid_credits, to_email)
             body = (
-                "Your PixelForge AI access code is:\n\n"
-                f"  {token}\n\n"
-                "Use Access Codes -> Have an Access Code? to restore your account and credits on a reinstall.\n"
+                "Your PixelForge AI recovery code is:\n\n"
+                f"  {recovery_token}\n\n"
+                "Use Access Codes \u2192 Have an Access Code? to restore your credits on any device or reinstall.\n"
+                f"This code contains {paid_credits} paid credit{'s' if paid_credits != 1 else ''}.\n"
             )
             msg = MIMEText(body, "plain", "utf-8")
             msg["Subject"] = "PixelForge AI Access Code Backup"
@@ -3554,6 +3596,35 @@ class V11BApp(tk.Tk):
         if not is_valid_paid_access_token(token):
             messagebox.showwarning("Invalid Access Code", "Access code format is invalid.")
             return
+
+        # New signed recovery token — verify HMAC, extract credits, apply to current session
+        payload = _verify_recovery_token(token)
+        if payload is not None:
+            credits = int(payload.get("c", 0))
+            email = str(payload.get("e") or "").strip()
+            if credits <= 0:
+                messagebox.showwarning("Invalid Recovery Token", "Recovery token contains no credits to restore.")
+                return
+            current = self.billing_token_var.get().strip()
+            if not current or not is_valid_paid_access_token(current):
+                current = self._generate_billing_token()
+                self.billing_token_var.set(current)
+            self.billing_store.add_credits(current, credits, source="recovery_token")
+            if email:
+                self.billing_store.link_email(current, email)
+                self.recovery_email_var.set(email)
+            self._save_billing_state()
+            self._refresh_billing_status(silent=True)
+            self.billing_status_var.set(f"Recovery token applied. {credits} paid credit(s) restored.")
+            self.log_queue.put(f"[INFO] Recovery token applied: {credits} credits restored.")
+            messagebox.showinfo(
+                "Credits Restored",
+                f"{credits} paid credit{'s' if credits != 1 else ''} have been restored to your account."
+                + (f"\n\nEmail {email} has been linked." if email else ""),
+            )
+            return
+
+        # Legacy opaque token — set as session key (backward compat for pre-v1.0.14 recovery emails)
         self.billing_token_var.set(token)
         self._ensure_free_trial_for_token(token)
         self._save_billing_state()
