@@ -112,7 +112,7 @@ ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "mediu
 IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
 TOKEN_PATTERN = re.compile(r"^v11b[-_][A-Za-z0-9]{12,128}$")
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Prefer bundled runtime files from PyInstaller extraction (_MEIPASS), then fall back
@@ -3722,23 +3722,15 @@ class V11BApp(tk.Tk):
         self.smtp_from = _env_first(["V11B_SMTP_FROM", "PIXELFORGE_SMTP_FROM", "VIDEOFORGE_SMTP_FROM", "SMTP_FROM"])
         self.smtp_configured = bool(self.smtp_host and self.smtp_user and self.smtp_pass and self.smtp_from)
 
-        # If SMTP is still missing, try importing from a local VideoForge .env (same machine/dev setup).
-        if not self.smtp_configured:
-            self._try_import_smtp_from_videoforge_env(silent=True)
-
-    def _try_import_smtp_from_videoforge_env(self, silent: bool = False) -> bool:
+    def _try_import_smtp_from_env_file(self, silent: bool = False) -> bool:
         configured_now = bool(self.smtp_host and self.smtp_user and self.smtp_pass and self.smtp_from)
         if configured_now:
             return True
 
-        custom_env_path = _env_first(["V11B_VIDEOFORGE_ENV_PATH"], "")
+        custom_env_path = _env_first(["V11B_SMTP_ENV_PATH"], "")
         candidates: list[Path] = []
         if custom_env_path:
             candidates.append(Path(custom_env_path))
-
-        appdata_root = Path(os.environ.get("APPDATA", "").strip()) if os.environ.get("APPDATA") else None
-        if appdata_root:
-            candidates.append(appdata_root / "KnightLogics" / "shared_billing.env")
         candidates.append(_APP_DIR / ".env")
 
         vf_env = None
@@ -3793,16 +3785,17 @@ class V11BApp(tk.Tk):
             if not silent:
                 messagebox.showinfo(
                     "SMTP Imported",
-                    f"Imported SMTP settings from VideoForge env:\n{vf_env}",
+                    f"Imported SMTP settings from env file:\n{vf_env}",
                     parent=self.billing_debug_window if self.billing_debug_window and self.billing_debug_window.winfo_exists() else self,
                 )
-            self.log_queue.put(f"[INFO] Imported SMTP settings from VideoForge env: {vf_env}")
+            self.log_queue.put(f"[INFO] Imported SMTP settings from env file: {vf_env}")
             return True
         except Exception as exc:
-            self.log_queue.put(f"[WARN] Failed to import SMTP from VideoForge env: {exc}")
+            self.log_queue.put(f"[WARN] Failed to import SMTP from env file: {exc}")
             return False
 
-    def _open_smtp_setup_dialog(self) -> None:
+    def _open_smtp_setup_dialog(self) -> bool:
+        saved = {"value": False}
         dialog = tk.Toplevel(self)
         dialog.title("SMTP Setup")
         dialog.minsize(560, 300)
@@ -3870,6 +3863,7 @@ class V11BApp(tk.Tk):
                 self._refresh_billing_debug_snapshot()
                 self.billing_status_var.set("SMTP settings saved. You can now send recovery emails.")
                 self.log_queue.put(f"[INFO] SMTP settings saved to {target_env}.")
+                saved["value"] = True
                 messagebox.showinfo("SMTP Saved", "SMTP settings saved successfully.", parent=dialog)
                 dialog.destroy()
             except Exception as exc:
@@ -3882,6 +3876,9 @@ class V11BApp(tk.Tk):
 
         dialog.lift()
         dialog.focus_force()
+        dialog.grab_set()
+        dialog.wait_window()
+        return bool(saved["value"])
 
     def _apply_stripe_key_override(self, secret_key: str, source_label: str) -> bool:
         normalized = str(secret_key or "").strip()
@@ -3998,7 +3995,7 @@ class V11BApp(tk.Tk):
         ttk.Button(key_row, text="Switch To TEST Key", command=self._switch_to_test_key).pack(side=LEFT)
         ttk.Button(key_row, text="Switch To LIVE Key", command=self._switch_to_live_key).pack(side=LEFT, padx=6)
         ttk.Button(key_row, text="Configure SMTP", command=self._open_smtp_setup_dialog).pack(side=LEFT, padx=6)
-        ttk.Button(key_row, text="Import SMTP From VideoForge", command=self._try_import_smtp_from_videoforge_env).pack(side=LEFT, padx=6)
+        ttk.Button(key_row, text="Import SMTP From Env File", command=self._try_import_smtp_from_env_file).pack(side=LEFT, padx=6)
 
         ttk.Checkbutton(
             frame,
@@ -4584,15 +4581,58 @@ class V11BApp(tk.Tk):
                 )
             else:
                 if "SMTP is not configured" in msg:
-                    self.billing_status_var.set(
-                        "Purchase confirmed. Email linked successfully. SMTP is not configured yet, so backup email was skipped."
+                    setup_now = messagebox.askyesno(
+                        "SMTP Not Configured",
+                        "Email is linked, but SMTP is not configured yet.\n\n"
+                        "Would you like to configure SMTP now and retry sending the backup email?",
+                        parent=parent_window,
                     )
+                    if setup_now:
+                        saved = self._open_smtp_setup_dialog()
+                        if saved:
+                            retry_ok, retry_msg = self._send_recovery_email(normalized, token)
+                            if retry_ok:
+                                if trigger == "purchase":
+                                    self.billing_status_var.set(f"Purchase confirmed. Backup email sent to {normalized}.")
+                                else:
+                                    self.billing_status_var.set(f"Backup email sent to {normalized}.")
+                                self.log_queue.put(f"[INFO] Access code backup email sent to {normalized} after SMTP setup.")
+                                messagebox.showinfo(
+                                    "Backup Email Sent",
+                                    "SMTP was configured and your backup email was sent successfully.",
+                                    parent=parent_window,
+                                )
+                                return
+                            self.log_queue.put(f"[WARN] SMTP configured but backup send still failed: {retry_msg}")
+                            messagebox.showwarning(
+                                "Backup Email Failed",
+                                f"SMTP was configured, but sending still failed:\n\n{retry_msg}",
+                                parent=parent_window,
+                            )
+                            return
+
+                    if trigger == "purchase":
+                        self.billing_status_var.set(
+                            "Purchase confirmed. Email linked successfully. SMTP is not configured yet, so backup email was skipped."
+                        )
+                        info_text = (
+                            "Payment is confirmed and your email is linked.\n\n"
+                            "SMTP is not configured yet, so backup email was skipped for now.\n"
+                            "Set V11B_SMTP_* vars to enable automatic email sending."
+                        )
+                    else:
+                        self.billing_status_var.set(
+                            "Email linked successfully. SMTP is not configured yet, so backup email was skipped."
+                        )
+                        info_text = (
+                            "Your email is linked successfully.\n\n"
+                            "SMTP is not configured yet, so backup email was skipped for now.\n"
+                            "Set V11B_SMTP_* vars to enable automatic email sending."
+                        )
                     self.log_queue.put("[INFO] Email linked; SMTP not configured so backup send was skipped.")
                     messagebox.showinfo(
                         "Email Linked",
-                        "Payment is confirmed and your email is linked.\n\n"
-                        "SMTP is not configured yet, so backup email was skipped for now.\n"
-                        "Set V11B_SMTP_* vars to enable automatic email sending.",
+                        info_text,
                         parent=parent_window,
                     )
                 else:
