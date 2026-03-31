@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import threading
 import time
 import tkinter as tk
 import traceback
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -27,10 +29,12 @@ RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 APPDATA_ROOT = os.environ.get("APPDATA", os.path.expanduser("~"))
 RUNTIME_DIR = os.path.join(APPDATA_ROOT, "KnightLogics", "PixelForgeAI")
 UPDATES_DIR = os.path.join(RUNTIME_DIR, "updates")
+INSTALLS_DIR = os.path.join(RUNTIME_DIR, "installs")
 PENDING_UPDATE_PATH = os.path.join(RUNTIME_DIR, "pending_update.json")
 UPDATE_LOG_PATH = os.path.join(RUNTIME_DIR, "updater.log")
 
 os.makedirs(UPDATES_DIR, exist_ok=True)
+os.makedirs(INSTALLS_DIR, exist_ok=True)
 
 
 def _log_update(message: str) -> None:
@@ -115,21 +119,28 @@ def _normalize_asset_digest(asset: dict) -> str | None:
     return digest or None
 
 
-def _select_windows_exe_asset(release_payload: dict) -> tuple[str | None, str | None, int, str | None]:
+def _select_windows_asset(release_payload: dict) -> tuple[str | None, str | None, int, str | None]:
     assets = release_payload.get("assets", [])
     tag_clean = str(release_payload.get("tag_name", "")).strip().lower().lstrip("v")
 
-    # Prefer files with v11b naming and explicit version in filename.
+    # Prefer the packaged zip first; this avoids in-place exe replacement.
     for asset in assets:
         name = str(asset.get("name", "")).strip()
         lname = name.lower()
         url = str(asset.get("browser_download_url", "")).strip()
-        if not url or not lname.endswith(".exe"):
+        if not url or not lname.endswith(".zip"):
             continue
-        if "v11b" in lname and (tag_clean and tag_clean in lname):
+        if "pixelforge-ai_" in lname and "_windows_x64.zip" in lname and (tag_clean and tag_clean in lname):
             return url, name, int(asset.get("size", 0) or 0), _normalize_asset_digest(asset)
 
-    # Fallback: first .exe asset.
+    # Fallback: first zip package.
+    for asset in assets:
+        name = str(asset.get("name", "")).strip()
+        url = str(asset.get("browser_download_url", "")).strip()
+        if url and name.lower().endswith(".zip"):
+            return url, name, int(asset.get("size", 0) or 0), _normalize_asset_digest(asset)
+
+    # Final fallback: first .exe asset.
     for asset in assets:
         name = str(asset.get("name", "")).strip()
         url = str(asset.get("browser_download_url", "")).strip()
@@ -137,6 +148,54 @@ def _select_windows_exe_asset(release_payload: dict) -> tuple[str | None, str | 
             return url, name, int(asset.get("size", 0) or 0), _normalize_asset_digest(asset)
 
     return None, None, 0, None
+
+
+def _find_exe_in_tree(root: str) -> str | None:
+    preferred = os.path.join(root, "PixelForge-AI.exe")
+    if os.path.isfile(preferred):
+        return preferred
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for filename in filenames:
+            if filename.lower() == "pixelforge-ai.exe":
+                return os.path.join(dirpath, filename)
+    return None
+
+
+def _prepare_staged_runtime(downloaded_path: str, latest_tag: str) -> str:
+    tag_clean = latest_tag.strip().lstrip("vV") or "latest"
+    target_dir = os.path.join(INSTALLS_DIR, f"v{tag_clean}")
+    staging_dir = os.path.join(INSTALLS_DIR, f"v{tag_clean}.staging")
+
+    if os.path.exists(staging_dir):
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    os.makedirs(staging_dir, exist_ok=True)
+
+    if downloaded_path.lower().endswith(".zip"):
+        with zipfile.ZipFile(downloaded_path, "r") as zf:
+            zf.extractall(staging_dir)
+        staged_exe = _find_exe_in_tree(staging_dir)
+        if not staged_exe:
+            raise RuntimeError("Downloaded update package does not contain PixelForge-AI.exe")
+    else:
+        staged_exe = os.path.join(staging_dir, "PixelForge-AI.exe")
+        shutil.copy2(downloaded_path, staged_exe)
+
+    if os.path.exists(target_dir):
+        shutil.rmtree(target_dir, ignore_errors=True)
+    os.replace(staging_dir, target_dir)
+
+    final_exe = _find_exe_in_tree(target_dir)
+    if not final_exe:
+        raise RuntimeError("Staged runtime is missing PixelForge-AI.exe")
+    return final_exe
+
+
+def _launch_staged_runtime(exe_path: str) -> None:
+    _log_update(f"Launching staged runtime: {exe_path}")
+    if hasattr(os, "startfile"):
+        os.startfile(exe_path)  # type: ignore[attr-defined]
+        return
+    subprocess.Popen([exe_path])
 
 
 def _download_asset(url: str, filename: str, expected_size: int = 0, expected_sha256: str | None = None, status_cb=None) -> str:
@@ -187,16 +246,12 @@ def _download_asset(url: str, filename: str, expected_size: int = 0, expected_sh
 
 
 def _create_swap_script(old_exe: str, new_exe: str, log_path: str, launch_args: list[str] | None = None) -> str:
-    args = launch_args or []
-    args_str = " ".join(f'"{a}"' for a in args)
     script = f"""@echo off
 setlocal
 set "OLD_EXE={old_exe}"
 set "NEW_EXE={new_exe}"
 set "BACKUP_EXE={old_exe}.previous"
 set "LOG_FILE={log_path}"
-set "LAUNCH_ARGS={args_str}"
-
 >> "%LOG_FILE%" echo [%date% %time%] Update swap script started. old=%OLD_EXE% new=%NEW_EXE%
 
 timeout /t 3 /nobreak >nul
@@ -213,12 +268,16 @@ if errorlevel 1 (
 >> "%LOG_FILE%" echo [%date% %time%] Update copy verified.
 
 >> "%LOG_FILE%" echo [%date% %time%] Launching updated executable.
-powershell -NoProfile -Command "Remove-Item Env:_MEIPASS2 -ErrorAction SilentlyContinue; Get-ChildItem Env: | Where-Object {{ $_.Name -like '_PYI*' }} | ForEach-Object {{ Remove-Item -Path ('Env:' + $_.Name) -ErrorAction SilentlyContinue }}; Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue; Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue; $p = if ($env:LAUNCH_ARGS) {{ Start-Process -FilePath $env:OLD_EXE -ArgumentList $env:LAUNCH_ARGS -PassThru }} else {{ Start-Process -FilePath $env:OLD_EXE -PassThru }}; Start-Sleep -Seconds 20; if (-not $p -or $p.HasExited) {{ Write-Output ('EXITED:' + ($p.ExitCode -as [string])); exit 2 }}; Write-Output ('RUNNING:' + $p.Id)" > "%TEMP%\\pixelforge_launch_result.txt"
-if errorlevel 2 goto launch_failed
-for /f "usebackq delims=" %%L in ("%TEMP%\\pixelforge_launch_result.txt") do >> "%LOG_FILE%" echo [%date% %time%] %%L
+set "_MEIPASS2="
+set "PYTHONHOME="
+set "PYTHONPATH="
+start "" "%OLD_EXE%"
+timeout /t 8 /nobreak >nul
+tasklist /fi "IMAGENAME eq PixelForge-AI.exe" /fo csv /nh 2>nul | find /i "PixelForge-AI.exe" >nul 2>nul
+if errorlevel 1 goto launch_failed
+>> "%LOG_FILE%" echo [%date% %time%] RUNNING (health check passed)
 
 powershell -NoProfile -Command "if (Test-Path -LiteralPath $env:BACKUP_EXE) {{ Remove-Item -LiteralPath $env:BACKUP_EXE -Force -ErrorAction SilentlyContinue }}; if (Test-Path -LiteralPath $env:NEW_EXE) {{ Remove-Item -LiteralPath $env:NEW_EXE -Force -ErrorAction SilentlyContinue }}"
-if exist "%TEMP%\\pixelforge_launch_result.txt" del "%TEMP%\\pixelforge_launch_result.txt" >nul 2>nul
 endlocal
 exit /b 0
 
@@ -228,10 +287,9 @@ endlocal
 exit /b 1
 
 :launch_failed
-for /f "usebackq delims=" %%L in ("%TEMP%\\pixelforge_launch_result.txt") do >> "%LOG_FILE%" echo [%date% %time%] %%L
+>> "%LOG_FILE%" echo [%date% %time%] Launch health check failed - restoring backup.
 powershell -NoProfile -Command "$ErrorActionPreference='Continue'; if (Test-Path -LiteralPath $env:BACKUP_EXE) {{ Copy-Item -LiteralPath $env:BACKUP_EXE -Destination $env:OLD_EXE -Force }}"
 >> "%LOG_FILE%" echo [%date% %time%] Restored previous executable after failed launch.
-if exist "%TEMP%\\pixelforge_launch_result.txt" del "%TEMP%\\pixelforge_launch_result.txt" >nul 2>nul
 endlocal
 exit /b 2
 """
@@ -291,7 +349,7 @@ def _show_update_dialog(
         if busy["value"]:
             return
         if not asset_url or not asset_name:
-            status_var.set("No Windows .exe update asset found in latest release.")
+            status_var.set("No Windows update asset found in latest release.")
             return
 
         resolved_url = str(asset_url)
@@ -330,26 +388,16 @@ def _show_update_dialog(
 
                 if getattr(sys, "frozen", False):
                     old_exe = os.path.abspath(sys.executable)
-                    _log_update(f"Frozen update mode active. current_exe={old_exe} downloaded_exe={new_path}")
-                    swap_script = _create_swap_script(old_exe, new_path, UPDATE_LOG_PATH)
-                    _set_status("Applying update and restarting...")
-                    clean_env = dict(os.environ)
-                    clean_env.pop("_MEIPASS2", None)
-                    clean_env.pop("PYTHONHOME", None)
-                    clean_env.pop("PYTHONPATH", None)
-                    for env_key in list(clean_env.keys()):
-                        if str(env_key).startswith("_PYI"):
-                            clean_env.pop(env_key, None)
-                    subprocess.Popen(
-                        ["cmd", "/c", swap_script],
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        env=clean_env,
-                    )
+                    _log_update(f"Frozen staged update mode active. current_exe={old_exe} downloaded_asset={new_path}")
+                    _set_status("Preparing updated runtime and relaunching...")
+                    staged_exe = _prepare_staged_runtime(new_path, latest_tag)
+                    _launch_staged_runtime(staged_exe)
                     parent.after(500, parent.destroy)
                 else:
                     _set_status("Update downloaded. Running downloaded executable...")
                     _log_update(f"Non-frozen update test launch: {new_path}")
-                    subprocess.Popen([new_path], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    staged_exe = _prepare_staged_runtime(new_path, latest_tag)
+                    _launch_staged_runtime(staged_exe)
             except Exception as exc:
                 _log_update(f"Update flow failed before restart: {exc}")
                 _set_status(f"Update failed: {exc}")
@@ -409,7 +457,7 @@ def check_for_updates(parent: tk.Tk, current_version: str, *, silent: bool = Tru
                 _log_update(f"Update prompt suppressed for tag={latest_tag} current=v{current_version}")
                 return
             if _parse_version(latest_tag) > _parse_version(current_version):
-                asset_url, asset_name, asset_size, asset_sha256 = _select_windows_exe_asset(payload)
+                asset_url, asset_name, asset_size, asset_sha256 = _select_windows_asset(payload)
                 _log_update(
                     f"Update available: current=v{current_version} latest={latest_tag} "
                     f"asset={asset_name} size={asset_size} sha256={asset_sha256 or 'n/a'}"
