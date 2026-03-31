@@ -112,7 +112,7 @@ ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "mediu
 IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
 TOKEN_PATTERN = re.compile(r"^v11b[-_][A-Za-z0-9]{12,128}$")
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Prefer bundled runtime files from PyInstaller extraction (_MEIPASS), then fall back
