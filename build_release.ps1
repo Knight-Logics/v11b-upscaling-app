@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "1.0.13"
+  [string]$Version = "1.0.16"
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,25 +32,43 @@ if (Test-Path $iconPath) {
   --collect-data certifi `
   --collect-all webview `
   --add-binary "realesrgan-ncnn-vulkan.exe;." `
+  --add-binary "realsr-ncnn-vulkan.exe;." `
+  --add-binary "waifu2x-ncnn-vulkan.exe;." `
+  --add-binary "rife-ncnn-vulkan.exe;." `
   --add-data "assets;assets" `
   --add-data "models;models" `
+  --add-data "realsr-models;realsr-models" `
+  --add-data "waifu2x-models;waifu2x-models" `
+  --add-data "rife-models;rife-models" `
   @iconArg `
   process_full_video_ultimate.py
 
 Copy-Item (Join-Path $root "dist\PixelForge-AI.exe") (Join-Path $releaseDir "PixelForge-AI.exe") -Force
 
 # Bundle runtime model/tool files needed by app pipeline
-if (Test-Path (Join-Path $root "realesrgan-ncnn-vulkan.exe")) {
-  Copy-Item (Join-Path $root "realesrgan-ncnn-vulkan.exe") (Join-Path $releaseDir "realesrgan-ncnn-vulkan.exe") -Force
+$runtimeExes = @(
+  "realesrgan-ncnn-vulkan.exe",
+  "realsr-ncnn-vulkan.exe",
+  "waifu2x-ncnn-vulkan.exe",
+  "rife-ncnn-vulkan.exe"
+)
+foreach ($exe in $runtimeExes) {
+  if (Test-Path (Join-Path $root $exe)) {
+    Copy-Item (Join-Path $root $exe) (Join-Path $releaseDir $exe) -Force
+  }
 }
-if (Test-Path (Join-Path $root "models")) {
-  Copy-Item (Join-Path $root "models") (Join-Path $releaseDir "models") -Recurse -Force
+
+$runtimeDirs = @("models", "realsr-models", "waifu2x-models", "rife-models")
+foreach ($dir in $runtimeDirs) {
+  if (Test-Path (Join-Path $root $dir)) {
+    Copy-Item (Join-Path $root $dir) (Join-Path $releaseDir $dir) -Recurse -Force
+  }
 }
-if (Test-Path (Join-Path $root "vcomp140.dll")) {
-  Copy-Item (Join-Path $root "vcomp140.dll") (Join-Path $releaseDir "vcomp140.dll") -Force
-}
-if (Test-Path (Join-Path $root "vcomp140d.dll")) {
-  Copy-Item (Join-Path $root "vcomp140d.dll") (Join-Path $releaseDir "vcomp140d.dll") -Force
+
+foreach ($dll in @("vcomp140.dll", "vcomp140d.dll")) {
+  if (Test-Path (Join-Path $root $dll)) {
+    Copy-Item (Join-Path $root $dll) (Join-Path $releaseDir $dll) -Force
+  }
 }
 
 $zipName = "PixelForge-AI_${Version}_windows_x64.zip"

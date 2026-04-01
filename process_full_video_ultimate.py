@@ -106,16 +106,67 @@ MODEL_DETAILS = [
         "realesr-animevideov3-x2",
         "realesr-animevideov3-x2 (Anime video, fastest draft for animation)",
     ),
+    (
+        "realsr-df2k",
+        "realsr-df2k (Real photos/camera footage: faces, natural scenes)",
+    ),
+    (
+        "realsr-df2k-jpeg",
+        "realsr-df2k-jpeg (Real photos + JPEG artifact removal)",
+    ),
+    (
+        "waifu2x-cunet-noise3",
+        "waifu2x-cunet-noise3 (2x/4x | Anime/art: highest quality, max denoise)",
+    ),
+    (
+        "waifu2x-cunet-noise1",
+        "waifu2x-cunet-noise1 (2x/4x | Anime/art: high quality, mild denoise)",
+    ),
+    (
+        "waifu2x-anime-noise3",
+        "waifu2x-anime-noise3 (2x/4x | Anime style: fast, max denoise)",
+    ),
+    (
+        "waifu2x-anime-noise1",
+        "waifu2x-anime-noise1 (2x/4x | Anime style: fastest, mild denoise)",
+    ),
 ]
 MODEL_OPTIONS = [key for key, _label in MODEL_DETAILS]
 MODEL_KEY_TO_LABEL = {key: label for key, label in MODEL_DETAILS}
 MODEL_LABEL_TO_KEY = {label: key for key, label in MODEL_DETAILS}
 
+# RealSR model name map (key → realsr-ncnn-vulkan -n argument)
+REALSR_MODEL_NAMES: dict[str, str] = {
+    "realsr-df2k":      "models-DF2K",
+    "realsr-df2k-jpeg": "models-DF2K_JPEG",
+}
+
+# Waifu2x model config map (key → (models_subdir, noise_level_str))
+WAIFU2X_MODEL_CONFIGS: dict[str, tuple[str, str]] = {
+    "waifu2x-cunet-noise3": ("models-cunet",                         "3"),
+    "waifu2x-cunet-noise1": ("models-cunet",                         "1"),
+    "waifu2x-anime-noise3": ("models-upconv_7_anime_style_art_rgb",  "3"),
+    "waifu2x-anime-noise1": ("models-upconv_7_anime_style_art_rgb",  "1"),
+}
+
 ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 IMAGE_FORMATS = ["png", "jpg"]
 FPS_OPTIONS = [24, 30, 48, 60]
+
+INTERP_ENGINE_OPTIONS = ["RIFE (GPU — fast, high quality)", "minterpolate (CPU — slower, compatible)"]
+INTERP_ENGINE_RIFE     = "RIFE (GPU — fast, high quality)"
+INTERP_ENGINE_MINTERP  = "minterpolate (CPU — slower, compatible)"
+
+# RIFE model options: key in rife-models/, label shown in UI
+RIFE_MODEL_DETAILS = [
+    ("rife-v4.6", "rife-v4.6  (recommended — fast, high quality)"),
+    ("rife-v4",   "rife-v4    (legacy baseline)"),
+]
+RIFE_MODEL_OPTIONS   = [key for key, _label in RIFE_MODEL_DETAILS]
+RIFE_MODEL_KEY_TO_LABEL = {key: label for key, label in RIFE_MODEL_DETAILS}
+RIFE_MODEL_LABEL_TO_KEY = {label: key for key, label in RIFE_MODEL_DETAILS}
 TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
-APP_VERSION = "1.0.15"
+APP_VERSION = "1.0.16"
 
 # ---------------------------------------------------------------------------
 # Recovery token helpers (cross-device restore)
@@ -374,6 +425,15 @@ def _resolve_runtime_path(relative_path: str) -> Path:
 
 _REALESRGAN_EXE: Path = _resolve_runtime_path("realesrgan-ncnn-vulkan.exe")
 _REALESRGAN_MODELS_DIR: Path = _resolve_runtime_path("models")
+
+_REALSR_EXE: Path = _resolve_runtime_path("realsr-ncnn-vulkan.exe")
+_REALSR_MODELS_DIR: Path = _resolve_runtime_path("realsr-models")
+
+_WAIFU2X_EXE: Path = _resolve_runtime_path("waifu2x-ncnn-vulkan.exe")
+_WAIFU2X_MODELS_DIR: Path = _resolve_runtime_path("waifu2x-models")
+
+_RIFE_EXE: Path = _resolve_runtime_path("rife-ncnn-vulkan.exe")
+_RIFE_MODELS_DIR: Path = _resolve_runtime_path("rife-models")
 
 
 def _configure_stripe_tls_bundle() -> None:
@@ -954,6 +1014,8 @@ class PipelineSettings:
     unsharp2: float
     enable_interpolation: bool
     target_fps: int
+    interp_engine: str
+    rife_model: str
     apply_final_scale: bool
     target_width: int
     target_height: int
@@ -1286,14 +1348,66 @@ class PipelineRunner:
     def run(self) -> None:
         input_path = self.settings.input_video
         output_path = self.settings.output_video
-        exe_path = _REALESRGAN_EXE
+        model_key = self.settings.model
+
+        # Determine which binary family handles this model
+        if model_key.startswith("realsr-"):
+            exe_path = _REALSR_EXE
+            exe_label = "RealSR"
+        elif model_key.startswith("waifu2x-"):
+            exe_path = _WAIFU2X_EXE
+            exe_label = "Waifu2x"
+        else:
+            exe_path = _REALESRGAN_EXE
+            exe_label = "Real-ESRGAN"
+
+        self.log(f"[INFO] Upscale engine: {exe_label}  |  model: {model_key}")
+        self.log(f"[INFO] Engine binary path: {exe_path}")
 
         if not input_path.exists():
             raise FileNotFoundError(f"Input video not found: {input_path}")
         if not exe_path.exists():
-            raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (looked in bundled/app paths; final candidate: {exe_path})")
-        if not _REALESRGAN_MODELS_DIR.exists():
-            raise FileNotFoundError(f"Real-ESRGAN models folder not found (looked in bundled/app paths; final candidate: {_REALESRGAN_MODELS_DIR})")
+            raise FileNotFoundError(
+                f"{exe_label} exe not found (looked in bundled/app paths; final candidate: {exe_path})\n"
+                f"Download {exe_label} from its GitHub releases page and place it next to PixelForge-AI.exe."
+            )
+
+        if model_key.startswith("realsr-"):
+            self.log(f"[INFO] RealSR models dir: {_REALSR_MODELS_DIR}")
+            if not _REALSR_MODELS_DIR.exists():
+                raise FileNotFoundError(
+                    f"RealSR models folder not found (final candidate: {_REALSR_MODELS_DIR})\n"
+                    f"Expected folder 'realsr-models/' next to PixelForge-AI.exe containing models-DF2K/ and models-DF2K_JPEG/."
+                )
+            realsr_model_name = REALSR_MODEL_NAMES.get(model_key, "models-DF2K")
+            realsr_model_path = _REALSR_MODELS_DIR / realsr_model_name
+            if not realsr_model_path.exists():
+                raise FileNotFoundError(
+                    f"RealSR model subfolder '{realsr_model_name}' not found inside {_REALSR_MODELS_DIR}\n"
+                    f"Make sure realsr-models/{realsr_model_name}/ contains the .bin and .param files."
+                )
+            self.log(f"[INFO] RealSR model subfolder: {realsr_model_path}")
+        elif model_key.startswith("waifu2x-"):
+            waifu_subdir, _noise = WAIFU2X_MODEL_CONFIGS.get(model_key, ("models-cunet", "3"))
+            waifu_model_dir = _WAIFU2X_MODELS_DIR / waifu_subdir
+            self.log(f"[INFO] Waifu2x models dir: {_WAIFU2X_MODELS_DIR}  |  subdir: {waifu_subdir}  |  noise level: {_noise}")
+            if not _WAIFU2X_MODELS_DIR.exists():
+                raise FileNotFoundError(
+                    f"Waifu2x models root not found (final candidate: {_WAIFU2X_MODELS_DIR})\n"
+                    f"Expected folder 'waifu2x-models/' next to PixelForge-AI.exe containing model subdirs."
+                )
+            if not waifu_model_dir.exists():
+                raise FileNotFoundError(
+                    f"Waifu2x model subfolder '{waifu_subdir}' not found inside {_WAIFU2X_MODELS_DIR}\n"
+                    f"Make sure waifu2x-models/{waifu_subdir}/ contains the .bin and .param files."
+                )
+        else:
+            self.log(f"[INFO] Real-ESRGAN models dir: {_REALESRGAN_MODELS_DIR}")
+            if not _REALESRGAN_MODELS_DIR.exists():
+                raise FileNotFoundError(
+                    f"Real-ESRGAN models folder not found (final candidate: {_REALESRGAN_MODELS_DIR})\n"
+                    f"Expected folder 'models/' next to PixelForge-AI.exe."
+                )
 
         duration_full = self.get_video_duration(input_path)
         source_fps = self.get_fps(input_path)
@@ -1391,27 +1505,46 @@ class PipelineRunner:
         )
 
         # 2) Upscale
-        self.log("[2/6] Real-ESRGAN upscaling")
-        upscale_cmd = [
-            str(exe_path),
-            "-i",
-            str(frames_in),
-            "-o",
-            str(frames_out),
-            "-m",
-            str(_REALESRGAN_MODELS_DIR),
-            "-n",
-            self.settings.model,
-            "-s",
-            str(self.settings.scale),
-            "-f",
-            self.settings.image_format,
-            "-j",
-            self.settings.threads,
-        ]
-        self._run_command(upscale_cmd, "Real-ESRGAN upscale", 2, progress_mode="upscale", progress_target=frame_count, progress_path=frames_out)
-
-        # 3) Post filter
+        self.log(f"[2/6] {exe_label} upscaling")
+        if model_key.startswith("waifu2x-"):
+            waifu_subdir, waifu_noise = WAIFU2X_MODEL_CONFIGS.get(model_key, ("models-cunet", "3"))
+            waifu_scale = self.settings.scale if self.settings.scale in (1, 2, 4, 8, 16, 32) else 2
+            if waifu_scale != self.settings.scale:
+                self.log(f"[INFO] Waifu2x does not support scale {self.settings.scale}x — using scale {waifu_scale}x instead.")
+            upscale_cmd = [
+                str(exe_path),
+                "-i", str(frames_in),
+                "-o", str(frames_out),
+                "-n", waifu_noise,
+                "-s", str(waifu_scale),
+                "-m", str(_WAIFU2X_MODELS_DIR / waifu_subdir),
+                "-f", self.settings.image_format,
+                "-j", self.settings.threads,
+            ]
+        elif model_key.startswith("realsr-"):
+            realsr_model_name = REALSR_MODEL_NAMES.get(model_key, "models-DF2K")
+            upscale_cmd = [
+                str(exe_path),
+                "-i", str(frames_in),
+                "-o", str(frames_out),
+                "-m", str(_REALSR_MODELS_DIR / realsr_model_name),
+                "-s", str(self.settings.scale),
+                "-f", self.settings.image_format,
+                "-j", self.settings.threads,
+            ]
+        else:
+            upscale_cmd = [
+                str(exe_path),
+                "-i", str(frames_in),
+                "-o", str(frames_out),
+                "-m", str(_REALESRGAN_MODELS_DIR),
+                "-n", model_key,
+                "-s", str(self.settings.scale),
+                "-f", self.settings.image_format,
+                "-j", self.settings.threads,
+            ]
+        self.log(f"[INFO] {exe_label} upscale cmd: {' '.join(str(a) for a in upscale_cmd)}")
+        self._run_command(upscale_cmd, f"{exe_label} upscale", 2, progress_mode="upscale", progress_target=frame_count, progress_path=frames_out)
         source_frame_dir = frames_out
         if post_filter:
             self.log("[3/6] Post-processing (sharpen and/or final scale)")
@@ -1466,33 +1599,101 @@ class PipelineRunner:
         # 5) Optional interpolation
         final_video_input = temp_video
         if interpolation_enabled:
-            self.log("[5/6] Frame interpolation")
+            use_rife = self.settings.interp_engine == INTERP_ENGINE_RIFE
             interp_video = work_dir / "temp_interpolated.mp4"
-            interp_filter = (
-                f"minterpolate=fps={self.settings.target_fps}:mi_mode=mci:mc_mode=aobmc:"
-                f"me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"
-            )
-            interp_cmd = [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "info",
-                "-i",
-                str(temp_video),
-                "-vf",
-                interp_filter,
-                "-c:v",
-                "libx264",
-                "-crf",
-                str(self.settings.crf),
-                "-preset",
-                self.settings.encode_preset,
-                "-pix_fmt",
-                "yuv420p",
-                str(interp_video),
-            ]
-            self._run_command(interp_cmd, "frame interpolation", 5, progress_mode="time", progress_target=work_duration)
+
+            if use_rife:
+                self.log(f"[5/6] Frame interpolation — RIFE (model: {self.settings.rife_model})")
+                rife_frames_in  = work_dir / "rife_in"
+                rife_frames_out = work_dir / "rife_out"
+                rife_frames_in.mkdir(exist_ok=True)
+                rife_frames_out.mkdir(exist_ok=True)
+
+                if not _RIFE_EXE.exists():
+                    raise FileNotFoundError(
+                        f"rife-ncnn-vulkan.exe not found (final candidate: {_RIFE_EXE})\n"
+                        f"Download RIFE from its GitHub releases page and place it next to PixelForge-AI.exe."
+                    )
+                rife_model_path = _RIFE_MODELS_DIR / self.settings.rife_model
+                if not rife_model_path.exists():
+                    raise FileNotFoundError(
+                        f"RIFE model '{self.settings.rife_model}' not found inside {_RIFE_MODELS_DIR}\n"
+                        f"Expected folder rife-models/{self.settings.rife_model}/ with flownet .bin/.param files."
+                    )
+                self.log(f"[INFO] RIFE exe: {_RIFE_EXE}")
+                self.log(f"[INFO] RIFE model path: {rife_model_path}")
+
+                # Extract frames from the upscaled temp video for RIFE to process
+                rife_extract_cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(temp_video),
+                    "-vsync", "0", "-fps_mode", "passthrough",
+                    str(rife_frames_in / "frame_%08d.png"),
+                ]
+                self._run_command(rife_extract_cmd, "RIFE frame extraction", 5,
+                                  progress_mode="frames", progress_target=frame_count)
+
+                extracted_rife = sum(1 for f in rife_frames_in.iterdir() if f.suffix == ".png")
+                self.log(f"[INFO] RIFE input frames: {extracted_rife}")
+
+                # target_fps factor: RIFE doubles frames; for 2x only one pass needed
+                fps_factor = max(2, round(self.settings.target_fps / max(1.0, effective_source_fps)))
+                self.log(f"[INFO] RIFE FPS factor: {fps_factor}x  ({effective_source_fps:.2f} → {self.settings.target_fps} FPS)")
+
+                rife_cmd = [
+                    str(_RIFE_EXE),
+                    "-i", str(rife_frames_in),
+                    "-o", str(rife_frames_out),
+                    "-m", str(rife_model_path),
+                    "-f", "frame_%08d.png",
+                    "-j", "4:4:4",
+                ]
+                # -n = total target frame count in output (N input frames × fps_factor = 2x, 3x…)
+                rife_n = extracted_rife * fps_factor
+                rife_cmd.extend(["-n", str(rife_n)])
+                self.log(f"[INFO] RIFE cmd: {' '.join(str(a) for a in rife_cmd)}")
+                rife_out_count_approx = rife_n
+                self._run_command(rife_cmd, "RIFE interpolation", 5,
+                                  progress_mode="upscale", progress_target=rife_out_count_approx,
+                                  progress_path=rife_frames_out)
+
+                rife_frame_count = sum(1 for f in rife_frames_out.iterdir() if f.suffix == ".png")
+                self.log(f"[INFO] RIFE output frames: {rife_frame_count}")
+
+                # Reassemble RIFE frames → temp_interpolated.mp4
+                rife_reassemble_cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
+                    "-framerate", str(self.settings.target_fps),
+                    "-i", str(rife_frames_out / "frame_%08d.png"),
+                    "-c:v", "libx264",
+                    "-crf", str(self.settings.crf),
+                    "-preset", self.settings.encode_preset,
+                    "-pix_fmt", "yuv420p",
+                    str(interp_video),
+                ]
+                self._run_command(rife_reassemble_cmd, "RIFE reassembly", 5,
+                                  progress_mode="frames", progress_target=rife_frame_count)
+
+            else:
+                self.log(f"[5/6] Frame interpolation — minterpolate (FFmpeg CPU)")
+                interp_filter = (
+                    f"minterpolate=fps={self.settings.target_fps}:mi_mode=mci:mc_mode=aobmc:"
+                    f"me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"
+                )
+                self.log(f"[INFO] minterpolate filter: {interp_filter}")
+                interp_cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
+                    "-i", str(temp_video),
+                    "-vf", interp_filter,
+                    "-c:v", "libx264",
+                    "-crf", str(self.settings.crf),
+                    "-preset", self.settings.encode_preset,
+                    "-pix_fmt", "yuv420p",
+                    str(interp_video),
+                ]
+                self._run_command(interp_cmd, "minterpolate", 5,
+                                  progress_mode="time", progress_target=work_duration)
+
             final_video_input = interp_video
         else:
             self.log("[5/6] Skipping interpolation")
@@ -1752,6 +1953,8 @@ class V11BApp(tk.Tk):
         self.unsharp2_var = tk.DoubleVar(value=0.8)
 
         self.enable_interpolation_var = tk.BooleanVar(value=False)
+        self.interp_engine_var = tk.StringVar(value=INTERP_ENGINE_RIFE)
+        self.rife_model_var = tk.StringVar(value="rife-v4.6")
         self.target_fps_var = tk.IntVar(value=30)
 
         self.apply_final_scale_var = tk.BooleanVar(value=True)
@@ -2527,7 +2730,9 @@ class V11BApp(tk.Tk):
             wraplength=740,
         ).pack(anchor=W, pady=(0, 8))
 
-        ttk.Checkbutton(tab, text="Enable frame interpolation (creates new in-between frames)", variable=self.enable_interpolation_var).pack(anchor=W, pady=(4, 8))
+        ttk.Checkbutton(tab, text="Enable frame interpolation (creates new in-between frames)", variable=self.enable_interpolation_var).pack(anchor=W, pady=(4, 4))
+        self._labeled_combo(tab, "Interpolation Engine", self.interp_engine_var, INTERP_ENGINE_OPTIONS)
+        self._labeled_combo(tab, "RIFE Model", self.rife_model_var, [label for _k, label in RIFE_MODEL_DETAILS])
         self._labeled_combo(tab, "Final FPS (higher is smoother but slower)", self.target_fps_var, FPS_OPTIONS)
 
         tips = ttk.Label(
@@ -3023,6 +3228,12 @@ class V11BApp(tk.Tk):
             "realesr-animevideov3-x4": 1.05,
             "realesrgan-x4plus-anime": 1.18,
             "realesrgan-x4plus": 1.32,
+            "realsr-df2k":             1.60,
+            "realsr-df2k-jpeg":        1.65,
+            "waifu2x-anime-noise1":    0.85,
+            "waifu2x-anime-noise3":    0.90,
+            "waifu2x-cunet-noise1":    1.75,
+            "waifu2x-cunet-noise3":    1.90,
         }.get(settings.model, 1.0)
         scale_factor = 0.78 if settings.scale <= 2 else 0.94 if settings.scale == 3 else 1.10
         format_factor = 1.08 if settings.image_format == "png" else 0.92
@@ -4901,6 +5112,9 @@ class V11BApp(tk.Tk):
         }.get(upscaling_name, upscaling_name)
         self._sync_target_fps_to_source_if_needed()
         self.estimate_var.set(f"Profile set: {speed_label} + {upscaling_label}.")
+        # Explicitly schedule a compare re-render so it always fires when a profile
+        # is applied — even if all var values happened to already match.
+        self._schedule_auto_compare(delay_ms=800)
 
     def _set_selected_profile(self, profile_name: str) -> None:
         # Backward-compatible shim for older calls.
@@ -5018,11 +5232,13 @@ class V11BApp(tk.Tk):
         self._compare_after_id = self.after(delay_ms, lambda: self._generate_compare_frame(silent=True))
 
     def _register_auto_compare_watchers(self) -> None:
+        # Only watch vars that have a visible effect on a single frame.
+        # Non-visual vars (CRF, encode preset, audio, interpolation, FPS, threads)
+        # are intentionally excluded to avoid pointless re-renders.
         watched_vars = [
             self.model_var,
             self.scale_var,
             self.image_format_var,
-            self.threads_var,
             self.start_time_var,
             self.clip_duration_var,
             self.denoise_var,
@@ -5036,25 +5252,61 @@ class V11BApp(tk.Tk):
             self.cas_strength_var,
             self.unsharp1_var,
             self.unsharp2_var,
-            self.enable_interpolation_var,
-            self.target_fps_var,
             self.apply_final_scale_var,
             self.target_width_var,
             self.target_height_var,
-            self.crf_var,
-            self.encode_preset_var,
-            self.include_audio_var,
         ]
         for var in watched_vars:
             var.trace_add("write", lambda *_args: self._schedule_auto_compare())
 
     def _generate_compare_worker(self, settings: PipelineSettings) -> None:
         try:
-            exe_path = _REALESRGAN_EXE
-            if not exe_path.exists():
-                raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (looked in bundled/app paths; final candidate: {exe_path})")
-            if not _REALESRGAN_MODELS_DIR.exists():
-                raise FileNotFoundError(f"Real-ESRGAN models folder not found (looked in bundled/app paths; final candidate: {_REALESRGAN_MODELS_DIR})")
+            model_key = settings.model
+
+            # Select correct binary + build upscale command for the compare frame
+            if model_key.startswith("realsr-"):
+                exe_path = _REALSR_EXE
+                exe_label = "RealSR"
+                if not exe_path.exists():
+                    raise FileNotFoundError(f"realsr-ncnn-vulkan.exe not found (final candidate: {exe_path})")
+                realsr_model_name = REALSR_MODEL_NAMES.get(model_key, "models-DF2K")
+                if not (_REALSR_MODELS_DIR / realsr_model_name).exists():
+                    raise FileNotFoundError(f"RealSR model '{realsr_model_name}' not found inside {_REALSR_MODELS_DIR}")
+                def _build_upscale_cmd(src, dst, scale):
+                    return [
+                        str(exe_path), "-i", str(src), "-o", str(dst),
+                        "-m", str(_REALSR_MODELS_DIR / realsr_model_name),
+                        "-s", str(scale), "-f", "png", "-j", settings.threads,
+                    ]
+            elif model_key.startswith("waifu2x-"):
+                exe_path = _WAIFU2X_EXE
+                exe_label = "Waifu2x"
+                if not exe_path.exists():
+                    raise FileNotFoundError(f"waifu2x-ncnn-vulkan.exe not found (final candidate: {exe_path})")
+                waifu_subdir, waifu_noise = WAIFU2X_MODEL_CONFIGS.get(model_key, ("models-cunet", "3"))
+                waifu_model_dir = _WAIFU2X_MODELS_DIR / waifu_subdir
+                if not waifu_model_dir.exists():
+                    raise FileNotFoundError(f"Waifu2x model subdir '{waifu_subdir}' not found inside {_WAIFU2X_MODELS_DIR}")
+                def _build_upscale_cmd(src, dst, scale):
+                    waifu_scale = scale if scale in (1, 2, 4, 8, 16, 32) else 2
+                    return [
+                        str(exe_path), "-i", str(src), "-o", str(dst),
+                        "-n", waifu_noise, "-s", str(waifu_scale),
+                        "-m", str(waifu_model_dir), "-f", "png", "-j", settings.threads,
+                    ]
+            else:
+                exe_path = _REALESRGAN_EXE
+                exe_label = "Real-ESRGAN"
+                if not exe_path.exists():
+                    raise FileNotFoundError(f"realesrgan-ncnn-vulkan.exe not found (final candidate: {exe_path})")
+                if not _REALESRGAN_MODELS_DIR.exists():
+                    raise FileNotFoundError(f"Real-ESRGAN models folder not found (final candidate: {_REALESRGAN_MODELS_DIR})")
+                def _build_upscale_cmd(src, dst, scale):
+                    return [
+                        str(exe_path), "-i", str(src), "-o", str(dst),
+                        "-m", str(_REALESRGAN_MODELS_DIR), "-n", model_key,
+                        "-s", str(scale), "-f", "png", "-j", settings.threads,
+                    ]
 
             compare_root = Path(tempfile.gettempdir()) / "pixelforge_compare" / self._safe_name(settings.input_video.stem)
             compare_root.mkdir(parents=True, exist_ok=True)
@@ -5077,37 +5329,13 @@ class V11BApp(tk.Tk):
             source_for_upscale = before_frame
             if pre_filter:
                 pre_cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    str(before_frame),
-                    "-vf",
-                    pre_filter,
-                    str(pre_frame),
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(before_frame), "-vf", pre_filter, str(pre_frame),
                 ]
                 subprocess.run(pre_cmd, check=True, creationflags=_NO_WINDOW)
                 source_for_upscale = pre_frame
 
-            upscale_cmd = [
-                str(exe_path),
-                "-i",
-                str(source_for_upscale),
-                "-o",
-                str(upscaled_frame),
-                "-m",
-                str(_REALESRGAN_MODELS_DIR),
-                "-n",
-                settings.model,
-                "-s",
-                str(settings.scale),
-                "-f",
-                "png",
-                "-j",
-                settings.threads,
-            ]
+            upscale_cmd = _build_upscale_cmd(source_for_upscale, upscaled_frame, settings.scale)
             subprocess.run(upscale_cmd, check=True, creationflags=_NO_WINDOW)
 
             post_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_post_filter()
@@ -5422,6 +5650,8 @@ class V11BApp(tk.Tk):
             unsharp2=float(self.unsharp2_var.get()),
             enable_interpolation=bool(self.enable_interpolation_var.get()),
             target_fps=int(self.target_fps_var.get()),
+            interp_engine=self.interp_engine_var.get().strip(),
+            rife_model=RIFE_MODEL_LABEL_TO_KEY.get(self.rife_model_var.get().strip(), "rife-v4.6"),
             apply_final_scale=bool(self.apply_final_scale_var.get()),
             target_width=int(self.target_width_var.get()),
             target_height=int(self.target_height_var.get()),
