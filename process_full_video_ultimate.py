@@ -171,7 +171,15 @@ APP_VERSION = "1.0.16"
 # ---------------------------------------------------------------------------
 # Recovery token helpers (cross-device restore)
 # ---------------------------------------------------------------------------
-_RECOVERY_HMAC_SECRET = b"v11b-pixelforge-ai-recovery-key-2026-xK9mQ2rL7n"
+_RECOVERY_HMAC_SECRET_FALLBACK = b"v11b-pixelforge-ai-recovery-key-2026-xK9mQ2rL7n"
+
+
+def _get_recovery_hmac_secret() -> bytes:
+    """Return the HMAC secret, preferring the operator-supplied env var over the compiled fallback."""
+    val = os.environ.get("V11B_RECOVERY_HMAC_SECRET", "").strip()
+    if val:
+        return val.encode()
+    return _RECOVERY_HMAC_SECRET_FALLBACK
 
 
 def _build_recovery_token(paid_credits: int, email: str) -> str:
@@ -181,7 +189,7 @@ def _build_recovery_token(paid_credits: int, email: str) -> str:
         separators=(",", ":"),
     )
     b64 = base64.urlsafe_b64encode(payload.encode()).rstrip(b"=").decode()
-    sig = hmac.new(_RECOVERY_HMAC_SECRET, b64.encode(), hashlib.sha256).hexdigest()[:32]
+    sig = hmac.new(_get_recovery_hmac_secret(), b64.encode(), hashlib.sha256).hexdigest()[:32]
     return f"v11b2.{b64}.{sig}"
 
 
@@ -191,7 +199,7 @@ def _verify_recovery_token(token: str) -> dict | None:
     if len(parts) != 3 or parts[0] != "v11b2":
         return None
     _, b64, given_sig = parts
-    expected_sig = hmac.new(_RECOVERY_HMAC_SECRET, b64.encode(), hashlib.sha256).hexdigest()[:32]
+    expected_sig = hmac.new(_get_recovery_hmac_secret(), b64.encode(), hashlib.sha256).hexdigest()[:32]
     if not hmac.compare_digest(expected_sig, given_sig):
         return None
     try:
