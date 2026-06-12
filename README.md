@@ -1,6 +1,6 @@
-# v11b Upscaling App
+# PixelForge AI
 
-Desktop upscaling app using Real-ESRGAN with quality profiles, compare view, ETA estimation, billing hooks, and auto-update support.
+Desktop video and image upscaling app using Real-ESRGAN, RealSR, and Waifu2x with quality profiles, compare view, ETA estimation, billing hooks, and auto-update support.
 
 ## Features
 
@@ -19,14 +19,14 @@ python process_full_video_ultimate.py
 ## Build Standalone EXE
 
 ```powershell
-./build_release.ps1 -Version 1.0.0
+./build_release.ps1 -Version 1.0.17
 ```
 
 Build output is generated in `release/`:
 
-- `v11b-upscaling-app.exe` (single-file app)
-- `v11b-upscaling-app_<version>_windows_x64.zip`
+- `PixelForge-AI.exe` (single-file app)
+- `PixelForge-AI_<version>_windows_x64.zip`
 
 ## Release Asset Naming
 
-Auto-updater picks the latest `.exe` asset from GitHub release, preferring names with `v11b` and version in the filename.
+Auto-updater picks the latest `.exe` asset from GitHub release, preferring names with `PixelForge` or `v11b` and version in the filename.

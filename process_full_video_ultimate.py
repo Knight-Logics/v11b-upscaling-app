@@ -72,7 +72,7 @@ except Exception:
     WEBVIEW_AVAILABLE = False
 
 try:
-    from PIL import Image, ImageDraw, ImageTk
+    from PIL import Image, ImageDraw, ImageStat, ImageTk
 
     PIL_AVAILABLE = True
 except ImportError:
@@ -151,6 +151,7 @@ WAIFU2X_MODEL_CONFIGS: dict[str, tuple[str, str]] = {
 
 ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 IMAGE_FORMATS = ["png", "jpg"]
+IMAGE_INPUT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 FPS_OPTIONS = [24, 30, 48, 60]
 
 INTERP_ENGINE_OPTIONS = ["RIFE (GPU — fast, high quality)", "minterpolate (CPU — slower, compatible)"]
@@ -166,7 +167,7 @@ RIFE_MODEL_OPTIONS   = [key for key, _label in RIFE_MODEL_DETAILS]
 RIFE_MODEL_KEY_TO_LABEL = {key: label for key, label in RIFE_MODEL_DETAILS}
 RIFE_MODEL_LABEL_TO_KEY = {label: key for key, label in RIFE_MODEL_DETAILS}
 TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
-APP_VERSION = "1.0.16"
+APP_VERSION = "1.0.17"
 
 # ---------------------------------------------------------------------------
 # Recovery token helpers (cross-device restore)
@@ -1025,6 +1026,7 @@ class PipelineSettings:
     interp_engine: str
     rife_model: str
     apply_final_scale: bool
+    preserve_aspect_ratio: bool
     target_width: int
     target_height: int
     crf: int
@@ -1280,7 +1282,41 @@ class PipelineRunner:
         return out.strip()
 
     @staticmethod
+    def is_image_output(path: Path) -> bool:
+        return path.suffix.lower() in IMAGE_INPUT_SUFFIXES
+
+    def _export_single_frame_output(self, frame_dir: Path, output_path: Path) -> None:
+        ext = self.settings.image_format.lower()
+        candidates = sorted(frame_dir.glob(f"frame_*.{ext}"))
+        if not candidates:
+            candidates = sorted(frame_dir.glob("frame_*.*"))
+        if not candidates:
+            raise FileNotFoundError(f"No processed frames found in {frame_dir}")
+        source_frame = candidates[0]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if source_frame.suffix.lower() == output_path.suffix.lower():
+            output_path.write_bytes(source_frame.read_bytes())
+            return
+        convert_cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source_frame),
+            str(output_path),
+        ]
+        self._run_command(convert_cmd, "image export", 6, progress_mode="time", progress_target=0.1)
+
+    @staticmethod
+    def is_image_input(path: Path) -> bool:
+        return path.suffix.lower() in IMAGE_INPUT_SUFFIXES
+
+    @staticmethod
     def get_video_duration(video_path: Path) -> float:
+        if PipelineRunner.is_image_input(video_path):
+            return 1.0 / 30.0
         cmd = [
             "ffprobe",
             "-v",
@@ -1292,10 +1328,15 @@ class PipelineRunner:
             PipelineRunner._cli_path(video_path),
         ]
         out = subprocess.check_output(cmd, text=True, encoding="utf-8", errors="replace", creationflags=_NO_WINDOW)
-        return float(out.strip())
+        text = out.strip()
+        if not text or text.upper() == "N/A":
+            return 1.0 / 30.0
+        return float(text)
 
     @classmethod
     def get_fps(cls, video_path: Path) -> float:
+        if cls.is_image_input(video_path):
+            return 30.0
         # Prefer average frame rate for user-facing timing and output duration decisions.
         fps_text = cls._ffprobe_value(video_path, "avg_frame_rate")
         if not fps_text or fps_text == "0/0" or fps_text == "N/A":
@@ -1342,7 +1383,15 @@ class PipelineRunner:
             filters.append(f"unsharp=5:5:{self.settings.unsharp1}:5:5:0.0")
             filters.append(f"unsharp=7:7:{self.settings.unsharp2}:7:7:0.0")
         if self.settings.apply_final_scale:
-            filters.append(f"scale={self.settings.target_width}:{self.settings.target_height}:flags=lanczos")
+            w = self.settings.target_width
+            h = self.settings.target_height
+            if self.settings.preserve_aspect_ratio:
+                filters.append(
+                    f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                    f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                )
+            else:
+                filters.append(f"scale={w}:{h}:flags=lanczos")
         return ",".join(filters) if filters else None
 
     def _trim_input_args(self) -> list[str]:
@@ -1480,7 +1529,11 @@ class PipelineRunner:
         self.log("[1/6] Extracting frames")
         extract_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info"]
         extract_cmd += self._trim_input_args()
+        if self.is_image_input(input_path):
+            extract_cmd += ["-loop", "1"]
         extract_cmd += ["-i", str(input_path)]
+        if self.is_image_input(input_path):
+            extract_cmd += ["-frames:v", "1"]
         # Keep all decoded frames; prevents dup/drop sync behavior that shortens output videos.
         extract_cmd += ["-vsync", "0"]
         # Prefer explicit passthrough on newer ffmpeg builds for variable frame rate inputs.
@@ -1578,6 +1631,29 @@ class PipelineRunner:
         else:
             self.log("[3/6] Skipping post-processing (disabled)")
             self._set_stage_progress(3, 1.0, stage_name="post-processing (skipped)")
+
+        if self.is_image_output(output_path):
+            self.log("[4/6] Writing image output (skipping video reassembly)")
+            self._set_stage_progress(4, 1.0, stage_name="image export")
+            self._set_stage_progress(5, 1.0, stage_name="interpolation (skipped)")
+            self._export_single_frame_output(source_frame_dir, output_path)
+            if not self.settings.keep_intermediate:
+                self.log("Cleaning intermediate work folder...")
+                for child in work_dir.rglob("*"):
+                    if child.is_file():
+                        child.unlink(missing_ok=True)
+                for child in sorted(work_dir.rglob("*"), reverse=True):
+                    if child.is_dir():
+                        child.rmdir()
+                work_dir.rmdir()
+            output_size_mb = output_path.stat().st_size / (1024 * 1024)
+            self.log("=" * 78)
+            self.log("Completed successfully")
+            self.log(f"Output: {output_path}")
+            self.log(f"Output size: {output_size_mb:.2f} MB")
+            self.log("=" * 78)
+            self._emit_progress(100.0, stage_index=6, stage_fraction=1.0, stage_name="finalize")
+            return
 
         # 4) Reassemble
         self.log("[4/6] Reassembling video")
@@ -1963,11 +2039,13 @@ class V11BApp(tk.Tk):
         self.enable_interpolation_var = tk.BooleanVar(value=False)
         self.interp_engine_var = tk.StringVar(value=INTERP_ENGINE_RIFE)
         self.rife_model_var = tk.StringVar(value="rife-v4.6")
+        self.rife_model_display_var = tk.StringVar(value=RIFE_MODEL_KEY_TO_LABEL["rife-v4.6"])
         self.target_fps_var = tk.IntVar(value=30)
 
-        self.apply_final_scale_var = tk.BooleanVar(value=True)
-        self.target_width_var = tk.IntVar(value=2430)
-        self.target_height_var = tk.IntVar(value=4320)
+        self.apply_final_scale_var = tk.BooleanVar(value=False)
+        self.preserve_aspect_ratio_var = tk.BooleanVar(value=True)
+        self.target_width_var = tk.IntVar(value=1920)
+        self.target_height_var = tk.IntVar(value=1080)
 
         self.crf_var = tk.IntVar(value=16)
         self.encode_preset_var = tk.StringVar(value="slow")
@@ -1981,6 +2059,8 @@ class V11BApp(tk.Tk):
         self.estimate_stage_var = tk.StringVar(value="")
         self.estimate_tips_var = tk.StringVar(value="")
         self.compare_slider_var = tk.DoubleVar(value=50.0)
+        self.compare_frame_pct_var = tk.DoubleVar(value=50.0)
+        self.profile_summary_var = tk.StringVar(value="")
         self.compare_dragging = False
         self.compare_hover_near_line = False
         self.compare_separator_x = 0
@@ -2442,7 +2522,7 @@ class V11BApp(tk.Tk):
 
         row1 = ttk.Frame(box)
         row1.pack(fill=X, pady=4)
-        ttk.Label(row1, text="Input video", width=16).pack(side=LEFT)
+        ttk.Label(row1, text="Input video or image", width=16).pack(side=LEFT)
         ttk.Entry(row1, textvariable=self.input_video_var).pack(side=LEFT, fill=X, expand=True)
         ttk.Button(row1, text="Browse", command=self._pick_input).pack(side=LEFT, padx=(6, 0))
 
@@ -2493,6 +2573,14 @@ class V11BApp(tk.Tk):
         self._set_selected_upscaling_profile("animation", apply=False)
         self._apply_combined_profile()
 
+        ttk.Label(
+            parent,
+            textvariable=self.profile_summary_var,
+            style="Hint.TLabel",
+            wraplength=780,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(8, 0))
+
     def _build_settings_notebook(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent, style="Panel.TFrame")
         header.pack(fill=X, pady=(10, 0))
@@ -2529,6 +2617,7 @@ class V11BApp(tk.Tk):
             "enable_interpolation_var",
             "target_fps_var",
             "apply_final_scale_var",
+            "preserve_aspect_ratio_var",
             "target_width_var",
             "target_height_var",
             "crf_var",
@@ -2544,6 +2633,7 @@ class V11BApp(tk.Tk):
         for name, value in snapshot.items():
             getattr(self, name).set(value)
         self._sync_display_from_model()
+        self._sync_rife_display_from_model()
         self._schedule_auto_estimate()
 
     def _build_advanced_notebook(self, parent: ttk.Frame) -> ttk.Notebook:
@@ -2740,7 +2830,19 @@ class V11BApp(tk.Tk):
 
         ttk.Checkbutton(tab, text="Enable frame interpolation (creates new in-between frames)", variable=self.enable_interpolation_var).pack(anchor=W, pady=(4, 4))
         self._labeled_combo(tab, "Interpolation Engine", self.interp_engine_var, INTERP_ENGINE_OPTIONS)
-        self._labeled_combo(tab, "RIFE Model", self.rife_model_var, [label for _k, label in RIFE_MODEL_DETAILS])
+        rife_row = ttk.Frame(tab)
+        rife_row.pack(fill=X, pady=2)
+        rife_row.columnconfigure(0, weight=1)
+        rife_row.columnconfigure(1, weight=1)
+        ttk.Label(rife_row, text="RIFE Model", anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        rife_combo = ttk.Combobox(
+            rife_row,
+            textvariable=self.rife_model_display_var,
+            values=[label for _k, label in RIFE_MODEL_DETAILS],
+            state="readonly",
+        )
+        rife_combo.grid(row=0, column=1, sticky="ew")
+        rife_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_rife_model_from_display())
         self._labeled_combo(tab, "Final FPS (higher is smoother but slower)", self.target_fps_var, FPS_OPTIONS)
 
         tips = ttk.Label(
@@ -2763,7 +2865,12 @@ class V11BApp(tk.Tk):
             wraplength=740,
         ).pack(anchor=W, pady=(0, 8))
 
-        ttk.Checkbutton(tab, text="Apply final scaling (resize to exact output dimensions)", variable=self.apply_final_scale_var).pack(anchor=W, pady=(4, 8))
+        ttk.Checkbutton(tab, text="Apply final scaling (optional resize to target dimensions)", variable=self.apply_final_scale_var).pack(anchor=W, pady=(4, 4))
+        ttk.Checkbutton(
+            tab,
+            text="Preserve source aspect ratio when final scaling (recommended — avoids forced 9:16 stretch)",
+            variable=self.preserve_aspect_ratio_var,
+        ).pack(anchor=W, pady=(0, 8))
         self._labeled_spin(tab, "Output Width (final video width)", self.target_width_var, 360, 7680)
         self._labeled_spin(tab, "Output Height (final video height)", self.target_height_var, 360, 7680)
 
@@ -3342,9 +3449,22 @@ class V11BApp(tk.Tk):
         controls.pack(fill=X, pady=(0, 8))
         ttk.Label(
             controls,
-            text="Compare frame regenerates automatically as settings change. Drag the separator line to reveal before/after.",
+            text="Preview frame position (% through clip):",
             style="Hint.TLabel",
-        ).pack(side=LEFT, padx=(10, 0))
+        ).pack(side=LEFT)
+        ttk.Scale(
+            controls,
+            from_=0,
+            to=100,
+            variable=self.compare_frame_pct_var,
+            command=lambda _v: self._schedule_auto_compare(delay_ms=250),
+        ).pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
+        ttk.Label(
+            box,
+            text="Compare regenerates when settings change. Drag the separator to inspect before/after. Preview skips black frames when possible.",
+            style="Hint.TLabel",
+            wraplength=760,
+        ).pack(anchor=W, pady=(0, 6))
 
         self.compare_canvas = tk.Canvas(
             box,
@@ -3476,16 +3596,25 @@ class V11BApp(tk.Tk):
 
     def _pick_input(self) -> None:
         file_path = filedialog.askopenfilename(
-            title="Select input video",
-            filetypes=[("Video files", "*.mp4 *.mov *.mkv *.webm"), ("All files", "*.*")],
+            title="Select input video or image",
+            filetypes=[
+                ("Video files", "*.mp4 *.mov *.mkv *.webm"),
+                ("Image files", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"),
+                ("All files", "*.*"),
+            ],
         )
         if not file_path:
             return
         self.input_video_var.set(file_path)
         input_path = Path(file_path)
-        output_name = f"{input_path.stem}_v11b_upscaled.mp4"
-        self.output_video_var.set(str(input_path.with_name(output_name)))
+        if PipelineRunner.is_image_input(input_path):
+            output_name = f"{input_path.stem}_pixelforge_upscaled.png"
+            self.output_video_var.set(str(input_path.with_name(output_name)))
+        else:
+            output_name = f"{input_path.stem}_pixelforge_upscaled.mp4"
+            self.output_video_var.set(str(input_path.with_name(output_name)))
 
+        self._sync_target_dimensions_from_source(input_path)
         self._sync_target_fps_to_source_if_needed(file_path)
         self._normalize_interpolation_choice(show_feedback=True)
 
@@ -5103,11 +5232,12 @@ class V11BApp(tk.Tk):
                 self.unsharp2_var.set(0.8)
 
         if self.apply_final_scale_var.get():
-            self.target_width_var.set(2430)
-            self.target_height_var.set(4320)
+            self._sync_target_dimensions_from_source()
 
         self._refresh_auto_thread_recommendation()
         self._sync_display_from_model()
+        self._sync_rife_display_from_model()
+        self._update_profile_summary()
         speed_label = {
             "fast": "Quick Preview",
             "balanced": "Balanced Workflow",
@@ -5171,6 +5301,7 @@ class V11BApp(tk.Tk):
         ]
         for var in watched_vars:
             var.trace_add("write", lambda *_args: self._schedule_auto_estimate())
+        self.scale_var.trace_add("write", lambda *_args: self._sync_target_dimensions_from_source())
         self.enable_interpolation_var.trace_add("write", lambda *_args: self._handle_interpolation_toggle())
 
     def _auto_prepare_after_input(self) -> None:
@@ -5190,6 +5321,62 @@ class V11BApp(tk.Tk):
     @staticmethod
     def _safe_name(value: str) -> str:
         return "".join(ch for ch in value if ch.isalnum() or ch in ("-", "_")) or "preview"
+
+    @staticmethod
+    def _even_dimension(value: int) -> int:
+        rounded = max(2, int(value))
+        return rounded if rounded % 2 == 0 else rounded + 1
+
+    def _sync_target_dimensions_from_source(self, input_path: str | Path | None = None) -> None:
+        candidate = str(input_path or self.input_video_var.get()).strip()
+        if not candidate:
+            return
+        path = Path(candidate)
+        if not path.exists():
+            return
+        try:
+            width = int(PipelineRunner._ffprobe_value(path, "width") or 0)
+            height = int(PipelineRunner._ffprobe_value(path, "height") or 0)
+        except Exception:
+            return
+        if width <= 0 or height <= 0:
+            return
+        scale = max(1, int(self.scale_var.get()))
+        self.target_width_var.set(self._even_dimension(width * scale))
+        self.target_height_var.set(self._even_dimension(height * scale))
+
+    def _update_profile_summary(self) -> None:
+        speed_label = {
+            "fast": "Quick Preview",
+            "balanced": "Balanced Workflow",
+            "quality": "Max Detail",
+        }.get(self.selected_speed_profile, self.selected_speed_profile)
+        upscaling_label = {
+            "live": "Natural Footage",
+            "animation": "Animation / Anime",
+            "restore": "Legacy / Noisy Repair",
+        }.get(self.selected_upscaling_profile, self.selected_upscaling_profile)
+        model_label = MODEL_KEY_TO_LABEL.get(self.model_var.get().strip(), self.model_var.get().strip())
+        scale = int(self.scale_var.get())
+        final_scale = "on" if self.apply_final_scale_var.get() else "off"
+        if self.apply_final_scale_var.get():
+            aspect_note = "preserve aspect" if self.preserve_aspect_ratio_var.get() else "stretch to fit"
+            output_dims = f"{int(self.target_width_var.get())}x{int(self.target_height_var.get())} ({aspect_note})"
+        else:
+            output_dims = f"native x{scale} upscale (no forced resize)"
+        interp = "on" if self.enable_interpolation_var.get() else "off"
+        self.profile_summary_var.set(
+            f"Active: {speed_label} + {upscaling_label} | model={model_label.split('(')[0].strip()} | "
+            f"scale={scale}x | final scale={final_scale} | output={output_dims} | interpolation={interp}"
+        )
+
+    def _sync_rife_model_from_display(self) -> None:
+        label = self.rife_model_display_var.get().strip()
+        self.rife_model_var.set(RIFE_MODEL_LABEL_TO_KEY.get(label, "rife-v4.6"))
+
+    def _sync_rife_display_from_model(self) -> None:
+        key = self.rife_model_var.get().strip()
+        self.rife_model_display_var.set(RIFE_MODEL_KEY_TO_LABEL.get(key, RIFE_MODEL_KEY_TO_LABEL["rife-v4.6"]))
 
     def _sync_model_from_display(self) -> None:
         label = self.model_display_var.get().strip()
@@ -5235,6 +5422,7 @@ class V11BApp(tk.Tk):
         self.compare_worker_thread.start()
 
     def _schedule_auto_compare(self, delay_ms: int = 700) -> None:
+        self._update_profile_summary()
         if self._compare_after_id:
             self.after_cancel(self._compare_after_id)
         self._compare_after_id = self.after(delay_ms, lambda: self._generate_compare_frame(silent=True))
@@ -5263,6 +5451,7 @@ class V11BApp(tk.Tk):
             self.apply_final_scale_var,
             self.target_width_var,
             self.target_height_var,
+            self.compare_frame_pct_var,
         ]
         for var in watched_vars:
             var.trace_add("write", lambda *_args: self._schedule_auto_compare())
@@ -5324,14 +5513,54 @@ class V11BApp(tk.Tk):
             upscaled_frame = compare_root / "upscaled.png"
             after_frame = compare_root / "after.png"
 
-            trim_args: list[str] = []
+            duration = PipelineRunner.get_video_duration(settings.input_video)
+            effective_duration = duration
             if settings.start_time > 0:
-                trim_args.extend(["-ss", str(settings.start_time)])
+                effective_duration = max(0.1, duration - settings.start_time)
+            if settings.clip_duration > 0:
+                effective_duration = min(effective_duration, settings.clip_duration)
 
-            extract_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-            extract_cmd += trim_args
-            extract_cmd += ["-i", str(settings.input_video), "-frames:v", "1", str(before_frame)]
-            subprocess.run(extract_cmd, check=True, creationflags=_NO_WINDOW)
+            frame_pct = float(self.compare_frame_pct_var.get())
+            primary_ts = settings.start_time + effective_duration * (frame_pct / 100.0)
+            candidate_timestamps = [primary_ts]
+            for pct in (5, 15, 25, 40, 50, 60, 75, 85, 95):
+                ts = settings.start_time + effective_duration * (pct / 100.0)
+                if all(abs(ts - existing) > 0.04 for existing in candidate_timestamps):
+                    candidate_timestamps.append(ts)
+
+            best_candidate = compare_root / "candidate_best.png"
+            best_score = -1.0
+            for index, timestamp in enumerate(candidate_timestamps):
+                candidate_path = compare_root / f"candidate_{index:02d}.png"
+                extract_cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", str(max(0.0, timestamp)),
+                    "-i", str(settings.input_video),
+                    "-frames:v", "1",
+                    str(candidate_path),
+                ]
+                try:
+                    subprocess.run(extract_cmd, check=True, creationflags=_NO_WINDOW)
+                    with Image.open(candidate_path) as candidate_img:
+                        score = ImageStat.Stat(candidate_img.convert("L")).mean[0]
+                    if score > best_score:
+                        best_score = score
+                        best_candidate.write_bytes(candidate_path.read_bytes())
+                except Exception:
+                    continue
+
+            if best_score < 0:
+                extract_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+                if settings.start_time > 0:
+                    extract_cmd.extend(["-ss", str(settings.start_time)])
+                extract_cmd += ["-i", str(settings.input_video), "-frames:v", "1", str(before_frame)]
+                subprocess.run(extract_cmd, check=True, creationflags=_NO_WINDOW)
+            else:
+                before_frame.write_bytes(best_candidate.read_bytes())
+                self.log_queue.put(
+                    f"[INFO] Compare preview frame selected at ~{frame_pct:.0f}% through clip "
+                    f"(brightness score {best_score:.1f})."
+                )
 
             pre_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_pre_filter()
             source_for_upscale = before_frame
@@ -5395,12 +5624,21 @@ class V11BApp(tk.Tk):
         controls = ttk.Frame(top, style="Panel.TFrame")
         controls.pack(fill=X)
         ttk.Label(controls, text="Before / After", style="Hint.TLabel").pack(side=LEFT)
+        ttk.Label(controls, text="Split", style="Hint.TLabel").pack(side=LEFT, padx=(12, 0))
         ttk.Scale(
             controls,
             from_=0,
             to=100,
             variable=self.compare_slider_var,
             command=lambda _v: self._redraw_compare_canvas(),
+        ).pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
+        ttk.Label(controls, text="Preview %", style="Hint.TLabel").pack(side=LEFT, padx=(8, 0))
+        ttk.Scale(
+            controls,
+            from_=0,
+            to=100,
+            variable=self.compare_frame_pct_var,
+            command=lambda _v: self._schedule_auto_compare(delay_ms=250),
         ).pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
 
         ttk.Button(
@@ -5604,33 +5842,45 @@ class V11BApp(tk.Tk):
         output_path = Path(output_raw)
 
         if not input_path.exists() or not input_path.is_file():
-            raise ValueError("Select a valid input video")
-        try:
-            probe = [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=codec_name,width,height",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                PipelineRunner._cli_path(input_path),
-            ]
-            probe_out = subprocess.check_output(probe, text=True, encoding="utf-8", errors="replace", creationflags=_NO_WINDOW).strip()
-            if not probe_out:
-                raise ValueError("Input does not contain a readable video stream")
-        except subprocess.CalledProcessError as exc:
-            raise ValueError(f"Input format is not readable by ffmpeg/ffprobe: {exc}") from exc
-        except FileNotFoundError as exc:
-            raise ValueError(f"ffprobe not found on PATH: {exc}") from exc
+            raise ValueError("Select a valid input video or image")
+        if PipelineRunner.is_image_input(input_path):
+            if PIL_AVAILABLE:
+                try:
+                    with Image.open(input_path) as probe_img:
+                        probe_img.verify()
+                except Exception as exc:
+                    raise ValueError(f"Input image is not readable: {exc}") from exc
+            else:
+                width = PipelineRunner._ffprobe_value(input_path, "width")
+                if not width or width == "N/A":
+                    raise ValueError("Input image is not readable by ffprobe")
+        else:
+            try:
+                probe = [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name,width,height",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    PipelineRunner._cli_path(input_path),
+                ]
+                probe_out = subprocess.check_output(probe, text=True, encoding="utf-8", errors="replace", creationflags=_NO_WINDOW).strip()
+                if not probe_out:
+                    raise ValueError("Input does not contain a readable video stream")
+            except subprocess.CalledProcessError as exc:
+                raise ValueError(f"Input format is not readable by ffmpeg/ffprobe: {exc}") from exc
+            except FileNotFoundError as exc:
+                raise ValueError(f"ffprobe not found on PATH: {exc}") from exc
         if output_path.exists() and output_path.is_dir():
             raise ValueError("Output path points to a folder; choose a file name")
         if not output_path.parent.exists():
             raise ValueError("Output folder does not exist")
         if self.model_var.get().strip() not in MODEL_OPTIONS:
-            raise ValueError("Select a valid Real-ESRGAN model")
+            raise ValueError("Select a valid upscale model")
         if self.target_width_var.get() < 360 or self.target_height_var.get() < 360:
             raise ValueError("Target width and height must be at least 360")
         if self.crf_var.get() < 12 or self.crf_var.get() > 30:
@@ -5659,8 +5909,9 @@ class V11BApp(tk.Tk):
             enable_interpolation=bool(self.enable_interpolation_var.get()),
             target_fps=int(self.target_fps_var.get()),
             interp_engine=self.interp_engine_var.get().strip(),
-            rife_model=RIFE_MODEL_LABEL_TO_KEY.get(self.rife_model_var.get().strip(), "rife-v4.6"),
+            rife_model=self.rife_model_var.get().strip(),
             apply_final_scale=bool(self.apply_final_scale_var.get()),
+            preserve_aspect_ratio=bool(self.preserve_aspect_ratio_var.get()),
             target_width=int(self.target_width_var.get()),
             target_height=int(self.target_height_var.get()),
             crf=int(self.crf_var.get()),

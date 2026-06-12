@@ -39,7 +39,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/v11b-upscaling-app.exe
+            release/PixelForge-AI.exe
             release/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
