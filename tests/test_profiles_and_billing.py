@@ -69,7 +69,7 @@ class BillingRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = APP.BillingStore(root / "tokens.json", root / "audit.jsonl")
-            token = "v11b-1234567890abcdef1234"
+            token = "test-token"
             claimed, balance = store.claim_free_trial(token, "device:test", 20)
             self.assertTrue(claimed)
             self.assertEqual(balance, 20)
@@ -82,7 +82,7 @@ class BillingRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = APP.BillingStore(root / "tokens.json", root / "audit.jsonl")
-            token = "v11b-1234567890abcdef1234"
+            token = "test-token"
             store.claim_free_trial(token, "device:test", 20)
             backend = APP.EmbeddedBillingBackend(store)
 
