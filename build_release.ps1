@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "1.0.17"
+  [string]$Version = "1.0.18"
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,7 +25,7 @@ if (Test-Path $iconPath) {
   $iconArg = @("--icon", $iconPath)
 }
 
-& "$root\.venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed `
+& "$root\.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed `
   --name "PixelForge-AI" `
   --collect-data PIL `
   --collect-data stripe `
@@ -42,6 +42,11 @@ if (Test-Path $iconPath) {
   --add-data "rife-models;rife-models" `
   @iconArg `
   process_full_video_ultimate.py
+
+if ($LASTEXITCODE -ne 0) {
+  throw "PyInstaller failed with exit code $LASTEXITCODE"
+}
+
 
 Copy-Item (Join-Path $root "dist\PixelForge-AI.exe") (Join-Path $releaseDir "PixelForge-AI.exe") -Force
 

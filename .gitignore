@@ -4,6 +4,12 @@ __pycache__/
 *.pyd
 .venv/
 venv/
+.env
+.env.*
+!.env.example
+billing.env
+billing_dev.env
+shared_billing.env
 build/
 dist/
 release/

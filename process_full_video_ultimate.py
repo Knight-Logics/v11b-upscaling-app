@@ -149,6 +149,79 @@ WAIFU2X_MODEL_CONFIGS: dict[str, tuple[str, str]] = {
     "waifu2x-anime-noise1": ("models-upconv_7_anime_style_art_rgb",  "1"),
 }
 
+# Native model scales must match the bundled NCNN network. Passing 2x or 3x to
+# an x4-only network can produce tiled/cropped output instead of a true upscale.
+MODEL_NATIVE_SCALES: dict[str, set[int]] = {
+    "realesrgan-x4plus": {4},
+    "realesrgan-x4plus-anime": {4},
+    "realesr-animevideov3-x2": {2},
+    "realesr-animevideov3-x3": {3},
+    "realesr-animevideov3-x4": {4},
+    "realsr-df2k": {4},
+    "realsr-df2k-jpeg": {4},
+    "waifu2x-cunet-noise3": {1, 2, 4},
+    "waifu2x-cunet-noise1": {1, 2, 4},
+    "waifu2x-anime-noise3": {1, 2, 4},
+    "waifu2x-anime-noise1": {1, 2, 4},
+}
+
+
+def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
+    """Return a tested, internally compatible preset without touching Tk state."""
+    if speed_name not in {"fast", "balanced", "quality"}:
+        raise ValueError(f"Unknown speed profile: {speed_name}")
+    if content_name not in {"live", "animation", "restore"}:
+        raise ValueError(f"Unknown content profile: {content_name}")
+
+    preset: dict[str, object] = {
+        # Neutral image processing is the safe baseline. The previous automatic
+        # color/sharpen stack visibly shifted skin tones and amplified halos.
+        "denoise": 0.0,
+        "enable_color": False,
+        "vibrance": 0.0,
+        "contrast": 1.0,
+        "brightness": 0.0,
+        "saturation": 1.0,
+        "gamma": 1.0,
+        "enable_sharpen": False,
+        "cas_strength": 0.20,
+        "unsharp1": 0.0,
+        "unsharp2": 0.0,
+        # Interpolation changes motion rather than image detail, so it remains
+        # an explicit Advanced option instead of a surprise Max Detail cost.
+        "enable_interpolation": False,
+        "target_fps": 30,
+        "apply_final_scale": False,
+    }
+
+    if speed_name == "fast":
+        preset.update(image_format="jpg", encode_preset="veryfast", crf=22)
+    elif speed_name == "quality":
+        preset.update(image_format="png", encode_preset="slow", crf=16)
+    else:
+        preset.update(image_format="png", encode_preset="medium", crf=17)
+
+    content_presets: dict[str, dict[str, tuple[str, int]]] = {
+        "live": {
+            "fast": ("realesr-animevideov3-x2", 2),
+            "balanced": ("waifu2x-cunet-noise1", 2),
+            "quality": ("realesrgan-x4plus", 4),
+        },
+        "animation": {
+            "fast": ("realesr-animevideov3-x2", 2),
+            "balanced": ("realesr-animevideov3-x3", 3),
+            "quality": ("realesr-animevideov3-x4", 4),
+        },
+        "restore": {
+            "fast": ("waifu2x-cunet-noise1", 2),
+            "balanced": ("waifu2x-cunet-noise3", 2),
+            "quality": ("realsr-df2k-jpeg", 4),
+        },
+    }
+    model, scale = content_presets[content_name][speed_name]
+    preset.update(model=model, scale=scale)
+    return preset
+
 ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 IMAGE_FORMATS = ["png", "jpg"]
 IMAGE_INPUT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -167,40 +240,43 @@ RIFE_MODEL_OPTIONS   = [key for key, _label in RIFE_MODEL_DETAILS]
 RIFE_MODEL_KEY_TO_LABEL = {key: label for key, label in RIFE_MODEL_DETAILS}
 RIFE_MODEL_LABEL_TO_KEY = {label: key for key, label in RIFE_MODEL_DETAILS}
 TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
-APP_VERSION = "1.0.17"
+APP_VERSION = "1.0.18"
 
 # ---------------------------------------------------------------------------
-# Recovery token helpers (cross-device restore)
+# Legacy recovery token helpers (developer mode only)
 # ---------------------------------------------------------------------------
-_RECOVERY_HMAC_SECRET_FALLBACK = b"v11b-pixelforge-ai-recovery-key-2026-xK9mQ2rL7n"
-
-
-def _get_recovery_hmac_secret() -> bytes:
-    """Return the HMAC secret, preferring the operator-supplied env var over the compiled fallback."""
+def _get_recovery_hmac_secret() -> bytes | None:
+    """Return an operator-supplied developer secret; never compile one into customer builds."""
     val = os.environ.get("V11B_RECOVERY_HMAC_SECRET", "").strip()
     if val:
         return val.encode()
-    return _RECOVERY_HMAC_SECRET_FALLBACK
+    return None
 
 
 def _build_recovery_token(paid_credits: int, email: str) -> str:
-    """Generate a self-contained signed recovery token for cross-device credit restore."""
+    """Generate a developer-only legacy recovery token."""
+    secret = _get_recovery_hmac_secret()
+    if not secret:
+        raise RuntimeError("Legacy recovery codes are disabled in production builds.")
     payload = json.dumps(
         {"c": int(paid_credits), "e": (email or "").strip().lower(), "t": int(time.time()), "v": 2},
         separators=(",", ":"),
     )
     b64 = base64.urlsafe_b64encode(payload.encode()).rstrip(b"=").decode()
-    sig = hmac.new(_get_recovery_hmac_secret(), b64.encode(), hashlib.sha256).hexdigest()[:32]
+    sig = hmac.new(secret, b64.encode(), hashlib.sha256).hexdigest()[:32]
     return f"v11b2.{b64}.{sig}"
 
 
 def _verify_recovery_token(token: str) -> dict | None:
     """Verify a signed recovery token. Returns the payload dict, or None if invalid."""
+    secret = _get_recovery_hmac_secret()
+    if not secret:
+        return None
     parts = (token or "").split(".")
     if len(parts) != 3 or parts[0] != "v11b2":
         return None
     _, b64, given_sig = parts
-    expected_sig = hmac.new(_get_recovery_hmac_secret(), b64.encode(), hashlib.sha256).hexdigest()[:32]
+    expected_sig = hmac.new(secret, b64.encode(), hashlib.sha256).hexdigest()[:32]
     if not hmac.compare_digest(expected_sig, given_sig):
         return None
     try:
@@ -792,6 +868,7 @@ class BillingStore:
 class EmbeddedBillingBackend:
     def __init__(self, store: BillingStore):
         self.store = store
+        self._local_reservations: dict[str, tuple[str, int]] = {}
         _configure_stripe_tls_bundle()
         self.stripe_secret_key = _env_first(
             [
@@ -864,6 +941,47 @@ class EmbeddedBillingBackend:
 
     def get_status(self, token: str) -> dict:
         return self.store.get_status(token)
+
+    def reserve_credits(self, token: str, credits: int, metadata: dict | None = None) -> dict:
+        status = self.store.get_status(token)
+        if int(status.get("credits", 0)) < int(credits):
+            return {
+                **status,
+                "ok": False,
+                "payment_required": True,
+                "error": "Not enough credits for this render.",
+            }
+        reservation_id = f"local_{uuid.uuid4().hex}"
+        self._local_reservations[reservation_id] = (token, int(credits))
+        return {**status, "ok": True, "reservation_id": reservation_id, "reserved_credits": int(credits)}
+
+    def commit_reservation(self, token: str, reservation_id: str) -> dict:
+        reservation = self._local_reservations.pop(reservation_id, None)
+        if reservation is None:
+            return {"ok": False, "error": "Local render reservation was not found."}
+        reserved_token, credits = reservation
+        if reserved_token != token:
+            return {"ok": False, "error": "Local render reservation does not match this account."}
+        consumed, balance = self.store.consume_credits(token, credits, source="v11b_render_complete")
+        return {
+            **self.store.get_status(token),
+            "ok": consumed,
+            "credits": balance,
+            "committed": consumed,
+            "committed_credits": credits if consumed else 0,
+        }
+
+    def release_reservation(self, token: str, reservation_id: str) -> dict:
+        reservation = self._local_reservations.pop(reservation_id, None)
+        return {
+            **self.store.get_status(token),
+            "ok": reservation is not None,
+            "released": reservation is not None,
+            "already_processed": reservation is None,
+        }
+
+    def record_event(self, event_name: str, metadata: dict | None = None) -> dict:
+        return {"ok": True, "recorded": False, "event_name": event_name}
 
     def create_checkout_session(
         self,
@@ -998,6 +1116,144 @@ class EmbeddedBillingBackend:
         if amount_total > 0 and self.price_per_credit_cents > 0:
             return max(1, int(round(amount_total / self.price_per_credit_cents)))
         return 0
+
+
+def _pixelforge_machine_id() -> str:
+    """Return an app-scoped hash; raw Windows identifiers never leave the machine."""
+    source = ""
+    if sys.platform == "win32":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+                source = str(winreg.QueryValueEx(key, "MachineGuid")[0]).strip()
+        except Exception:
+            source = ""
+    if not source:
+        source = f"{platform.node()}|{uuid.getnode()}|{platform.system()}"
+    return hashlib.sha256(f"pixelforge-ai-device-v1|{source}".encode("utf-8", errors="ignore")).hexdigest()
+
+
+class RemoteBillingBackend:
+    """Server-authoritative PixelForge credits, checkout, and anonymous diagnostics."""
+
+    PLAN_BY_CREDITS = {32: "starter_32", 68: "creator_68", 144: "pro_144"}
+
+    def __init__(self, api_base: str, machine_id: str, app_version: str):
+        self.api_base = str(api_base or "").strip().rstrip("/")
+        self.machine_id = machine_id
+        self.app_version = app_version
+        self.stripe_mode = "server"
+        self.price_per_credit_cents = 16
+        parsed = urlparse(self.api_base)
+        if parsed.scheme != "https" and not _is_loopback_url(self.api_base):
+            raise RuntimeError("PixelForge billing requires HTTPS (or a loopback developer server).")
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.api_base}/api/pixelforge-license"
+
+    def _post(self, action: str, payload: dict | None = None, timeout: int = 20, allow_error: bool = False) -> dict:
+        body = {
+            "action": action,
+            "machine_id": self.machine_id,
+            "app_version": self.app_version,
+            **(payload or {}),
+        }
+        request = Request(
+            self.endpoint,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+        except HTTPError as exc:
+            try:
+                data = json.loads(exc.read().decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {"ok": False, "error": f"Billing server returned HTTP {exc.code}."}
+            data.setdefault("ok", False)
+            data["http_status"] = int(exc.code)
+            if allow_error:
+                return data
+            raise RuntimeError(str(data.get("error") or f"Billing server returned HTTP {exc.code}.")) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"Could not reach PixelForge billing: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("PixelForge billing returned an invalid response.")
+        if not data.get("ok", False) and not allow_error:
+            raise RuntimeError(str(data.get("error") or "PixelForge billing request failed."))
+        return data
+
+    def get_status(self, token: str = "") -> dict:
+        return self._post("status")
+
+    def reserve_credits(self, token: str, credits: int, metadata: dict | None = None) -> dict:
+        return self._post(
+            "reserve",
+            {
+                "credits": int(credits),
+                "metadata": metadata or {},
+                "event_id": uuid.uuid4().hex,
+            },
+            allow_error=True,
+        )
+
+    def commit_reservation(self, token: str, reservation_id: str) -> dict:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                return self._post("commit", {"reservation_id": reservation_id})
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.6 * (attempt + 1))
+        raise RuntimeError(str(last_error or "Could not commit the render charge."))
+
+    def release_reservation(self, token: str, reservation_id: str) -> dict:
+        return self._post("release", {"reservation_id": reservation_id}, allow_error=True)
+
+    def create_checkout_session(
+        self,
+        token: str,
+        credits: int,
+        charge_cents: int | None = None,
+        package_name: str | None = None,
+        success_url_override: str | None = None,
+        cancel_url_override: str | None = None,
+    ) -> dict:
+        plan_id = self.PLAN_BY_CREDITS.get(int(credits))
+        if not plan_id:
+            raise RuntimeError("Choose one of the displayed PixelForge credit packages.")
+        return self._post(
+            "create_checkout",
+            {
+                "plan_id": plan_id,
+                "success_url": str(success_url_override or ""),
+                "cancel_url": str(cancel_url_override or ""),
+                "event_id": uuid.uuid4().hex,
+            },
+        )
+
+    def confirm_checkout_session(self, session_id: str) -> dict:
+        return self._post(
+            "confirm_session",
+            {"session_id": str(session_id), "event_id": uuid.uuid4().hex},
+        )
+
+    def record_event(self, event_name: str, metadata: dict | None = None) -> dict:
+        return self._post(
+            "event",
+            {
+                "event_name": event_name,
+                "event_id": uuid.uuid4().hex,
+                "metadata": metadata or {},
+            },
+            timeout=8,
+            allow_error=True,
+        )
 
 
 @dataclass
@@ -1915,12 +2171,13 @@ class V11BApp(tk.Tk):
         self.speed_profile_buttons: dict[str, ttk.Button] = {}
         self.upscaling_profile_buttons: dict[str, ttk.Button] = {}
         self.selected_speed_profile: str = "balanced"
-        self.selected_upscaling_profile: str = "animation"
+        self.selected_upscaling_profile: str = "live"
 
         self.app_data_dir = _PERSISTENT_DATA_DIR
         self.billing_tokens_file = self.app_data_dir / "pixelforge_billing_tokens.json"
         self.billing_audit_file = self.app_data_dir / "pixelforge_billing_audit.jsonl"
         self.billing_state_file = self.app_data_dir / "pixelforge_billing_state.json"
+        self.billing_pending_commits_file = self.app_data_dir / "pixelforge_pending_commits.json"
         _migrate_legacy_data_file(
             self.billing_tokens_file,
             [
@@ -1947,8 +2204,42 @@ class V11BApp(tk.Tk):
             self.billing_tokens_file,
             self.billing_audit_file,
         )
-        self.billing_backend = EmbeddedBillingBackend(self.billing_store)
+        self.machine_id = _pixelforge_machine_id()
+        configured_billing_api = os.environ.get(
+            "V11B_BILLING_API_BASE", "https://knightlogics.com"
+        ).strip()
+        developer_mode_enabled = _env_is_truthy(
+            _env_first(["V11B_DEV_MODE", "PIXELFORGE_DEV_MODE"], "0")
+        )
+        embedded_billing_requested = configured_billing_api.lower() in {
+            "",
+            "embedded://local",
+            "local",
+            "embedded",
+        }
+        developer_local_billing = developer_mode_enabled and embedded_billing_requested
+        # Old developer billing.env files commonly point at embedded://local. A
+        # production build must ignore that legacy value instead of crashing or
+        # silently falling back to a client-controlled credit ledger.
+        self.billing_api_default = (
+            "embedded://local"
+            if developer_local_billing
+            else (
+                "https://knightlogics.com"
+                if embedded_billing_requested
+                else configured_billing_api
+            )
+        )
+        self.local_billing_backend = EmbeddedBillingBackend(self.billing_store)
+        self.billing_backend = (
+            self.local_billing_backend
+            if developer_local_billing
+            else RemoteBillingBackend(self.billing_api_default, self.machine_id, APP_VERSION)
+        )
         self.free_trial_credits = max(0, int(os.environ.get("V11B_FREE_TRIAL_CREDITS", "20")))
+        self._active_reservation_id = ""
+        self.telemetry_enabled = not _env_is_truthy(os.environ.get("V11B_DISABLE_ANONYMOUS_DIAGNOSTICS", "0"))
+        self.telemetry_first_launch_file = self.app_data_dir / "pixelforge_first_launch_recorded"
         self.smtp_host = ""
         self.smtp_port = 587
         self.smtp_user = ""
@@ -1965,10 +2256,14 @@ class V11BApp(tk.Tk):
         self._build_ui()
         self._configure_window_icons()
         self._fit_window_to_content()
+        self.after(100, self._refresh_billing_status_async)
         self._start_system_detection()
         self.after(120, self._poll_log_queue)
         self.after(1200, self._start_update_checks)
-        self.after(1800, self._prompt_backup_email_on_login)
+        if self._use_embedded_billing():
+            self.after(1800, self._prompt_backup_email_on_login)
+        self.after(500, self._record_startup_telemetry)
+        self.after(900, self._retry_pending_billing_commits_async)
 
     def _set_initial_window_size(self) -> None:
         screen_w = self.winfo_screenwidth()
@@ -2013,9 +2308,9 @@ class V11BApp(tk.Tk):
         self.input_video_var = tk.StringVar(value="")
         self.output_video_var = tk.StringVar(value="")
 
-        self.model_var = tk.StringVar(value="realesrgan-x4plus-anime")
+        self.model_var = tk.StringVar(value="waifu2x-cunet-noise1")
         self.model_display_var = tk.StringVar(value=MODEL_KEY_TO_LABEL[self.model_var.get()])
-        self.scale_var = tk.IntVar(value=4)
+        self.scale_var = tk.IntVar(value=2)
         self.image_format_var = tk.StringVar(value="png")
         self._auto_threads_value = self._recommend_realesrgan_threads()
         self.threads_var = tk.StringVar(value=self._auto_threads_value)
@@ -2024,17 +2319,17 @@ class V11BApp(tk.Tk):
         self.clip_duration_var = tk.DoubleVar(value=0.0)
 
         self.denoise_var = tk.DoubleVar(value=0.0)
-        self.enable_color_var = tk.BooleanVar(value=True)
-        self.vibrance_var = tk.DoubleVar(value=0.35)
-        self.contrast_var = tk.DoubleVar(value=1.10)
-        self.brightness_var = tk.DoubleVar(value=0.04)
-        self.saturation_var = tk.DoubleVar(value=1.25)
-        self.gamma_var = tk.DoubleVar(value=1.06)
+        self.enable_color_var = tk.BooleanVar(value=False)
+        self.vibrance_var = tk.DoubleVar(value=0.0)
+        self.contrast_var = tk.DoubleVar(value=1.0)
+        self.brightness_var = tk.DoubleVar(value=0.0)
+        self.saturation_var = tk.DoubleVar(value=1.0)
+        self.gamma_var = tk.DoubleVar(value=1.0)
 
-        self.enable_sharpen_var = tk.BooleanVar(value=True)
-        self.cas_strength_var = tk.DoubleVar(value=0.80)
-        self.unsharp1_var = tk.DoubleVar(value=1.5)
-        self.unsharp2_var = tk.DoubleVar(value=0.8)
+        self.enable_sharpen_var = tk.BooleanVar(value=False)
+        self.cas_strength_var = tk.DoubleVar(value=0.20)
+        self.unsharp1_var = tk.DoubleVar(value=0.0)
+        self.unsharp2_var = tk.DoubleVar(value=0.0)
 
         self.enable_interpolation_var = tk.BooleanVar(value=False)
         self.interp_engine_var = tk.StringVar(value=INTERP_ENGINE_RIFE)
@@ -2061,11 +2356,12 @@ class V11BApp(tk.Tk):
         self.compare_slider_var = tk.DoubleVar(value=50.0)
         self.compare_frame_pct_var = tk.DoubleVar(value=50.0)
         self.profile_summary_var = tk.StringVar(value="")
+        self.profile_guidance_var = tk.StringVar(value="")
         self.compare_dragging = False
         self.compare_hover_near_line = False
         self.compare_separator_x = 0
 
-        default_api = os.environ.get("V11B_BILLING_API_BASE", "embedded://local")
+        default_api = self.billing_api_default
         self.billing_api_base_var = tk.StringVar(value=default_api)
         self.billing_token_var = tk.StringVar(value=os.environ.get("V11B_BILLING_TOKEN", ""))
         self.checkout_credits_var = tk.IntVar(value=25)
@@ -2079,7 +2375,7 @@ class V11BApp(tk.Tk):
         self.debug_stripe_mode_var = tk.StringVar(value=f"mode={getattr(self.billing_backend, 'stripe_mode', 'unknown')}")
         self.debug_key_hint_var = tk.StringVar(value="key=not loaded")
         self.debug_smtp_status_var = tk.StringVar(value="smtp=unknown")
-        self.header_registration_var = tk.StringVar(value="X Not Registered")
+        self.header_registration_var = tk.StringVar(value="Account ready")
         self._header_email_registered: bool = False
         self.billing_status_var = tk.StringVar(value="Billing: Ready. Select a package and click Start Checkout.")
         self.available_credits_var = tk.StringVar(value="0")
@@ -2103,8 +2399,10 @@ class V11BApp(tk.Tk):
         self._load_billing_state()
         if not self.billing_token_var.get().strip():
             self.billing_token_var.set(self._generate_billing_token())
-        self._ensure_free_trial_for_token(self.billing_token_var.get().strip())
-        self._refresh_billing_status(silent=True)
+        if self._use_embedded_billing():
+            self._ensure_free_trial_for_token(self.billing_token_var.get().strip())
+        if self._use_embedded_billing():
+            self._refresh_billing_status(silent=True)
 
     def _configure_theme(self) -> None:
         self.configure(bg="#0a1220")
@@ -2335,6 +2633,17 @@ class V11BApp(tk.Tk):
         if linked_email:
             self.recovery_email_var.set(linked_email)
 
+        if not self._use_embedded_billing():
+            self.header_registration_var.set("✓ Purchase protected" if self._header_email_registered else "✓ Trial active")
+            if self.header_registration_label is not None:
+                self.header_registration_label.configure(
+                    fg="#39d98a",
+                    cursor="arrow",
+                    font=("Segoe UI", 8, "bold"),
+                )
+                self.header_registration_label.unbind("<Button-1>")
+            return
+
         if self._header_email_registered:
             self.header_registration_var.set("✓ Registered")
         else:
@@ -2359,6 +2668,12 @@ class V11BApp(tk.Tk):
             self.header_registration_label.bind("<Button-1>", self._manual_register_email_from_header)
 
     def _manual_register_email_from_header(self, _event=None) -> None:
+        if not self._use_embedded_billing():
+            messagebox.showinfo(
+                "Account Protection",
+                "Your purchase email is collected by secure checkout and linked automatically. No manual registration is needed.",
+            )
+            return
         token = self.billing_token_var.get().strip()
         if not token:
             token = self._generate_billing_token()
@@ -2570,7 +2885,7 @@ class V11BApp(tk.Tk):
             "restore": restore_btn,
         }
         self._set_selected_speed_profile("balanced", apply=False)
-        self._set_selected_upscaling_profile("animation", apply=False)
+        self._set_selected_upscaling_profile("live", apply=False)
         self._apply_combined_profile()
 
         ttk.Label(
@@ -2580,6 +2895,13 @@ class V11BApp(tk.Tk):
             wraplength=780,
             justify=LEFT,
         ).pack(anchor=W, pady=(8, 0))
+        ttk.Label(
+            parent,
+            textvariable=self.profile_guidance_var,
+            style="Hint.TLabel",
+            wraplength=780,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(4, 0))
 
     def _build_settings_notebook(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent, style="Panel.TFrame")
@@ -3033,6 +3355,8 @@ class V11BApp(tk.Tk):
             wraplength=790,
             justify=LEFT,
         ).pack(anchor=W, pady=(6, 0))
+        if not self._is_dev_bypass_enabled():
+            self.restore_account_link_label.pack_forget()
 
     def _toggle_restore_code_panel(self) -> None:
         is_visible = bool(self.restore_code_panel.winfo_manager())
@@ -3411,6 +3735,12 @@ class V11BApp(tk.Tk):
         return stage_map
 
     def _apply_restore_or_offer_code(self) -> None:
+        if not self._is_dev_bypass_enabled():
+            messagebox.showinfo(
+                "Account Access",
+                "Production credits are now linked through secure checkout. Legacy local access and offer codes are disabled.",
+            )
+            return
         code = self.access_code_input_var.get().strip()
         if not code:
             messagebox.showwarning("Code Required", "Enter an access code or offer code first.")
@@ -3692,8 +4022,7 @@ class V11BApp(tk.Tk):
         return f"{base}{endpoint}"
 
     def _use_embedded_billing(self) -> bool:
-        base = self.billing_api_base_var.get().strip().lower()
-        return base in {"", "embedded://local", "local", "embedded"}
+        return isinstance(self.billing_backend, EmbeddedBillingBackend)
 
     @staticmethod
     def _generate_billing_token() -> str:
@@ -3711,9 +4040,12 @@ class V11BApp(tk.Tk):
             recovery_email = str(data.get("recovery_email", "")).strip()
             if token:
                 self.billing_token_var.set(token)
-            if api_base in {"http://127.0.0.1:5050", "http://localhost:5050"} and not os.environ.get("V11B_BILLING_API_BASE"):
-                api_base = "embedded://local"
-            if api_base:
+            if (
+                api_base.lower() in {"", "embedded://local", "local", "embedded"}
+                and not self._use_embedded_billing()
+            ):
+                api_base = self.billing_api_default
+            if api_base and self._use_embedded_billing():
                 self.billing_api_base_var.set(api_base)
             if last_session:
                 self.checkout_session_var.set(last_session)
@@ -3738,6 +4070,9 @@ class V11BApp(tk.Tk):
         self.log_queue.put(f"[INFO] Billing state saved to {self.billing_state_file}")
 
     def _refresh_billing_status(self, silent: bool = False) -> None:
+        if not self._use_embedded_billing():
+            self._refresh_billing_status_async()
+            return
         token = self.billing_token_var.get().strip()
         if not token:
             self.available_credits_var.set("0")
@@ -3746,29 +4081,146 @@ class V11BApp(tk.Tk):
                 self.billing_status_var.set("Billing: generate or enter a token first.")
             return
         try:
-            self._ensure_free_trial_for_token(token)
             if self._use_embedded_billing():
-                status = self.billing_backend.get_status(token)
-            else:
-                url = self._billing_endpoint("/api/billing/status") + "?" + urlencode({"token": token})
-                request = Request(url, method="GET")
-                with urlopen(request, timeout=15) as response:
-                    status = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
-            credits = int(status.get("credits", 0) or 0)
-            paid = int(status.get("paid_credits", 0) or 0)
-            trial = int(status.get("free_trial_remaining", 0) or 0)
-            email_linked = bool(status.get("email_linked", False))
-            linked_email = str(status.get("linked_email") or "").strip()
-            self._set_header_registration_state(email_linked, linked_email)
-            self.available_credits_var.set(str(credits))
-            self.billing_status_var.set(
-                f"Billing: token {token[:12]}... has {credits} credits available (paid: {paid}, trial: {trial})."
-            )
+                self._ensure_free_trial_for_token(token)
+            status = self.billing_backend.get_status(token)
+            self._apply_billing_status(status, token)
         except Exception as exc:
             self.available_credits_var.set("--")
             self._set_header_registration_state(False)
             if not silent:
                 self.billing_status_var.set(f"Billing status check failed: {exc}")
+
+    def _apply_billing_status(self, status: dict, token: str = "") -> None:
+        credits = int(status.get("credits", 0) or 0)
+        paid = int(status.get("paid_credits", 0) or 0)
+        trial = int(status.get("free_trial_remaining", 0) or 0)
+        email_linked = bool(status.get("email_linked", False))
+        linked_email = str(status.get("linked_email") or "").strip()
+        self._set_header_registration_state(email_linked, linked_email)
+        self.available_credits_var.set(str(credits))
+        if self._use_embedded_billing():
+            self.billing_status_var.set(
+                f"Billing: local developer token {token[:12]}... has {credits} credits (paid: {paid}, trial: {trial})."
+            )
+        else:
+            self.billing_status_var.set(
+                f"Billing: {credits} credits available ({paid} purchased + {trial} trial)."
+            )
+
+    def _refresh_billing_status_async(self) -> None:
+        if self._use_embedded_billing():
+            self._refresh_billing_status(silent=True)
+            return
+        token = self.billing_token_var.get().strip()
+
+        def _worker() -> None:
+            try:
+                status = self.billing_backend.get_status(token)
+                self.after(0, lambda: self._apply_billing_status(status, token))
+            except Exception as exc:
+                self.log_queue.put(f"[WARN] Billing status unavailable: {exc}")
+                self.after(0, lambda: self.available_credits_var.set("--"))
+
+        threading.Thread(target=_worker, name="billing-status", daemon=True).start()
+
+    def _record_telemetry_event(self, event_name: str, metadata: dict | None = None) -> None:
+        if not self.telemetry_enabled or self._use_embedded_billing():
+            return
+        try:
+            self.billing_backend.record_event(event_name, metadata or {})
+        except Exception as exc:
+            self.log_queue.put(f"[DEBUG] Anonymous diagnostics skipped: {exc}")
+
+    def _record_telemetry_event_async(self, event_name: str, metadata: dict | None = None) -> None:
+        threading.Thread(
+            target=self._record_telemetry_event,
+            args=(event_name, metadata or {}),
+            name=f"telemetry-{event_name}",
+            daemon=True,
+        ).start()
+
+    def _record_startup_telemetry(self) -> None:
+        if not self.telemetry_enabled or self._use_embedded_billing():
+            return
+
+        def _worker() -> None:
+            self._record_telemetry_event("app_open", {"outcome": "opened"})
+            if self.telemetry_first_launch_file.exists():
+                return
+            try:
+                result = self.billing_backend.record_event("first_launch", {"outcome": "installed"})
+                if result.get("ok"):
+                    self.telemetry_first_launch_file.write_text(APP_VERSION, encoding="utf-8")
+            except Exception as exc:
+                self.log_queue.put(f"[DEBUG] First-launch diagnostics skipped: {exc}")
+
+        threading.Thread(target=_worker, name="telemetry-startup", daemon=True).start()
+
+    def _queue_pending_billing_commit(self, reservation_id: str, credits: int) -> None:
+        if not reservation_id:
+            return
+        try:
+            payload: list[dict] = []
+            if self.billing_pending_commits_file.exists():
+                loaded = json.loads(self.billing_pending_commits_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    payload = [item for item in loaded if isinstance(item, dict)]
+            if not any(str(item.get("reservation_id")) == reservation_id for item in payload):
+                payload.append(
+                    {
+                        "reservation_id": reservation_id,
+                        "credits": int(credits),
+                        "queued_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    }
+                )
+            self.billing_pending_commits_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self.log_queue.put(f"[ERROR] Could not save pending billing confirmation: {exc}")
+
+    def _retry_pending_billing_commits_async(self) -> None:
+        if self._use_embedded_billing() or not self.billing_pending_commits_file.exists():
+            return
+
+        def _worker() -> None:
+            try:
+                loaded = json.loads(self.billing_pending_commits_file.read_text(encoding="utf-8"))
+                pending = [item for item in loaded if isinstance(item, dict)] if isinstance(loaded, list) else []
+            except Exception:
+                return
+            remaining: list[dict] = []
+            token = self.billing_token_var.get().strip()
+            for item in pending:
+                reservation_id = str(item.get("reservation_id") or "").strip()
+                try:
+                    result = self.billing_backend.commit_reservation(token, reservation_id)
+                    if result.get("ok"):
+                        self.log_queue.put(f"[INFO] Confirmed previously pending render charge: {reservation_id}.")
+                        continue
+                except Exception as exc:
+                    item["last_error"] = str(exc)[:240]
+                remaining.append(item)
+            try:
+                if remaining:
+                    self.billing_pending_commits_file.write_text(json.dumps(remaining, indent=2), encoding="utf-8")
+                else:
+                    self.billing_pending_commits_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="billing-pending-commits", daemon=True).start()
+
+    @staticmethod
+    def _duration_bucket(seconds: float) -> str:
+        if seconds <= 15:
+            return "0-15s"
+        if seconds <= 60:
+            return "16-60s"
+        if seconds <= 300:
+            return "1-5m"
+        if seconds <= 1200:
+            return "5-20m"
+        return "20m+"
 
     def _prompt_backup_email_on_login(self) -> None:
         self._maybe_prompt_backup_email(trigger="login")
@@ -3783,13 +4235,7 @@ class V11BApp(tk.Tk):
 
         status: dict = {}
         try:
-            if self._use_embedded_billing():
-                status = self.billing_backend.get_status(token)
-            else:
-                url = self._billing_endpoint("/api/billing/status") + "?" + urlencode({"token": token})
-                request = Request(url, method="GET")
-                with urlopen(request, timeout=15) as response:
-                    status = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+            status = self.billing_backend.get_status(token)
         except Exception as exc:
             self.log_queue.put(f"[WARN] Backup email prompt status check failed: {exc}")
             return
@@ -4611,7 +5057,7 @@ class V11BApp(tk.Tk):
                 "title": "68 Credits",
                 "credits": 68,
                 "price_cents": 1000,
-                "accent": False,
+                "accent": True,
                 "badge": "Most Popular",
                 "summary": "Better value per credit for regular creators handling multiple clips per session.",
             },
@@ -4736,28 +5182,14 @@ class V11BApp(tk.Tk):
         local_cancel  = f"http://127.0.0.1:{port}/payment_cancel"
 
         try:
-            if self._use_embedded_billing():
-                data = self.billing_backend.create_checkout_session(
-                    token,
-                    credits,
-                    charge_cents=charge_cents,
-                    package_name=package_name,
-                    success_url_override=local_success,
-                    cancel_url_override=local_cancel,
-                )
-            else:
-                url = self._billing_endpoint("/api/payments/create-checkout-session")
-                payload = {
-                    "token": token,
-                    "credits": str(credits),
-                }
-                if charge_cents is not None:
-                    payload["charge_cents"] = str(int(charge_cents))
-                if package_name:
-                    payload["package_name"] = package_name
-                status_code, data = self._post_form_json(url, payload)
-                if status_code != 200:
-                    raise RuntimeError(str(data.get("error", f"HTTP {status_code}")))
+            data = self.billing_backend.create_checkout_session(
+                token,
+                credits,
+                charge_cents=charge_cents,
+                package_name=package_name,
+                success_url_override=local_success,
+                cancel_url_override=local_cancel,
+            )
             checkout_url = str(data.get("url", "")).strip()
             session_id = str(data.get("session_id", "")).strip()
         except Exception as exc:
@@ -4829,6 +5261,7 @@ class V11BApp(tk.Tk):
             self._checkout_pending = False
             self.billing_status_var.set("Checkout cancelled. No payment was made.")
             self.log_queue.put("[INFO] Checkout cancelled by user.")
+            self._record_telemetry_event_async("checkout_cancelled", {"outcome": "cancelled"})
             return
 
         if status == "success":
@@ -4841,13 +5274,7 @@ class V11BApp(tk.Tk):
 
             def _confirm_worker() -> None:
                 try:
-                    if self._use_embedded_billing():
-                        data = self.billing_backend.confirm_checkout_session(session_id)
-                    else:
-                        api_url = self._billing_endpoint("/api/payments/confirm-session")
-                        status_code, data = self._post_form_json(api_url, {"session_id": session_id})
-                        if status_code != 200:
-                            raise RuntimeError(str(data.get("error", f"HTTP {status_code}")))
+                    data = self.billing_backend.confirm_checkout_session(session_id)
                     self.after(0, lambda: self._on_payment_confirmed(data))
                 except Exception as exc:
                     self.log_queue.put("[ERROR] Auto-confirm exception details:\n" + traceback.format_exc())
@@ -4858,7 +5285,7 @@ class V11BApp(tk.Tk):
     def _on_payment_confirmed(self, data: dict) -> None:
         """Called in main thread after auto-confirm succeeds."""
         self._checkout_pending = False
-        credited = int(data.get("credited_credits", 0) or 0)
+        credited = int(data.get("credited_credits", 0) or data.get("purchased_credits", 0) or 0)
         already_processed = bool(data.get("already_processed", False))
         token = self.billing_token_var.get().strip()
         self._save_billing_state()
@@ -4876,7 +5303,7 @@ class V11BApp(tk.Tk):
         )
 
         should_prompt_email = False
-        if (not already_processed) and credited > 0 and token:
+        if self._use_embedded_billing() and (not already_processed) and credited > 0 and token:
             try:
                 status = self.billing_backend.get_status(token)
                 should_prompt_email = not bool(status.get("email_linked", False))
@@ -4913,13 +5340,7 @@ class V11BApp(tk.Tk):
             return
 
         try:
-            if self._use_embedded_billing():
-                data = self.billing_backend.confirm_checkout_session(session_id)
-            else:
-                url = self._billing_endpoint("/api/payments/confirm-session")
-                status_code, data = self._post_form_json(url, {"session_id": session_id})
-                if status_code != 200:
-                    raise RuntimeError(str(data.get("error", f"HTTP {status_code}")))
+            data = self.billing_backend.confirm_checkout_session(session_id)
         except Exception as exc:
             err = str(exc)
             self.billing_status_var.set(f"Confirm failed: {err}")
@@ -4928,7 +5349,7 @@ class V11BApp(tk.Tk):
 
         self._checkout_pending = False
 
-        credited = int(data.get("credited_credits", 0) or 0)
+        credited = int(data.get("credited_credits", 0) or data.get("purchased_credits", 0) or 0)
         already_processed = bool(data.get("already_processed", False))
         token = self.billing_token_var.get().strip()
         if already_processed:
@@ -4956,7 +5377,7 @@ class V11BApp(tk.Tk):
             )
 
         should_prompt_email = False
-        if (not already_processed) and credited > 0 and token:
+        if self._use_embedded_billing() and (not already_processed) and credited > 0 and token:
             try:
                 status = self.billing_backend.get_status(token)
                 should_prompt_email = not bool(status.get("email_linked", False))
@@ -5139,100 +5560,32 @@ class V11BApp(tk.Tk):
     def _apply_combined_profile(self) -> None:
         speed_name = self.selected_speed_profile
         upscaling_name = self.selected_upscaling_profile
-
-        # Baseline v11b quality stack (used as a starting point for every profile).
-        self.enable_color_var.set(True)
-        self.vibrance_var.set(0.35)
-        self.contrast_var.set(1.10)
-        self.brightness_var.set(0.04)
-        self.saturation_var.set(1.25)
-        self.gamma_var.set(1.06)
-        self.enable_sharpen_var.set(True)
-        self.cas_strength_var.set(0.80)
-        self.unsharp1_var.set(1.5)
-        self.unsharp2_var.set(0.8)
-
-        # Speed presets control throughput/encode behavior first.
-        if speed_name == "fast":
-            self.image_format_var.set("jpg")
-            self.enable_interpolation_var.set(False)
-            self.target_fps_var.set(30)
-            self.encode_preset_var.set("veryfast")
-            self.crf_var.set(22)
-            self.apply_final_scale_var.set(False)
-        elif speed_name == "quality":
-            self.image_format_var.set("png")
-            self.enable_interpolation_var.set(True)
-            self.target_fps_var.set(60)
-            self.encode_preset_var.set("slow")
-            self.crf_var.set(16)
-            self.apply_final_scale_var.set(True)
-        else:
-            # Balanced: keep quality-oriented pipeline while trimming runtime vs Max Detail.
-            self.image_format_var.set("png")
-            self.enable_interpolation_var.set(False)
-            self.target_fps_var.set(30)
-            self.encode_preset_var.set("medium")
-            self.crf_var.set(17)
-            self.apply_final_scale_var.set(True)
-
-        # Upscaling presets control model strength and cleanup behavior.
-        if upscaling_name == "live":
-            self.model_var.set("realesrgan-x4plus")
-            if speed_name == "fast":
-                self.scale_var.set(2)
-                self.denoise_var.set(0.2)
-                self.cas_strength_var.set(0.55)
-            elif speed_name == "balanced":
-                self.scale_var.set(3)
-                self.denoise_var.set(0.2)
-                self.cas_strength_var.set(0.65)
-            else:
-                self.scale_var.set(4)
-                self.denoise_var.set(0.2)
-                self.cas_strength_var.set(0.80)
-        elif upscaling_name == "restore":
-            self.model_var.set("realesrgan-x4plus")
-            if speed_name == "fast":
-                self.scale_var.set(2)
-                self.denoise_var.set(0.8)
-                self.cas_strength_var.set(0.55)
-            elif speed_name == "balanced":
-                self.scale_var.set(3)
-                self.denoise_var.set(0.8)
-                self.cas_strength_var.set(0.65)
-            else:
-                self.scale_var.set(4)
-                self.denoise_var.set(0.8)
-                self.cas_strength_var.set(0.80)
-        else:
-            # Animation / Anime
-            if speed_name == "fast":
-                # Quick Preview: fastest enhancement path.
-                self.model_var.set("realesr-animevideov3-x2")
-                self.scale_var.set(2)
-                self.denoise_var.set(0.0)
-                self.enable_sharpen_var.set(False)
-                self.cas_strength_var.set(0.50)
-            elif speed_name == "balanced":
-                # Balanced: quality-first but meaningfully faster than Max Detail.
-                self.model_var.set("realesr-animevideov3-x3")
-                self.scale_var.set(3)
-                self.denoise_var.set(0.0)
-                self.enable_sharpen_var.set(True)
-                self.cas_strength_var.set(0.75)
-            else:
-                # Max Detail + Animation: match original v11b strong settings.
-                self.model_var.set("realesrgan-x4plus-anime")
-                self.scale_var.set(4)
-                self.denoise_var.set(0.0)
-                self.enable_sharpen_var.set(True)
-                self.cas_strength_var.set(0.80)
-                self.unsharp1_var.set(1.5)
-                self.unsharp2_var.set(0.8)
-
-        if self.apply_final_scale_var.get():
-            self._sync_target_dimensions_from_source()
+        preset = get_profile_preset(speed_name, upscaling_name)
+        variable_map = {
+            "model": self.model_var,
+            "scale": self.scale_var,
+            "image_format": self.image_format_var,
+            "denoise": self.denoise_var,
+            "enable_color": self.enable_color_var,
+            "vibrance": self.vibrance_var,
+            "contrast": self.contrast_var,
+            "brightness": self.brightness_var,
+            "saturation": self.saturation_var,
+            "gamma": self.gamma_var,
+            "enable_sharpen": self.enable_sharpen_var,
+            "cas_strength": self.cas_strength_var,
+            "unsharp1": self.unsharp1_var,
+            "unsharp2": self.unsharp2_var,
+            "enable_interpolation": self.enable_interpolation_var,
+            "target_fps": self.target_fps_var,
+            "apply_final_scale": self.apply_final_scale_var,
+            "crf": self.crf_var,
+            "encode_preset": self.encode_preset_var,
+        }
+        for setting_name, setting_value in preset.items():
+            variable = variable_map.get(setting_name)
+            if variable is not None:
+                variable.set(setting_value)
 
         self._refresh_auto_thread_recommendation()
         self._sync_display_from_model()
@@ -5369,6 +5722,17 @@ class V11BApp(tk.Tk):
             f"Active: {speed_label} + {upscaling_label} | model={model_label.split('(')[0].strip()} | "
             f"scale={scale}x | final scale={final_scale} | output={output_dims} | interpolation={interp}"
         )
+        guidance = {
+            "live": "Recommended for phone/camera footage, people, products, and real-world scenes.",
+            "animation": "Use only for animation, line art, anime, or game captures.",
+            "restore": "Use for visibly compressed, blocky, noisy, or older footage; it intentionally smooths artifacts.",
+        }.get(self.selected_upscaling_profile, "")
+        speed_guidance = {
+            "fast": "Quick Preview favors speed and a smaller 2x result.",
+            "balanced": "Balanced is the safest first run for most files.",
+            "quality": "Max Detail uses a native 4x model and can take substantially longer.",
+        }.get(self.selected_speed_profile, "")
+        self.profile_guidance_var.set(f"{guidance} {speed_guidance}".strip())
 
     def _sync_rife_model_from_display(self) -> None:
         label = self.rife_model_display_var.get().strip()
@@ -5386,7 +5750,7 @@ class V11BApp(tk.Tk):
 
     def _sync_display_from_model(self) -> None:
         key = self.model_var.get().strip()
-        self.model_display_var.set(MODEL_KEY_TO_LABEL.get(key, MODEL_KEY_TO_LABEL["realesrgan-x4plus-anime"]))
+        self.model_display_var.set(MODEL_KEY_TO_LABEL.get(key, MODEL_KEY_TO_LABEL["waifu2x-cunet-noise1"]))
 
     def _generate_compare_frame(self, silent: bool = False) -> None:
         if not self.input_video_var.get().strip():
@@ -5879,8 +6243,17 @@ class V11BApp(tk.Tk):
             raise ValueError("Output path points to a folder; choose a file name")
         if not output_path.parent.exists():
             raise ValueError("Output folder does not exist")
-        if self.model_var.get().strip() not in MODEL_OPTIONS:
+        model_key = self.model_var.get().strip()
+        if model_key not in MODEL_OPTIONS:
             raise ValueError("Select a valid upscale model")
+        selected_scale = int(self.scale_var.get())
+        allowed_scales = MODEL_NATIVE_SCALES.get(model_key, {selected_scale})
+        if selected_scale not in allowed_scales:
+            scale_text = ", ".join(f"{value}x" for value in sorted(allowed_scales))
+            raise ValueError(
+                f"{MODEL_KEY_TO_LABEL.get(model_key, model_key).split('(')[0].strip()} supports {scale_text} with the bundled model. "
+                "Choose a compatible scale or select a tested profile."
+            )
         if self.target_width_var.get() < 360 or self.target_height_var.get() < 360:
             raise ValueError("Target width and height must be at least 360")
         if self.crf_var.get() < 12 or self.crf_var.get() > 30:
@@ -6209,26 +6582,59 @@ class V11BApp(tk.Tk):
             messagebox.showerror("Billing estimate failed", f"Could not calculate processing credits: {exc}")
             return
 
-        _bal_check = self.billing_store.get_status(token)
-        remaining = _bal_check["credits"]
-        if remaining < required_credits:
-            self._refresh_billing_status(silent=True)
-            messagebox.showwarning(
-                "Insufficient Credits",
-                f"This render needs {required_credits} credits but only {remaining} are available.\n\n"
-                "Open the Billing tab to purchase more credits.",
+        render_metadata = {
+            "profile": self.selected_speed_profile,
+            "content_type": self.selected_upscaling_profile,
+            "model": settings.model,
+            "scale": settings.scale,
+            "duration_bucket": self._duration_bucket(effective_duration),
+            "source_size": f"{_src_w}x{_src_h}",
+            "target_fps": settings.target_fps,
+            "interpolation": bool(settings.enable_interpolation),
+        }
+        try:
+            reservation = self.billing_backend.reserve_credits(token, required_credits, render_metadata)
+        except Exception as exc:
+            messagebox.showerror(
+                "Billing Unavailable",
+                f"PixelForge could not securely reserve credits for this render.\n\n{exc}\n\n"
+                "Check your connection and try again; no credits were charged.",
             )
+            return
+
+        remaining = int(reservation.get("credits", 0) or 0)
+        reservation_id = str(reservation.get("reservation_id") or "").strip()
+        if not reservation.get("ok") or not reservation_id:
+            self._refresh_billing_status(silent=True)
+            if reservation.get("payment_required"):
+                messagebox.showwarning(
+                    "Insufficient Credits",
+                    f"This render needs {required_credits} credits but only {remaining} are available.\n\n"
+                    "Click Buy Credits to add more.",
+                )
+            else:
+                messagebox.showerror(
+                    "Billing Unavailable",
+                    str(reservation.get("error") or "PixelForge could not reserve credits. Try again shortly."),
+                )
             return
 
         self._charged_token = token
         self._charged_credits = required_credits
+        self._active_reservation_id = reservation_id
         self._stop_requested_by_user = False
         self._current_run_output = settings.output_video
+        self.available_credits_var.set(str(remaining))
         self._reset_progress_state()
         self.credit_quote_var.set(f"Render cost locked: {required_credits} credit(s). Basis: {breakdown}.")
         self.start_button_credit_var.set(f"({required_credits} credits)")
-        self.billing_status_var.set(f"Billing: {required_credits} credits will be charged on successful completion. Current balance: {remaining}.")
-        self.log_queue.put(f"[INFO] {required_credits} credits reserved for this run. Credits are charged only after a successful output is confirmed.")
+        self.billing_status_var.set(
+            f"Billing: {required_credits} credits reserved. They are returned automatically if the render fails or is cancelled. Available balance: {remaining}."
+        )
+        self.log_queue.put(
+            f"[INFO] Securely reserved {required_credits} credits for this run ({reservation_id})."
+        )
+        self._record_telemetry_event_async("render_reserved", {**render_metadata, "reservation_id": reservation_id})
 
         self.stop_event.clear()
         self._set_progress_visible(True)
@@ -6260,17 +6666,59 @@ class V11BApp(tk.Tk):
                 and output_path.is_file()
             )
             if was_canceled:
-                self.log_queue.put("[WARN] Processing canceled by user. No output file was kept. No credits were charged.")
-            elif output_exists and self._charged_token and self._charged_credits > 0:
-                consumed, new_balance = self.billing_store.consume_credits(
-                    self._charged_token, self._charged_credits, source="v11b_render_complete"
+                release = self.billing_backend.release_reservation(
+                    self._charged_token or "", self._active_reservation_id
                 )
-                self.log_queue.put(f"[INFO] Processing completed. Charged {self._charged_credits} credits. Remaining balance: {new_balance}.")
-                self.after(0, lambda b=new_balance: self.billing_status_var.set(f"Billing: charged {self._charged_credits} credits for completed render. Remaining balance: {b}."))
+                returned_balance = int(release.get("credits", 0) or 0)
+                self.log_queue.put(
+                    f"[WARN] Processing canceled by user. No output file was kept. Reserved credits were returned; balance: {returned_balance}."
+                )
+                self._record_telemetry_event(
+                    "render_cancelled", {"reservation_id": self._active_reservation_id, "outcome": "cancelled"}
+                )
+            elif output_exists and self._charged_token and self._charged_credits > 0 and self._active_reservation_id:
+                charged_credits = self._charged_credits
+                try:
+                    committed = self.billing_backend.commit_reservation(
+                        self._charged_token, self._active_reservation_id
+                    )
+                    new_balance = int(committed.get("credits", 0) or 0)
+                    self.log_queue.put(
+                        f"[INFO] Processing completed. Charged {charged_credits} credits. Remaining balance: {new_balance}."
+                    )
+                    self.after(
+                        0,
+                        lambda b=new_balance, c=charged_credits: self.billing_status_var.set(
+                            f"Billing: charged {c} credits for completed render. Remaining balance: {b}."
+                        ),
+                    )
+                except Exception as billing_exc:
+                    self._queue_pending_billing_commit(self._active_reservation_id, charged_credits)
+                    self.log_queue.put(
+                        f"[WARN] Output completed, but final billing confirmation is pending and will retry automatically: {billing_exc}"
+                    )
+                    self.after(
+                        0,
+                        lambda: self.billing_status_var.set(
+                            "Billing: render completed; secure charge confirmation is pending and will retry automatically."
+                        ),
+                    )
+                self._record_telemetry_event(
+                    "render_completed", {"reservation_id": self._active_reservation_id, "outcome": "completed"}
+                )
             else:
-                self.log_queue.put("[INFO] Processing completed successfully.")
+                release = self.billing_backend.release_reservation(
+                    self._charged_token or "", self._active_reservation_id
+                )
+                self.log_queue.put(
+                    f"[WARN] Pipeline exited without a valid output. Reserved credits were returned; balance: {int(release.get('credits', 0) or 0)}."
+                )
+                self._record_telemetry_event(
+                    "render_failed", {"reservation_id": self._active_reservation_id, "outcome": "missing_output"}
+                )
             self._charged_token = None
             self._charged_credits = 0
+            self._active_reservation_id = ""
             self._current_run_output = None
             self._stop_requested_by_user = False
             self._active_stage_pred_seconds = {}
@@ -6279,8 +6727,28 @@ class V11BApp(tk.Tk):
             self.after(0, lambda: self._set_processing_controls_active(False))
             self.after(0, lambda: self._refresh_billing_status(silent=True))
         except Exception as exc:
+            reservation_id = self._active_reservation_id
+            charged_token = self._charged_token or ""
+            if reservation_id:
+                try:
+                    released = self.billing_backend.release_reservation(charged_token, reservation_id)
+                    self.log_queue.put(
+                        f"[INFO] Returned reserved credits after failure. Balance: {int(released.get('credits', 0) or 0)}."
+                    )
+                except Exception as release_exc:
+                    self.log_queue.put(f"[WARN] Credit release will be retried by reservation expiry: {release_exc}")
+                event_name = "render_cancelled" if self._stop_requested_by_user else "render_failed"
+                self._record_telemetry_event(
+                    event_name,
+                    {
+                        "reservation_id": reservation_id,
+                        "outcome": "cancelled" if self._stop_requested_by_user else "failed",
+                        "error_code": type(exc).__name__,
+                    },
+                )
             self._charged_token = None
             self._charged_credits = 0
+            self._active_reservation_id = ""
             self._cleanup_output_if_canceled()
             self._current_run_output = None
             self._stop_requested_by_user = False
@@ -6309,12 +6777,10 @@ class V11BApp(tk.Tk):
                 pass
 
         if self._charged_token and self._charged_credits > 0:
-            refunded = self.billing_store.restore_credits(self._charged_token, self._charged_credits, source="v11b_render_user_stop_refund")
-            self.log_queue.put(f"[WARN] Stop pressed: refunded {self._charged_credits} credits. Balance: {refunded}.")
-            self.billing_status_var.set(f"Billing: stop requested. Refunded {self._charged_credits} credits. Remaining balance: {refunded}.")
-            self._charged_token = None
-            self._charged_credits = 0
-            self._refresh_billing_status(silent=True)
+            self.log_queue.put(
+                f"[WARN] Stop pressed: {self._charged_credits} reserved credits will be returned when the worker exits."
+            )
+            self.billing_status_var.set("Billing: stop requested. Reserved credits will be returned automatically.")
 
         self.log_queue.put("[WARN] Stop requested by user.")
         self._set_total_progress(0.0, allow_decrease=True)
