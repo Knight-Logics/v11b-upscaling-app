@@ -31,9 +31,21 @@ jobs:
       - name: Build executable
         shell: pwsh
         run: |
-          $ver = "${{ github.ref_name }}"
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
           if ([string]::IsNullOrWhiteSpace($ver) -or $ver -eq "main") { $ver = "manual" }
           ./build_release.ps1 -Version $ver
+
+      - name: Generate release checksums
+        shell: pwsh
+        run: |
+          $lines = Get-ChildItem release -File |
+            Where-Object { $_.Extension -in @('.exe', '.zip') } |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = Get-FileHash $_.FullName -Algorithm SHA256
+              "$($hash.Hash)  $($_.Name)"
+            }
+          $lines | Set-Content release/SHA256SUMS.txt -Encoding ascii
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -41,5 +53,6 @@ jobs:
           files: |
             release/PixelForge-AI.exe
             release/*.zip
+            release/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
