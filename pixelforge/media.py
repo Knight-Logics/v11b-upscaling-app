@@ -32,6 +32,7 @@ class MediaProperties:
     subtitle_streams: int
     attachment_streams: int
     chapters: int
+    field_order: str = ""
 
     @property
     def is_hdr(self) -> bool:
@@ -41,6 +42,10 @@ class MediaProperties:
     def is_high_bit_depth(self) -> bool:
         text = self.pix_fmt.lower()
         return any(marker in text for marker in ("10", "12", "14", "16", "p010", "p016"))
+
+    @property
+    def is_interlaced(self) -> bool:
+        return self.field_order.lower() not in {"", "unknown", "progressive"}
 
 
 def probe_media(path: Path) -> MediaProperties:
@@ -64,7 +69,19 @@ def probe_media(path: Path) -> MediaProperties:
         subtitle_streams=count("subtitle"),
         attachment_streams=count("attachment"),
         chapters=len(payload.get("chapters", [])),
+        field_order=str(video.get("field_order") or ""),
     )
+
+
+def deinterlace_filter(source: MediaProperties, enabled: bool) -> str | None:
+    """Return a conservative same-frame-rate deinterlace filter when needed.
+
+    ``send_frame`` avoids silently doubling duration estimates or frame counts.
+    BWDIF still reconstructs each progressive frame from both source fields.
+    """
+    if not enabled or not source.is_interlaced:
+        return None
+    return "bwdif=mode=send_frame:parity=auto:deint=all"
 
 
 def estimate_workspace_bytes(

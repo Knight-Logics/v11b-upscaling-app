@@ -76,6 +76,7 @@ def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
         "unsharp1": 0.0,
         "unsharp2": 0.0,
         "enable_interpolation": False,
+        "auto_deinterlace": True,
         "target_fps": 30,
         "apply_final_scale": False,
         "rife_model": "rife-v4.25",

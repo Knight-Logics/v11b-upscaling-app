@@ -243,11 +243,13 @@ from pixelforge.media import (  # noqa: E402
     VIDEO_CODEC_OPTIONS,
     available_ffmpeg_encoders,
     color_metadata_args,
+    deinterlace_filter,
     ensure_workspace_capacity,
     estimate_workspace_bytes,
     probe_media,
     video_encode_args,
 )
+from pixelforge.quality import assess_quality  # noqa: E402
 
 ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 IMAGE_FORMATS = ["png", "jpg"]
@@ -1225,6 +1227,7 @@ class PipelineSettings:
     resume_job: bool
     include_audio: bool
     keep_intermediate: bool
+    auto_deinterlace: bool = True
 
 
 class PipelineRunner:
@@ -1551,8 +1554,12 @@ class PipelineRunner:
         duration = duration_override if duration_override is not None else cls.get_video_duration(video_path)
         return max(1, int(duration * fps))
 
-    def _build_pre_filter(self) -> str | None:
+    def _build_pre_filter(self, media_props=None) -> str | None:
         filters: list[str] = []
+        if media_props is not None:
+            interlace_filter = deinterlace_filter(media_props, self.settings.auto_deinterlace)
+            if interlace_filter:
+                filters.append(interlace_filter)
         if self.settings.denoise > 0:
             value = f"{self.settings.denoise:.2f}"
             filters.append(f"hqdn3d={value}:{value}")
@@ -2260,7 +2267,12 @@ class PipelineRunner:
 
         frame_count = self.get_frame_count(input_path, duration_override=work_duration)
         initial_frame_count = frame_count
-        pre_filter = self._build_pre_filter()
+        pre_filter = self._build_pre_filter(media_props)
+        if media_props.is_interlaced:
+            if self.settings.auto_deinterlace:
+                self.log(f"[INFO] Interlaced source detected ({media_props.field_order}); automatic BWDIF correction active.")
+            else:
+                self.log("[WARN] Interlaced source detected but automatic deinterlacing is disabled.")
         post_filter = self._build_post_filter()
         interpolation_enabled = self.settings.enable_interpolation and self.settings.target_fps > int(round(source_fps))
 
@@ -3057,6 +3069,8 @@ class V11BApp(tk.Tk):
         self.unsharp2_var = tk.DoubleVar(value=float(default_preset["unsharp2"]))
 
         self.enable_interpolation_var = tk.BooleanVar(value=bool(default_preset["enable_interpolation"]))
+        self.auto_deinterlace_var = tk.BooleanVar(value=bool(default_preset["auto_deinterlace"]))
+        self.protect_high_bit_precision_var = tk.BooleanVar(value=True)
         self.interp_engine_var = tk.StringVar(value=INTERP_ENGINE_RIFE)
         self.rife_model_var = tk.StringVar(value=str(default_preset["rife_model"]))
         self.rife_model_display_var = tk.StringVar(
@@ -3090,6 +3104,9 @@ class V11BApp(tk.Tk):
         self.compare_frame_pct_var = tk.DoubleVar(value=50.0)
         self.profile_summary_var = tk.StringVar(value="")
         self.profile_guidance_var = tk.StringVar(value="")
+        self.quality_guard_notice_var = tk.StringVar(value="")
+        self._current_media_properties = None
+        self._current_media_properties_path = ""
         self.compare_dragging = False
         self.compare_hover_near_line = False
         self.compare_separator_x = 0
@@ -3708,6 +3725,13 @@ class V11BApp(tk.Tk):
             wraplength=390,
             justify=LEFT,
         ).pack(anchor=W, pady=(4, 0))
+        ttk.Label(
+            parent,
+            textvariable=self.quality_guard_notice_var,
+            style="Hint.TLabel",
+            wraplength=390,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(4, 0))
 
     def _build_settings_notebook(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent, style="Panel.TFrame")
@@ -3743,6 +3767,8 @@ class V11BApp(tk.Tk):
             "unsharp1_var",
             "unsharp2_var",
             "enable_interpolation_var",
+            "auto_deinterlace_var",
+            "protect_high_bit_precision_var",
             "target_fps_var",
             "apply_final_scale_var",
             "preserve_aspect_ratio_var",
@@ -3970,6 +3996,11 @@ class V11BApp(tk.Tk):
         ).pack(anchor=W, pady=(0, 8))
 
         ttk.Checkbutton(tab, text="Enable frame interpolation", variable=self.enable_interpolation_var).pack(anchor=W, pady=(4, 4))
+        ttk.Checkbutton(
+            tab,
+            text="Automatically correct interlaced sources (recommended)",
+            variable=self.auto_deinterlace_var,
+        ).pack(anchor=W, pady=(0, 6))
         self._labeled_combo(tab, "Interpolation engine", self.interp_engine_var, INTERP_ENGINE_OPTIONS)
         rife_row = ttk.Frame(tab)
         rife_row.pack(fill=X, pady=2)
@@ -4025,6 +4056,11 @@ class V11BApp(tk.Tk):
             tab,
             text="Preserve all compatible audio tracks, subtitles, chapters, attachments, and color metadata",
             variable=self.preserve_media_var,
+        ).pack(anchor=W, pady=(2, 2))
+        ttk.Checkbutton(
+            tab,
+            text="Protect HDR/10-bit precision with the FP32 DirectML path (recommended)",
+            variable=self.protect_high_bit_precision_var,
         ).pack(anchor=W, pady=(2, 2))
         ttk.Checkbutton(tab, text="Checkpoint and resume interrupted jobs", variable=self.resume_job_var).pack(anchor=W, pady=(2, 2))
         self._labeled_spin(tab, "Upscale batch size (frames)", self.chunk_size_var, 30, 1000)
@@ -6624,6 +6660,7 @@ class V11BApp(tk.Tk):
             "unsharp1": self.unsharp1_var,
             "unsharp2": self.unsharp2_var,
             "enable_interpolation": self.enable_interpolation_var,
+            "auto_deinterlace": self.auto_deinterlace_var,
             "target_fps": self.target_fps_var,
             "apply_final_scale": self.apply_final_scale_var,
             "crf": self.crf_var,
@@ -6634,6 +6671,8 @@ class V11BApp(tk.Tk):
             variable = variable_map.get(setting_name)
             if variable is not None:
                 variable.set(setting_value)
+
+        self._apply_cached_precision_guard()
 
         self._refresh_auto_thread_recommendation()
         self._apply_output_target()
@@ -6708,6 +6747,7 @@ class V11BApp(tk.Tk):
                 str(self.saturation_var.get()),
                 str(self.gamma_var.get()),
                 str(self.enable_sharpen_var.get()),
+                str(self.auto_deinterlace_var.get()),
                 str(self.cas_strength_var.get()),
                 str(self.unsharp1_var.get()),
                 str(self.unsharp2_var.get()),
@@ -6912,6 +6952,8 @@ class V11BApp(tk.Tk):
             self.unsharp1_var,
             self.unsharp2_var,
             self.enable_interpolation_var,
+            self.auto_deinterlace_var,
+            self.protect_high_bit_precision_var,
             self.target_fps_var,
             self.apply_final_scale_var,
             self.target_width_var,
@@ -6931,8 +6973,86 @@ class V11BApp(tk.Tk):
 
     def _auto_prepare_after_input(self) -> None:
         self.log_queue.put("[INFO] New input selected. Building filmstrip, estimate, and compare preview...")
+        candidate = self.input_video_var.get().strip()
+        self._current_media_properties = None
+        self._current_media_properties_path = ""
+        self.quality_guard_notice_var.set("Analyzing source quality safeguards...")
+        if candidate and not PipelineRunner.is_image_input(Path(candidate)):
+            threading.Thread(
+                target=self._source_quality_worker,
+                args=(Path(candidate),),
+                daemon=True,
+                name="pixelforge-source-quality",
+            ).start()
+        else:
+            self.quality_guard_notice_var.set("")
         self.after(120, lambda: self._estimate_time(silent=True))
         self.after(180, lambda: self._schedule_filmstrip_extract(delay_ms=50))
+
+    def _source_quality_worker(self, input_path: Path) -> None:
+        try:
+            properties = probe_media(input_path)
+        except Exception as exc:
+            self.log_queue.put(f"[WARN] Source quality analysis unavailable: {exc}")
+            self.after(0, lambda: self.quality_guard_notice_var.set("Source quality analysis unavailable; preview before rendering."))
+            return
+        self.after(0, lambda: self._apply_source_quality_guard(input_path, properties))
+
+    def _quality_assessment(self, properties):
+        return assess_quality(
+            properties,
+            model_key=self.model_var.get().strip(),
+            content_name=self.selected_upscaling_profile,
+            target_width=int(self.target_width_var.get()),
+            target_height=int(self.target_height_var.get()),
+        )
+
+    def _apply_source_quality_guard(self, input_path: Path, properties) -> None:
+        if self.input_video_var.get().strip() != str(input_path):
+            return
+        self._current_media_properties = properties
+        self._current_media_properties_path = str(input_path)
+        assessment = self._quality_assessment(properties)
+        routed = False
+        if (
+            self.protect_high_bit_precision_var.get()
+            and assessment.precision_model
+            and assessment.precision_scale
+        ):
+            self.model_var.set(assessment.precision_model)
+            self.scale_var.set(assessment.precision_scale)
+            self._sync_display_from_model()
+            routed = True
+
+        notices = list(assessment.notices)
+        if routed:
+            notices[0] = (
+                f"HDR/10-bit precision guard selected {assessment.precision_model}; "
+                "the bundled NCNN engines would quantize AI inference to 8-bit."
+            )
+            self.log_queue.put(f"[INFO] {notices[0]}")
+        for notice in notices[1 if routed else 0:]:
+            self.log_queue.put(f"[WARN] {notice}")
+        self.quality_guard_notice_var.set("Quality guard: " + " ".join(notices) if notices else "Quality guard: source path is safe.")
+        self._update_profile_summary()
+        if routed:
+            self._invalidate_compare_cache()
+            self._schedule_auto_compare(delay_ms=350)
+
+    def _apply_cached_precision_guard(self) -> None:
+        candidate = self.input_video_var.get().strip()
+        if (
+            not candidate
+            or not self.protect_high_bit_precision_var.get()
+            or self._current_media_properties is None
+            or self._current_media_properties_path != candidate
+        ):
+            return
+        assessment = self._quality_assessment(self._current_media_properties)
+        if assessment.precision_model and assessment.precision_scale:
+            self.model_var.set(assessment.precision_model)
+            self.scale_var.set(assessment.precision_scale)
+            self._sync_display_from_model()
 
     def _pick_output(self) -> None:
         file_path = filedialog.asksaveasfilename(
@@ -7467,7 +7587,13 @@ class V11BApp(tk.Tk):
             except Exception:
                 pass
 
-            pre_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_pre_filter()
+            preview_media_props = None
+            if not PipelineRunner.is_image_input(settings.input_video):
+                try:
+                    preview_media_props = probe_media(settings.input_video)
+                except Exception:
+                    preview_media_props = None
+            pre_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_pre_filter(preview_media_props)
             source_for_upscale = before_frame
             if pre_filter:
                 pre_cmd = [
@@ -7865,6 +7991,34 @@ class V11BApp(tk.Tk):
         if not output_path.parent.exists():
             raise ValueError("Output folder does not exist")
         model_key = self.model_var.get().strip()
+        if not PipelineRunner.is_image_input(input_path):
+            try:
+                properties = (
+                    self._current_media_properties
+                    if self._current_media_properties_path == str(input_path)
+                    else probe_media(input_path)
+                )
+                assessment = assess_quality(
+                    properties,
+                    model_key=model_key,
+                    content_name=self.selected_upscaling_profile,
+                    target_width=int(self.target_width_var.get()),
+                    target_height=int(self.target_height_var.get()),
+                )
+                if (
+                    self.protect_high_bit_precision_var.get()
+                    and assessment.precision_model
+                    and assessment.precision_scale
+                ):
+                    model_key = assessment.precision_model
+                    self.model_var.set(model_key)
+                    self.scale_var.set(assessment.precision_scale)
+                    self._sync_display_from_model()
+                    self.quality_guard_notice_var.set(
+                        f"Quality guard: HDR/10-bit source routed to {model_key} for FP32 DirectML inference."
+                    )
+            except Exception as exc:
+                self.log_queue.put(f"[WARN] Precision guard could not inspect the source: {exc}")
         if model_key not in MODEL_OPTIONS:
             raise ValueError("Select a valid upscale model")
         selected_scale = int(self.scale_var.get())
@@ -7917,6 +8071,7 @@ class V11BApp(tk.Tk):
             resume_job=bool(self.resume_job_var.get()),
             include_audio=bool(self.include_audio_var.get()),
             keep_intermediate=bool(self.keep_intermediate_var.get()),
+            auto_deinterlace=bool(self.auto_deinterlace_var.get()),
         )
 
     def _estimate_time(self, silent: bool = False) -> None:
@@ -8207,6 +8362,28 @@ class V11BApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Billing estimate failed", f"Could not calculate processing credits: {exc}")
             return
+
+        if not PipelineRunner.is_image_input(settings.input_video):
+            try:
+                properties = probe_media(settings.input_video)
+                assessment = assess_quality(
+                    properties,
+                    model_key=settings.model,
+                    content_name=self.selected_upscaling_profile,
+                    target_width=settings.target_width,
+                    target_height=settings.target_height,
+                )
+            except Exception:
+                assessment = None
+            if assessment and assessment.requires_extreme_scale_confirmation:
+                proceed = messagebox.askyesno(
+                    "Extreme enlargement",
+                    f"This output is {assessment.enlargement_factor:.1f}x larger per dimension. The AI model "
+                    "recovers detail up to its native scale; remaining enlargement is high-quality final scaling "
+                    "and may not look better.\n\nGenerate the three detail previews first. Continue only if they look credible.\n\nContinue?",
+                )
+                if not proceed:
+                    return
 
         render_metadata = {
             "profile": self.selected_speed_profile,

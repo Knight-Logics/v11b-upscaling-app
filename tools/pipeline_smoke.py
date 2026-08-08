@@ -116,6 +116,29 @@ def main() -> None:
         preserve_media=False,
     )
     APP.PipelineRunner(high_bit_settings, messages, Event()).run()
+    interlaced_source = work / "source-interlaced.mkv"
+    interlaced_output = work / "output-deinterlaced.mkv"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=10:duration=1",
+            "-vf", "tinterlace=mode=interleave_top", "-flags", "+ilme+ildct", "-top", "1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(interlaced_source),
+        ],
+        check=True,
+    )
+    interlaced_settings = replace(
+        settings,
+        input_video=interlaced_source,
+        output_video=interlaced_output,
+        target_width=160,
+        target_height=96,
+        target_fps=5,
+        include_audio=False,
+        preserve_media=False,
+        auto_deinterlace=True,
+    )
+    APP.PipelineRunner(interlaced_settings, messages, Event()).run()
     probe = json.loads(
         subprocess.check_output(
             ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_chapters", str(output)],
@@ -160,6 +183,19 @@ def main() -> None:
         "bits_per_raw_sample": high_bit_video.get("bits_per_raw_sample"),
         "output": str(high_bit_output),
     }
+    interlaced_probe = json.loads(
+        subprocess.check_output(
+            ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(interlaced_output)],
+            text=True,
+        )
+    )
+    interlaced_video = next(
+        stream for stream in interlaced_probe.get("streams", []) if stream.get("codec_type") == "video"
+    )
+    summary["auto_deinterlace"] = {
+        "field_order": interlaced_video.get("field_order"),
+        "output": str(interlaced_output),
+    }
     print(json.dumps(summary, indent=2))
     if summary["audio_tracks"] != 2 or summary["subtitles"] != 1 or summary["chapters"] != 1:
         raise SystemExit("media preservation smoke failed")
@@ -167,6 +203,8 @@ def main() -> None:
         raise SystemExit("RIFE single-encode smoke failed")
     if "10" not in str(summary["high_bit_directml"]["pixel_format"]):
         raise SystemExit("high-bit DirectML output smoke failed")
+    if summary["auto_deinterlace"]["field_order"] not in {"progressive", "unknown", None}:
+        raise SystemExit("automatic deinterlace smoke failed")
 
 
 if __name__ == "__main__":

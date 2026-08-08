@@ -34,6 +34,7 @@ class ProfilePresetTests(unittest.TestCase):
                 with self.subTest(speed=speed, content=content):
                     preset = get_profile_preset(speed, content)
                     self.assertIn(preset["scale"], MODEL_NATIVE_SCALES[preset["model"]])
+                    self.assertTrue(preset["auto_deinterlace"])
 
     def test_balanced_natural_uses_benchmark_winning_realsr(self) -> None:
         preset = get_profile_preset("balanced", "live")

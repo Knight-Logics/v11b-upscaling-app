@@ -9,6 +9,7 @@ Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, 
 - Same resolution, 1080p, 1440p, 4K, and 8K delivery targets
 - Stage-based ETA with hardware-aware estimation
 - Bounded-memory DirectML streaming with a single final encode; disk-backed checkpoint batches for directory-only NCNN/RIFE engines
+- Foolproof quality guard: automatic interlace correction, HDR/10-bit precision-safe routing, and confirmation for enlargement beyond a credible 4x detail-recovery range
 - H.264, HEVC 10-bit, AV1 10-bit, ProRes 422 HQ, image sequences, NVENC, multiple audio tracks, subtitles, chapters, and metadata preservation
 - Server-authoritative free-trial and purchased credits
 - Failure-safe render reservations: commit on valid output, return on cancel/failure
@@ -34,6 +35,8 @@ Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, 
 - Advanced options stay collapsed behind the Advanced Options link.
 
 DirectML SPAN video processing preserves high-bit sources as RGB48 through FP32 ONNX inference and feeds RGB48 directly to the final 10-bit encoder. The directory-only NCNN/RIFE and Pillow still-preview paths remain 8-bit; HDR metadata is preserved, but the bundled SPAN models are not advertised as HDR-trained models.
+
+PixelForge does not make an unmeasured universal "better than Topaz" claim. See `QUALITY_BENCHMARK.md` and `tools/compare_topaz.py` for the matched-source gate used before category-specific quality claims.
 
 ## Secrets and Billing Configuration
 

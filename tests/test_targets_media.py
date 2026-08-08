@@ -5,8 +5,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from pixelforge.media import MediaProperties, estimate_workspace_bytes, video_encode_args
+from pixelforge.media import MediaProperties, deinterlace_filter, estimate_workspace_bytes, video_encode_args
 from pixelforge.onnx_upscale import MODEL_CATALOG, OnnxUpscaler
+from pixelforge.quality import assess_quality, output_enlargement_factor
 from pixelforge.targets import OUTPUT_TARGETS, target_dimensions
 
 
@@ -54,6 +55,55 @@ class MediaPlanTests(unittest.TestCase):
         base = estimate_workspace_bytes(1920, 1080, 100, 4, image_format="png", post_enabled=False, interpolation_factor=1)
         interpolated = estimate_workspace_bytes(1920, 1080, 100, 4, image_format="png", post_enabled=True, interpolation_factor=2)
         self.assertGreater(interpolated, base)
+
+    def test_interlaced_sources_receive_same_rate_bwdif(self) -> None:
+        interlaced = MediaProperties(
+            720, 480, "yuv420p", "smpte170m", "bt709", "smpte170m", "mpeg2video", 1, 0, 0, 0, "tt"
+        )
+        self.assertTrue(interlaced.is_interlaced)
+        self.assertEqual(deinterlace_filter(interlaced, True), "bwdif=mode=send_frame:parity=auto:deint=all")
+        self.assertIsNone(deinterlace_filter(interlaced, False))
+
+
+class QualityGuardTests(unittest.TestCase):
+    def test_hdr_ncnn_route_is_replaced_with_precision_safe_directml(self) -> None:
+        source = MediaProperties(
+            1920, 1080, "yuv420p10le", "bt2020nc", "smpte2084", "bt2020", "hevc", 1, 0, 0, 0
+        )
+        assessment = assess_quality(
+            source,
+            model_key="realsr-df2k",
+            content_name="live",
+            target_width=3840,
+            target_height=2160,
+        )
+        self.assertEqual((assessment.precision_model, assessment.precision_scale), ("span-photo-x4", 4))
+        self.assertFalse(assessment.requires_extreme_scale_confirmation)
+
+    def test_animation_hdr_uses_animation_precision_model(self) -> None:
+        source = MediaProperties(
+            1280, 720, "yuv420p10le", "bt2020nc", "arib-std-b67", "bt2020", "hevc", 0, 0, 0, 0
+        )
+        assessment = assess_quality(
+            source,
+            model_key="realcugan-se-x2-n1",
+            content_name="animation",
+            target_width=2560,
+            target_height=1440,
+        )
+        self.assertEqual((assessment.precision_model, assessment.precision_scale), ("span-modern-animation-x2", 2))
+
+    def test_extreme_enlargement_requires_confirmation(self) -> None:
+        source = MediaProperties(640, 360, "yuv420p", "bt709", "bt709", "bt709", "h264", 1, 0, 0, 0)
+        assessment = assess_quality(
+            source,
+            model_key="span-photo-x4",
+            content_name="live",
+            target_width=3840,
+            target_height=2160,
+        )
+        self.assertAlmostEqual(output_enlargement_factor(640, 360, 3840, 2160), 6.0)
+        self.assertTrue(assessment.requires_extreme_scale_confirmation)
 
 
 class ModernModelCatalogTests(unittest.TestCase):
