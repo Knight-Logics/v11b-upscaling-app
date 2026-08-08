@@ -1,0 +1,8 @@
+;FFMETADATA1
+title=PixelForge pipeline smoke
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=0
+END=900
+title=Smoke chapter

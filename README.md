@@ -1,29 +1,43 @@
 # PixelForge AI
 
-Desktop video and image upscaling app using Real-ESRGAN, RealSR, Waifu2x, and RIFE with quality profiles, compare view, ETA estimation, secure credit billing, and auto-update support.
+Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, Real-CUGAN, SRMD, RealSR, Waifu2x, and RIFE with content-aware profiles, target-driven output, professional media controls, secure credit billing, and auto-update support.
 
 ## Features
 
 - Profile-based quality/speed controls
-- Before/after compare with draggable separator
+- Three cached source-frame crop previews with progress, cancellation, and a draggable separator
+- Same resolution, 1080p, 1440p, 4K, and 8K delivery targets
 - Stage-based ETA with hardware-aware estimation
+- Bounded-memory DirectML streaming with a single final encode; disk-backed checkpoint batches for directory-only NCNN/RIFE engines
+- H.264, HEVC 10-bit, AV1 10-bit, ProRes 422 HQ, image sequences, NVENC, multiple audio tracks, subtitles, chapters, and metadata preservation
 - Server-authoritative free-trial and purchased credits
 - Failure-safe render reservations: commit on valid output, return on cancel/failure
 - Direct in-app auto-update from GitHub Releases
 - Windows standalone EXE packaging
 
+## Engines (v1.0.20)
+
+| Content | Preferred free engine | Notes |
+|---|---|---|
+| People / camera | **SPAN Photo / RealSR DF2K** | Fast DirectML preview; benchmark-leading RealSR final presets |
+| Anime / game | **ModernSpanimation / Real-CUGAN SE** | Fast current SPAN preview; conservative Real-CUGAN detail presets |
+| Old / noisy | **SRMD** (+ RealSR JPEG quality) | Fast denoise + restore |
+| Frame interpolation | **RIFE v4.25** (recommended) | 4.22-lite for previews; 4.26 available as the newer optional model |
+
 ## Recommended First Run
 
-- Start with **Balanced Workflow + Natural Footage** for phones, cameras, people, products, and real-world scenes.
-- Use **Animation / Anime** only for animation, line art, anime, or game captures.
-- Use **Legacy / Noisy Repair** for visibly compressed, noisy, blocky, or older sources.
-- Frame interpolation, color enhancement, sharpening, and forced final dimensions are opt-in Advanced settings.
+- A first-run picker asks **People / camera**, **Anime / game**, or **Old / noisy**.
+- Default Balanced + People/camera uses **RealSR DF2K** after the local preset benchmark.
+- Anime profiles use ModernSpanimation or Real-CUGAN; restore profiles use SRMD or RealSR JPEG.
+- Choose the delivery target rather than an engine scale; PixelForge resolves the internal native model pass and final dimensions.
+- The compare view shows three actual source frame numbers and defaults to a fast detail crop. Still frames do not represent interpolated motion.
+- Advanced options stay collapsed behind the Advanced Options link.
 
-PixelForge presets use only native model/scale combinations. The bundled 4x-only networks must remain at 4x; requesting 2x or 3x from those networks can create tiled or cropped output.
+DirectML SPAN video processing preserves high-bit sources as RGB48 through FP32 ONNX inference and feeds RGB48 directly to the final 10-bit encoder. The directory-only NCNN/RIFE and Pillow still-preview paths remain 8-bit; HDR metadata is preserved, but the bundled SPAN models are not advertised as HDR-trained models.
 
 ## Secrets and Billing Configuration
 
-Customer builds use `https://knightlogics.com/api/pixelforge-license`; no Stripe, SMTP, database, or signing secret is shipped in the EXE. Package price and credit quantity are validated server-side. Do not commit or package `billing.env`, `shared_billing.env`, passwords, or secret keys.
+Customer builds use `POST https://knightlogics.com/api/pixelforge-license`. No Stripe, SMTP, database, or signing secret is shipped in the EXE. Packs: 32/$5.00, 68/$10.00, 144/$20.00.
 
 Anonymous diagnostics include only an app-scoped hashed device ID, app version, selected profile/model, coarse source dimensions/duration, and outcome. File names, media, computer name, raw machine identifiers, and email are not sent as diagnostics. Set `V11B_DISABLE_ANONYMOUS_DIAGNOSTICS=1` to opt out.
 
@@ -38,7 +52,7 @@ python process_full_video_ultimate.py
 ## Build Standalone EXE
 
 ```powershell
-./build_release.ps1 -Version 1.0.18
+./build_release.ps1 -Version 1.0.20
 ```
 
 Build output is generated in `release/`:
@@ -48,4 +62,4 @@ Build output is generated in `release/`:
 
 ## Release Asset Naming
 
-Auto-updater picks the latest `.exe` asset from GitHub release, preferring names with `PixelForge` or `v11b` and version in the filename.
+The auto-updater selects the latest `.exe` asset from GitHub Releases, preferring names with PixelForge or v11b and a matching version.
