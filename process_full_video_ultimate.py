@@ -90,6 +90,10 @@ if PIL_AVAILABLE:
 
 MODEL_DETAILS = [
     (
+        "nvidia-rtx-vsr",
+        "nvidia-rtx-vsr (NVIDIA RTX Video Super Resolution Ultra — optional pack)",
+    ),
+    (
         "span-photo-x4",
         "span-photo-x4 (Modern SPAN photo/detail 4x — DirectML)",
     ),
@@ -250,11 +254,24 @@ from pixelforge.media import (  # noqa: E402
     video_encode_args,
 )
 from pixelforge.quality import assess_quality  # noqa: E402
+from pixelforge.nvidia import (  # noqa: E402
+    NVIDIA_MODEL_KEY,
+    NvidiaHardware,
+    NvidiaWorker,
+    activate_nvidia_pack,
+    detect_nvidia_hardware,
+    discover_nvidia_worker,
+    download_nvidia_pack,
+    frame_rate_choice,
+    install_nvidia_pack,
+    nvidia_worker_command,
+)
 
 ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 IMAGE_FORMATS = ["png", "jpg"]
 IMAGE_INPUT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 FPS_OPTIONS = [24, 30, 48, 60]
+FRAME_RATE_TARGETS = ("Keep source", "Smooth 60 FPS")
 
 INTERP_ENGINE_OPTIONS = ["RIFE (GPU — fast, high quality)", "minterpolate (CPU — slower, compatible)"]
 INTERP_ENGINE_RIFE     = "RIFE (GPU — fast, high quality)"
@@ -1228,6 +1245,7 @@ class PipelineSettings:
     include_audio: bool
     keep_intermediate: bool
     auto_deinterlace: bool = True
+    nvidia_vsr_mode: str = "auto-standard"
 
 
 class PipelineRunner:
@@ -1664,6 +1682,160 @@ class PipelineRunner:
             remaining -= len(chunk)
         return b"".join(chunks)
 
+    def _resolve_nvidia_worker(self) -> NvidiaWorker:
+        worker = discover_nvidia_worker(_APP_DIR, _PERSISTENT_DATA_DIR)
+        if worker is None:
+            raise FileNotFoundError(
+                "The optional NVIDIA RTX engine pack is not installed. Use Install RTX in PixelForge, "
+                "then retry. The standard DirectML/Vulkan profiles remain available."
+            )
+        return worker
+
+    def _nvidia_native_output_dimensions(self, width: int, height: int) -> tuple[int, int]:
+        """Use the requested deliverable directly, bounded by NVIDIA VSR's 4x limit."""
+        source_w = max(1, int(width))
+        source_h = max(1, int(height))
+        if self.settings.apply_final_scale:
+            desired_w = max(1, int(self.settings.target_width))
+            desired_h = max(1, int(self.settings.target_height))
+        else:
+            desired_w = source_w * 4
+            desired_h = source_h * 4
+        # VSR does not downscale. Same-resolution modes enhance/restore; FFmpeg
+        # performs any requested downscale in the one final encode.
+        output_w = max(source_w, min(desired_w, source_w * 4))
+        output_h = max(source_h, min(desired_h, source_h * 4))
+        return output_w, output_h
+
+    def _nvidia_quality_for_dimensions(self, width: int, height: int, output_width: int, output_height: int) -> str:
+        mode = str(self.settings.nvidia_vsr_mode or "auto-standard")
+        same_resolution = int(width) == int(output_width) and int(height) == int(output_height)
+        if same_resolution:
+            return {
+                "auto-clean": "deblur-low",
+                "auto-restore": "denoise-high",
+                "auto-standard": "deblur-medium",
+            }.get(mode, mode if mode.startswith(("denoise-", "deblur-")) else "deblur-medium")
+        return {
+            "auto-clean": "clean-ultra",
+            "auto-restore": "ultra",
+            "auto-standard": "ultra",
+        }.get(mode, mode if not mode.startswith(("denoise-", "deblur-")) else "ultra")
+
+    def _start_nvidia_worker(
+        self,
+        width: int,
+        height: int,
+        output_width: int,
+        output_height: int,
+        *,
+        stderr,
+    ) -> subprocess.Popen[bytes]:
+        worker = self._resolve_nvidia_worker()
+        quality = self._nvidia_quality_for_dimensions(width, height, output_width, output_height)
+        command = nvidia_worker_command(
+            worker,
+            [
+                "--width", str(width),
+                "--height", str(height),
+                "--output-width", str(output_width),
+                "--output-height", str(output_height),
+                "--quality", quality,
+            ],
+        )
+        environment = os.environ.copy()
+        environment.setdefault("PIXELFORGE_NVIDIA_CACHE", str(_PERSISTENT_DATA_DIR / "nvidia-cache"))
+        self.log(
+            f"[INFO] NVIDIA RTX worker: {worker.source} | mode={quality} | "
+            f"{width}x{height} -> {output_width}x{output_height}"
+        )
+        return subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            env=environment,
+            creationflags=_NO_WINDOW,
+            bufsize=0,
+        )
+
+    def _upscale_nvidia_directory(
+        self,
+        frames_in: Path,
+        frames_out: Path,
+        expected_frames: int,
+    ) -> None:
+        if not PIL_AVAILABLE:
+            raise RuntimeError("Pillow is required for NVIDIA RTX image/frame processing")
+        candidates = sorted(
+            item for item in frames_in.iterdir()
+            if item.is_file() and item.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        if not candidates:
+            completed = sum(1 for item in frames_out.iterdir() if item.is_file())
+            if completed >= expected_frames:
+                self._set_stage_progress(2, 1.0, stage_name="NVIDIA RTX VSR (resumed)")
+                return
+            raise FileNotFoundError(f"No decoded frames found in {frames_in}")
+        with Image.open(candidates[0]) as first:
+            width, height = first.size
+        output_width, output_height = self._nvidia_native_output_dimensions(width, height)
+        input_bytes = width * height * 3
+        output_bytes = output_width * output_height * 3
+        frames_out.mkdir(parents=True, exist_ok=True)
+        worker_log = tempfile.TemporaryFile(mode="w+b")
+        worker_process = self._start_nvidia_worker(
+            width, height, output_width, output_height, stderr=worker_log
+        )
+        try:
+            if worker_process.stdin is None or worker_process.stdout is None:
+                raise RuntimeError("Unable to open NVIDIA RTX worker pipes")
+            total = max(1, len(candidates) or int(expected_frames))
+            for index, source_path in enumerate(candidates, start=1):
+                if self.stop_event.is_set():
+                    raise RuntimeError("Canceled by user")
+                destination = frames_out / source_path.name
+                if destination.is_file() and destination.stat().st_size > 0:
+                    if not self.settings.keep_intermediate:
+                        source_path.unlink(missing_ok=True)
+                    self._set_stage_progress(2, index / total, stage_name="NVIDIA RTX VSR (resumed)")
+                    continue
+                with Image.open(source_path) as source:
+                    rgb = source.convert("RGB")
+                    if rgb.size != (width, height):
+                        raise RuntimeError("NVIDIA frame sequence changed dimensions unexpectedly")
+                    payload = rgb.tobytes()
+                if len(payload) != input_bytes:
+                    raise RuntimeError("NVIDIA input frame has an unexpected byte size")
+                worker_process.stdin.write(payload)
+                worker_process.stdin.flush()
+                restored = self._read_exact(worker_process.stdout, output_bytes)
+                if len(restored) != output_bytes:
+                    worker_log.seek(0)
+                    details = worker_log.read().decode("utf-8", errors="replace")[-4000:]
+                    raise RuntimeError(f"NVIDIA RTX worker returned a partial frame.\n{details}")
+                enhanced = Image.frombytes("RGB", (output_width, output_height), restored)
+                if self.settings.image_format == "jpg":
+                    enhanced.save(destination, format="JPEG", quality=95, subsampling=0)
+                else:
+                    enhanced.save(destination, format="PNG", compress_level=1)
+                if not self.settings.keep_intermediate:
+                    source_path.unlink(missing_ok=True)
+                self._set_stage_progress(2, index / total, stage_name="NVIDIA RTX Video Super Resolution")
+            worker_process.stdin.close()
+            worker_code = worker_process.wait(timeout=30)
+            if worker_code != 0:
+                worker_log.seek(0)
+                details = worker_log.read().decode("utf-8", errors="replace")[-4000:]
+                raise RuntimeError(f"NVIDIA RTX worker failed with exit code {worker_code}.\n{details}")
+        finally:
+            if worker_process.poll() is None:
+                worker_process.terminate()
+            worker_log.close()
+        completed = sum(1 for item in frames_out.iterdir() if item.is_file())
+        if completed < expected_frames:
+            raise RuntimeError(f"NVIDIA RTX VSR produced {completed:,} of {expected_frames:,} expected frames")
+
     def _run_onnx_streaming_video(
         self,
         *,
@@ -1678,20 +1850,33 @@ class PipelineRunner:
         post_filter: str | None,
         interpolation_enabled: bool,
     ) -> None:
-        """Decode -> DirectML -> final encoder with one frame resident at a time."""
-        model = ONNX_MODEL_CATALOG[model_key]
-        runner = OnnxUpscaler(_ONNX_MODELS_DIR / model.filename, model.scale, tile_size=256, context=16)
-        self.log(f"[INFO] ONNX provider: {runner.provider}")
+        """Decode -> AI worker -> final encoder with one frame resident at a time."""
+        uses_nvidia = model_key == NVIDIA_MODEL_KEY
+        model = None if uses_nvidia else ONNX_MODEL_CATALOG[model_key]
+        runner = None if uses_nvidia else OnnxUpscaler(
+            _ONNX_MODELS_DIR / model.filename, model.scale, tile_size=256, context=16
+        )
+        if runner is not None:
+            self.log(f"[INFO] ONNX provider: {runner.provider}")
 
         high_precision = bool(media_props.is_hdr or media_props.is_high_bit_depth)
+        if uses_nvidia and high_precision:
+            raise RuntimeError(
+                "NVIDIA RTX VSR currently accepts 8-bit SDR frames. Keep the precision guard enabled so "
+                "HDR/10-bit media uses the FP32 DirectML profile."
+            )
         raw_pix_fmt = "rgb48le" if high_precision else "rgb24"
-        sample_dtype = runner.np.dtype("<u2") if high_precision else runner.np.uint8
+        sample_dtype = None if runner is None else (runner.np.dtype("<u2") if high_precision else runner.np.uint8)
         bytes_per_sample = 2 if high_precision else 1
         input_width = int(media_props.width)
         input_height = int(media_props.height)
-        output_width = input_width * model.scale
-        output_height = input_height * model.scale
+        if uses_nvidia:
+            output_width, output_height = self._nvidia_native_output_dimensions(input_width, input_height)
+        else:
+            output_width = input_width * model.scale
+            output_height = input_height * model.scale
         input_frame_bytes = input_width * input_height * 3 * bytes_per_sample
+        output_frame_bytes = output_width * output_height * 3 * bytes_per_sample
 
         if high_precision:
             self.log(
@@ -1703,6 +1888,8 @@ class PipelineRunner:
                     "[WARN] HDR transfer/color metadata is preserved, but the selected SPAN model was not "
                     "trained specifically for scene-linear HDR imagery."
                 )
+        elif uses_nvidia:
+            self.log("[INFO] SDR NVIDIA RTX VSR streaming path active: no decoded or enhanced frame directories.")
         else:
             self.log("[INFO] SDR DirectML streaming path active: no decoded or enhanced frame directories.")
 
@@ -1766,7 +1953,7 @@ class PipelineRunner:
         encode_command.append(str(output_path))
 
         self.log("[1/6] Streaming source frames (bounded memory)")
-        self.log("[2/6] DirectML AI upscale")
+        self.log("[2/6] NVIDIA RTX Video Super Resolution" if uses_nvidia else "[2/6] DirectML AI upscale")
         self.log("[3/6] Post-processing in final FFmpeg graph" if post_filter else "[3/6] Post-processing skipped")
         self.log("[4/6] No intermediate video or frame checkpoint encode")
         self.log("[5/6] FFmpeg minterpolate in final graph" if interpolation_enabled else "[5/6] Interpolation skipped")
@@ -1776,6 +1963,8 @@ class PipelineRunner:
         encoded_log = tempfile.TemporaryFile(mode="w+b")
         decoder = None
         encoder = None
+        ai_worker = None
+        ai_worker_log = tempfile.TemporaryFile(mode="w+b") if uses_nvidia else None
         processed = 0
         try:
             encoder = subprocess.Popen(
@@ -1787,6 +1976,14 @@ class PipelineRunner:
                 bufsize=0,
             )
             self.current_process = encoder
+            if uses_nvidia:
+                ai_worker = self._start_nvidia_worker(
+                    input_width,
+                    input_height,
+                    output_width,
+                    output_height,
+                    stderr=ai_worker_log,
+                )
             decoder = subprocess.Popen(
                 decode_command,
                 stdout=subprocess.PIPE,
@@ -1795,7 +1992,9 @@ class PipelineRunner:
                 bufsize=0,
             )
             if decoder.stdout is None or encoder.stdin is None:
-                raise RuntimeError("Unable to open the DirectML streaming pipes")
+                raise RuntimeError("Unable to open the AI streaming pipes")
+            if uses_nvidia and (ai_worker is None or ai_worker.stdin is None or ai_worker.stdout is None):
+                raise RuntimeError("Unable to open the NVIDIA RTX worker pipes")
 
             while True:
                 if self.stop_event.is_set():
@@ -1807,21 +2006,41 @@ class PipelineRunner:
                     raise RuntimeError(
                         f"FFmpeg returned a partial raw frame ({len(raw_frame):,} of {input_frame_bytes:,} bytes)"
                     )
-                source = runner.np.frombuffer(raw_frame, dtype=sample_dtype).reshape(input_height, input_width, 3)
-                enhanced = runner.upscale_array(source, cancel_event=self.stop_event)
-                if high_precision:
-                    payload = enhanced.astype("<u2", copy=False).tobytes(order="C")
+                if uses_nvidia:
+                    ai_worker.stdin.write(raw_frame)
+                    ai_worker.stdin.flush()
+                    payload = self._read_exact(ai_worker.stdout, output_frame_bytes)
+                    if len(payload) != output_frame_bytes:
+                        ai_worker_log.seek(0)
+                        details = ai_worker_log.read().decode("utf-8", errors="replace")[-4000:]
+                        raise RuntimeError(f"NVIDIA RTX worker returned a partial frame.\n{details}")
                 else:
-                    payload = enhanced.tobytes(order="C")
+                    source = runner.np.frombuffer(raw_frame, dtype=sample_dtype).reshape(input_height, input_width, 3)
+                    enhanced = runner.upscale_array(source, cancel_event=self.stop_event)
+                    if high_precision:
+                        payload = enhanced.astype("<u2", copy=False).tobytes(order="C")
+                    else:
+                        payload = enhanced.tobytes(order="C")
                 encoder.stdin.write(payload)
                 processed += 1
                 fraction = min(0.99, processed / max(1, frame_count))
                 self._set_stage_progress(1, fraction, stage_name="stream decode")
-                self._set_stage_progress(2, fraction, stage_name="DirectML AI upscale")
+                self._set_stage_progress(
+                    2,
+                    fraction,
+                    stage_name="NVIDIA RTX VSR" if uses_nvidia else "DirectML AI upscale",
+                )
                 self._set_stage_progress(6, fraction, stage_name="single final encode")
 
             decoder.stdout.close()
             decoder_code = decoder.wait()
+            if ai_worker is not None:
+                ai_worker.stdin.close()
+                ai_worker_code = ai_worker.wait(timeout=30)
+                if ai_worker_code != 0:
+                    ai_worker_log.seek(0)
+                    details = ai_worker_log.read().decode("utf-8", errors="replace")[-4000:]
+                    raise RuntimeError(f"NVIDIA RTX worker failed with exit code {ai_worker_code}.\n{details}")
             encoder.stdin.close()
             encoder_code = encoder.wait()
             self.current_process = None
@@ -1833,7 +2052,7 @@ class PipelineRunner:
                     f"Streaming pipeline failed (decoder={decoder_code}, encoder={encoder_code}).\n{details}"
                 )
         except Exception:
-            for process in (decoder, encoder):
+            for process in (decoder, ai_worker, encoder):
                 if process is not None and process.poll() is None:
                     process.terminate()
             raise
@@ -1841,6 +2060,8 @@ class PipelineRunner:
             self.current_process = None
             decoded_log.close()
             encoded_log.close()
+            if ai_worker_log is not None:
+                ai_worker_log.close()
 
         if processed < 1 or not output_path.is_file():
             raise RuntimeError("Streaming pipeline produced no output frames")
@@ -1861,7 +2082,7 @@ class PipelineRunner:
             f"chapters={media_props.chapters if self.settings.preserve_media else 0}."
         )
         self._set_stage_progress(1, 1.0, stage_name="stream decode complete")
-        self._set_stage_progress(2, 1.0, stage_name="DirectML upscale complete")
+        self._set_stage_progress(2, 1.0, stage_name="NVIDIA RTX VSR complete" if uses_nvidia else "DirectML upscale complete")
         self._set_stage_progress(3, 1.0, stage_name="post-processing complete")
         self._set_stage_progress(4, 1.0, stage_name="frame stream complete")
         self._set_stage_progress(5, 1.0, stage_name="interpolation complete")
@@ -2147,7 +2368,12 @@ class PipelineRunner:
 
         # Determine which binary family handles this model
         uses_onnx = model_key in ONNX_MODEL_CATALOG
-        if uses_onnx:
+        uses_nvidia = model_key == NVIDIA_MODEL_KEY
+        if uses_nvidia:
+            worker = self._resolve_nvidia_worker()
+            exe_path = Path(worker.command[0])
+            exe_label = "NVIDIA RTX VSR"
+        elif uses_onnx:
             exe_path = _ONNX_MODELS_DIR / ONNX_MODEL_CATALOG[model_key].filename
             exe_label = "SPAN DirectML"
         elif model_key.startswith("realsr-"):
@@ -2177,7 +2403,15 @@ class PipelineRunner:
                 f"Reinstall the latest PixelForge AI build; the selected engine/model is missing."
             )
 
-        if uses_onnx:
+        if uses_nvidia:
+            hardware = detect_nvidia_hardware()
+            if not hardware.supported:
+                raise RuntimeError(f"NVIDIA RTX VSR is unavailable: {hardware.reason}")
+            self.log(
+                f"[INFO] NVIDIA RTX hardware: {hardware.name} | driver={hardware.driver} | "
+                f"VRAM={hardware.vram_mb} MiB | CUDA capability={hardware.compute_capability}"
+            )
+        elif uses_onnx:
             model = ONNX_MODEL_CATALOG[model_key]
             self.log(
                 f"[INFO] Modern model: {model.label} | license={model.license_name} | "
@@ -2284,18 +2518,18 @@ class PipelineRunner:
             interpolation_enabled=interpolation_enabled,
         )
 
-        can_stream_directml = (
-            uses_onnx
+        can_stream_ai = (
+            (uses_onnx or uses_nvidia)
             and not self.is_image_input(input_path)
             and not self.is_image_output(output_path)
             and self.settings.video_codec != "Image sequence (PNG)"
             and not self.settings.keep_intermediate
             and not (interpolation_enabled and self.settings.interp_engine == INTERP_ENGINE_RIFE)
         )
-        if can_stream_directml:
+        if can_stream_ai:
             if self.settings.resume_job:
                 self.log(
-                    "[INFO] DirectML bounded-memory streaming selected. This path restarts the video after an "
+                    "[INFO] Bounded-memory AI streaming selected. This path restarts the video after an "
                     "interruption; choose RIFE, image sequence, or Keep intermediate files when frame checkpoints "
                     "are required."
                 )
@@ -2432,7 +2666,10 @@ class PipelineRunner:
 
         # 2) Upscale
         self.log(f"[2/6] {exe_label} upscaling")
-        if uses_onnx:
+        if uses_nvidia:
+            self._upscale_nvidia_directory(frames_in, frames_out, frame_count)
+            upscale_cmd = []
+        elif uses_onnx:
             self._upscale_onnx_directory(model_key, frames_in, frames_out, frame_count)
             upscale_cmd = []
         elif model_key.startswith("waifu2x-"):
@@ -2868,11 +3105,14 @@ class V11BApp(tk.Tk):
         self.stage_timing_profile = self._load_stage_timing_profile()
 
         self.speed_profile_buttons: dict[str, ttk.Button] = {}
+        self.nvidia_profile_button: ttk.Button | None = None
         self.upscaling_profile_buttons: dict[str, ttk.Button] = {}
         self.selected_speed_profile: str = "balanced"
         self.selected_upscaling_profile: str = "live"
 
         self.app_data_dir = _PERSISTENT_DATA_DIR
+        self.nvidia_hardware: NvidiaHardware = detect_nvidia_hardware()
+        self.nvidia_worker: NvidiaWorker | None = discover_nvidia_worker(_APP_DIR, self.app_data_dir)
         self.billing_tokens_file = self.app_data_dir / "pixelforge_billing_tokens.json"
         self.billing_audit_file = self.app_data_dir / "pixelforge_billing_audit.jsonl"
         self.billing_state_file = self.app_data_dir / "pixelforge_billing_state.json"
@@ -3078,6 +3318,8 @@ class V11BApp(tk.Tk):
             value=RIFE_MODEL_KEY_TO_LABEL.get(str(default_preset["rife_model"]), RIFE_MODEL_KEY_TO_LABEL["rife-v4.25"])
         )
         self.target_fps_var = tk.IntVar(value=int(default_preset["target_fps"]))
+        self.frame_rate_target_var = tk.StringVar(value="Keep source")
+        self.nvidia_vsr_mode_var = tk.StringVar(value="auto-standard")
 
         self.apply_final_scale_var = tk.BooleanVar(value=bool(default_preset["apply_final_scale"]))
         self.preserve_aspect_ratio_var = tk.BooleanVar(value=True)
@@ -3655,27 +3897,60 @@ class V11BApp(tk.Tk):
             justify=LEFT,
         ).pack(side=LEFT, padx=(8, 0))
 
+        frame_rate_row = ttk.Frame(box)
+        frame_rate_row.pack(fill=X, pady=(6, 0))
+        ttk.Label(frame_rate_row, text="Frame rate", width=10).pack(side=LEFT)
+        frame_rate_picker = ttk.Combobox(
+            frame_rate_row,
+            textvariable=self.frame_rate_target_var,
+            values=FRAME_RATE_TARGETS,
+            state="readonly",
+            width=16,
+        )
+        frame_rate_picker.pack(side=LEFT)
+        frame_rate_picker.bind("<<ComboboxSelected>>", lambda _event: self._apply_frame_rate_target())
+        ttk.Label(
+            frame_rate_row,
+            text="Keep the original motion, or create smooth 60 FPS with RIFE.",
+            style="Hint.TLabel",
+            wraplength=132,
+            justify=LEFT,
+        ).pack(side=LEFT, padx=(8, 0))
+
     def _build_profile_section(self, parent: ttk.Frame) -> None:
         speed_box = ttk.LabelFrame(parent, text="2 · Speed", padding=12, style="Card.TLabelframe")
         speed_box.pack(fill=X, pady=(10, 0))
         ttk.Label(
             speed_box,
-            text="Start with Balanced. Use Quick Preview to test settings fast.",
+            text="Start with Balanced. Use Fast Preview to test settings quickly.",
             style="Hint.TLabel",
             wraplength=390,
         ).pack(anchor=W, pady=(0, 8))
         speed_row = ttk.Frame(speed_box, style="Panel.TFrame")
         speed_row.pack(fill=X)
-        for col in range(3):
+        show_nvidia = bool(self.nvidia_hardware.supported)
+        speed_columns = 4 if show_nvidia else 3
+        for col in range(speed_columns):
             speed_row.columnconfigure(col, weight=1, uniform="speed_profiles")
 
-        fast_btn = ttk.Button(speed_row, text="Quick Preview", command=self._apply_fast_profile, style="Profile.TButton")
+        fast_btn = ttk.Button(speed_row, text="Fast Preview", command=self._apply_fast_profile, style="Profile.TButton")
         balanced_btn = ttk.Button(speed_row, text="Balanced", command=self._apply_balanced_profile, style="Profile.TButton")
         quality_btn = ttk.Button(speed_row, text="Max Detail", command=self._apply_quality_profile, style="Profile.TButton")
+        nvidia_btn = None
+        if show_nvidia:
+            nvidia_text = "NVIDIA RTX" if self.nvidia_worker is not None else "Install RTX"
+            nvidia_btn = ttk.Button(
+                speed_row,
+                text=nvidia_text,
+                command=self._apply_nvidia_profile,
+                style="Profile.TButton",
+            )
 
         fast_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         balanced_btn.grid(row=0, column=1, sticky="ew", padx=4)
-        quality_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        quality_btn.grid(row=0, column=2, sticky="ew", padx=4 if show_nvidia else (4, 0))
+        if nvidia_btn is not None:
+            nvidia_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         content_box = ttk.LabelFrame(parent, text="3 · Content", padding=12, style="Card.TLabelframe")
         content_box.pack(fill=X, pady=(8, 0))
@@ -3703,6 +3978,9 @@ class V11BApp(tk.Tk):
             "balanced": balanced_btn,
             "quality": quality_btn,
         }
+        if nvidia_btn is not None and self.nvidia_worker is not None:
+            self.speed_profile_buttons["nvidia"] = nvidia_btn
+        self.nvidia_profile_button = nvidia_btn
         self.upscaling_profile_buttons = {
             "live": live_btn,
             "animation": anime_btn,
@@ -3888,7 +4166,7 @@ class V11BApp(tk.Tk):
             tab,
             text=(
                 "1) Pick Input and Output paths.\n"
-                "2) Choose Content type, then Speed (Quick Preview for tests).\n"
+                "2) Choose Content type, then Speed (Fast Preview for tests).\n"
                 "3) Pick one of the three preview frames on the right.\n"
                 "4) Drag the separator to inspect before/after quality.\n"
                 "5) When satisfied, use Balanced or Max Detail and Start Processing."
@@ -3930,7 +4208,7 @@ class V11BApp(tk.Tk):
     def _populate_upscale_tab(self, tab: ttk.Frame) -> None:
         ttk.Label(
             tab,
-            text="Use Quick Preview first, then increase quality after you confirm results.",
+            text="Use Fast Preview first, then increase quality after you confirm results.",
             style="Hint.TLabel",
             wraplength=740,
         ).pack(anchor=W, pady=(0, 8))
@@ -3943,7 +4221,10 @@ class V11BApp(tk.Tk):
         model_combo = ttk.Combobox(
             model_row,
             textvariable=self.model_display_var,
-            values=[label for _key, label in MODEL_DETAILS],
+            values=[
+                label for key, label in MODEL_DETAILS
+                if key != NVIDIA_MODEL_KEY or self.nvidia_hardware.supported
+            ],
             state="readonly",
         )
         model_combo.grid(row=0, column=1, sticky="ew")
@@ -4024,7 +4305,7 @@ class V11BApp(tk.Tk):
                 "Major speed reducers:\n"
                 "- Interpolation is mainly useful for 24/30 -> 60 FPS\n"
                 "- If source FPS is already at/above target FPS, interpolation is auto-skipped\n"
-                "- Use Quick Preview when testing"
+                "- Use Fast Preview when testing"
             ),
             justify=LEFT,
             style="Hint.TLabel",
@@ -4992,7 +5273,7 @@ class V11BApp(tk.Tk):
             self.output_video_var.set(str(input_path.with_name(output_name)))
 
         self._sync_target_dimensions_from_source(input_path)
-        self._sync_target_fps_to_source_if_needed(file_path)
+        self._apply_frame_rate_target(file_path)
         self._normalize_interpolation_choice(show_feedback=True)
 
         self._auto_prepare_after_input()
@@ -5042,6 +5323,36 @@ class V11BApp(tk.Tk):
             self.target_fps_var.set(max(1, int(round(fps))))
         except Exception:
             pass
+
+    def _apply_frame_rate_target(self, input_path: str | Path | None = None) -> None:
+        candidate = str(input_path or self.input_video_var.get()).strip()
+        if not candidate:
+            return
+        path = Path(candidate)
+        if PipelineRunner.is_image_input(path):
+            self.frame_rate_target_var.set("Keep source")
+            self.target_fps_var.set(30)
+            self.enable_interpolation_var.set(False)
+            return
+        try:
+            source_fps = PipelineRunner.get_fps(path)
+        except Exception:
+            source_fps = 30.0
+        enabled, target_fps = frame_rate_choice(self.frame_rate_target_var.get(), source_fps)
+        self.target_fps_var.set(target_fps)
+        self.enable_interpolation_var.set(enabled)
+        if enabled:
+            self.interp_engine_var.set(INTERP_ENGINE_RIFE)
+            self.rife_model_var.set("rife-v4.25")
+            self._sync_rife_display_from_model()
+            self.log_queue.put(
+                f"[INFO] Smooth 60 FPS selected: RIFE will generate motion frames ({source_fps:.3f} -> 60 FPS)."
+            )
+        elif self.frame_rate_target_var.get() == "Smooth 60 FPS" and source_fps >= 59.5:
+            self.frame_rate_target_var.set("Keep source")
+            self.log_queue.put(
+                f"[INFO] Source is already {source_fps:.3f} FPS; PixelForge will preserve it without interpolation."
+            )
 
     def _recommend_realesrgan_threads(self, gpu_name: str | None = None) -> str:
         gpu_text = (gpu_name or self._detect_primary_gpu_name() or "").lower()
@@ -6668,13 +6979,12 @@ class V11BApp(tk.Tk):
             "cas_strength": self.cas_strength_var,
             "unsharp1": self.unsharp1_var,
             "unsharp2": self.unsharp2_var,
-            "enable_interpolation": self.enable_interpolation_var,
             "auto_deinterlace": self.auto_deinterlace_var,
-            "target_fps": self.target_fps_var,
             "apply_final_scale": self.apply_final_scale_var,
             "crf": self.crf_var,
             "encode_preset": self.encode_preset_var,
             "rife_model": self.rife_model_var,
+            "nvidia_vsr_mode": self.nvidia_vsr_mode_var,
         }
         for setting_name, setting_value in preset.items():
             variable = variable_map.get(setting_name)
@@ -6689,9 +6999,10 @@ class V11BApp(tk.Tk):
         self._sync_rife_display_from_model()
         self._update_profile_summary()
         speed_label = {
-            "fast": "Quick Preview",
+            "fast": "Fast Preview",
             "balanced": "Balanced",
             "quality": "Max Detail",
+            "nvidia": "NVIDIA RTX",
         }.get(speed_name, speed_name)
         upscaling_label = {
             "live": "People / camera",
@@ -6947,6 +7258,10 @@ class V11BApp(tk.Tk):
     def _handle_interpolation_toggle(self) -> None:
         self._normalize_interpolation_choice(show_feedback=True)
         self._sync_target_fps_to_source_if_needed()
+        if self.enable_interpolation_var.get() and int(self.target_fps_var.get()) == 60:
+            self.frame_rate_target_var.set("Smooth 60 FPS")
+        elif not self.enable_interpolation_var.get():
+            self.frame_rate_target_var.set("Keep source")
         self._schedule_auto_estimate()
 
     def _register_auto_estimate_watchers(self) -> None:
@@ -7138,9 +7453,10 @@ class V11BApp(tk.Tk):
 
     def _update_profile_summary(self) -> None:
         speed_label = {
-            "fast": "Quick Preview",
+            "fast": "Fast Preview",
             "balanced": "Balanced",
             "quality": "Max Detail",
+            "nvidia": "NVIDIA RTX",
         }.get(self.selected_speed_profile, self.selected_speed_profile)
         upscaling_label = {
             "live": "People / camera",
@@ -7154,10 +7470,10 @@ class V11BApp(tk.Tk):
             output_dims = f"{target_label} — {int(self.target_width_var.get())}x{int(self.target_height_var.get())} ({aspect_note})"
         else:
             output_dims = target_label
-        interp = "on" if self.enable_interpolation_var.get() else "off"
+        interp = "60 FPS (RIFE)" if self.enable_interpolation_var.get() and self.target_fps_var.get() == 60 else "source FPS"
         self.profile_summary_var.set(
             f"Active: {speed_label} + {upscaling_label} | model={model_label.split('(')[0].strip()} | "
-            f"output={output_dims} | interpolation={interp}"
+            f"output={output_dims} | motion={interp}"
         )
         guidance = {
             "live": "Recommended for phone/camera footage, people, products, and real-world scenes.",
@@ -7165,9 +7481,10 @@ class V11BApp(tk.Tk):
             "restore": "Use for visibly compressed, blocky, noisy, or older footage; it intentionally smooths artifacts.",
         }.get(self.selected_upscaling_profile, "")
         speed_guidance = {
-            "fast": "Quick Preview favors a faster model for testing.",
+            "fast": "Fast Preview favors a faster model for testing.",
             "balanced": "Balanced is the safest first full run for most files.",
             "quality": "Max Detail uses the strongest model stack and can take substantially longer.",
+            "nvidia": "NVIDIA RTX uses the optional official VSR Ultra engine for compatible SDR media.",
         }.get(self.selected_speed_profile, "")
         self.profile_guidance_var.set(f"{guidance} {speed_guidance}".strip())
 
@@ -7460,7 +7777,31 @@ class V11BApp(tk.Tk):
             onnx_preview_runner: OnnxUpscaler | None = None
 
             # Select correct binary + build upscale command for the compare frame
-            if model_key in ONNX_MODEL_CATALOG:
+            if model_key == NVIDIA_MODEL_KEY:
+                worker = discover_nvidia_worker(_APP_DIR, _PERSISTENT_DATA_DIR)
+                if worker is None:
+                    raise FileNotFoundError("The optional NVIDIA RTX engine pack is not installed")
+                exe_label = "NVIDIA RTX VSR Ultra"
+                def _build_upscale_cmd(src, dst, scale):
+                    with Image.open(src) as preview_source:
+                        preview_w, preview_h = preview_source.size
+                    preview_scale = 2
+                    quality = {
+                        "auto-clean": "clean-ultra",
+                        "auto-restore": "ultra",
+                        "auto-standard": "ultra",
+                    }.get(settings.nvidia_vsr_mode, "ultra")
+                    return nvidia_worker_command(
+                        worker,
+                        [
+                            "--input-image", str(src),
+                            "--output-image", str(dst),
+                            "--output-width", str(preview_w * preview_scale),
+                            "--output-height", str(preview_h * preview_scale),
+                            "--quality", quality,
+                        ],
+                    )
+            elif model_key in ONNX_MODEL_CATALOG:
                 model = ONNX_MODEL_CATALOG[model_key]
                 model_path = _ONNX_MODELS_DIR / model.filename
                 onnx_preview_runner = OnnxUpscaler(model_path, model.scale, tile_size=256, context=16)
@@ -7957,7 +8298,7 @@ class V11BApp(tk.Tk):
         if "exit code" in text:
             hints.append("Review the command logs above; the failing stage and command are shown.")
         if not hints:
-            hints.append("Try Quick Preview profile and a short clip duration to isolate the issue quickly.")
+            hints.append("Try Fast Preview profile and a short clip duration to isolate the issue quickly.")
         return hints
 
     def _validate_settings(self) -> PipelineSettings:
@@ -8041,6 +8382,12 @@ class V11BApp(tk.Tk):
                 self.log_queue.put(f"[WARN] Precision guard could not inspect the source: {exc}")
         if model_key not in MODEL_OPTIONS:
             raise ValueError("Select a valid upscale model")
+        if model_key == NVIDIA_MODEL_KEY:
+            hardware = detect_nvidia_hardware()
+            if not hardware.supported:
+                raise ValueError(f"NVIDIA RTX Video Super Resolution is unavailable: {hardware.reason}")
+            if discover_nvidia_worker(_APP_DIR, _PERSISTENT_DATA_DIR) is None:
+                raise ValueError("Install the optional PixelForge NVIDIA RTX engine pack before selecting this profile")
         selected_scale = int(self.scale_var.get())
         allowed_scales = MODEL_NATIVE_SCALES.get(model_key, {selected_scale})
         if selected_scale not in allowed_scales:
@@ -8092,6 +8439,7 @@ class V11BApp(tk.Tk):
             include_audio=bool(self.include_audio_var.get()),
             keep_intermediate=bool(self.keep_intermediate_var.get()),
             auto_deinterlace=bool(self.auto_deinterlace_var.get()),
+            nvidia_vsr_mode=self.nvidia_vsr_mode_var.get().strip() or "auto-standard",
         )
 
     def _estimate_time(self, silent: bool = False) -> None:
@@ -8349,6 +8697,98 @@ class V11BApp(tk.Tk):
 
     def _apply_quality_profile(self) -> None:
         self._set_selected_speed_profile("quality")
+
+    def _apply_nvidia_profile(self) -> None:
+        self.nvidia_worker = discover_nvidia_worker(_APP_DIR, self.app_data_dir)
+        if not self.nvidia_hardware.supported:
+            messagebox.showinfo("NVIDIA RTX unavailable", self.nvidia_hardware.reason)
+            return
+        if self.nvidia_worker is None:
+            self._install_nvidia_pack_async()
+            return
+        self._set_selected_speed_profile("nvidia")
+
+    def _install_nvidia_pack_async(self) -> None:
+        if not self.nvidia_hardware.supported:
+            messagebox.showinfo("NVIDIA RTX unavailable", self.nvidia_hardware.reason)
+            return
+        confirmed = messagebox.askyesno(
+            "Install NVIDIA RTX engine",
+            "Install the optional NVIDIA RTX Video Super Resolution engine?\n\n"
+            "Download: about 585 MB\n"
+            "Installed size: about 1 GB\n"
+            f"Detected: {self.nvidia_hardware.name} ({self.nvidia_hardware.vram_mb // 1024} GB VRAM)\n\n"
+            "The RTX engine is for SDR media. HDR/10-bit sources continue to use PixelForge's precision-safe "
+            "DirectML path.",
+        )
+        if not confirmed:
+            return
+        button = self.nvidia_profile_button
+        if button is not None:
+            button.configure(text="Downloading 0%", state=tk.DISABLED)
+        self.profile_guidance_var.set("Downloading and verifying the NVIDIA RTX engine pack…")
+
+        def _progress(downloaded: int, total: int) -> None:
+            percent = int((downloaded / total) * 100) if total > 0 else 0
+            label = f"Downloading {percent}%" if total > 0 else f"Downloading {downloaded / 1024**2:.0f} MB"
+            self.after(0, lambda text=label: button.configure(text=text) if button is not None else None)
+
+        def _worker() -> None:
+            archive = self.app_data_dir / "PixelForge-NVIDIA-Pack.download.zip"
+            destination = self.app_data_dir / "nvidia-pack"
+            candidate = self.app_data_dir / "nvidia-pack-candidate"
+            try:
+                url = os.environ.get("PIXELFORGE_NVIDIA_PACK_URL", "").strip()
+                sha = os.environ.get("PIXELFORGE_NVIDIA_PACK_SHA256", "").strip()
+                kwargs = {"progress": _progress}
+                if url:
+                    kwargs["url"] = url
+                if sha:
+                    kwargs["expected_sha256"] = sha
+                download_nvidia_pack(archive, **kwargs)
+                candidate_worker = install_nvidia_pack(archive, candidate)
+                environment = os.environ.copy()
+                environment.setdefault("PIXELFORGE_NVIDIA_CACHE", str(self.app_data_dir / "nvidia-cache"))
+                probe = subprocess.run(
+                    [str(candidate_worker), "--probe"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                    check=False,
+                    env=environment,
+                    creationflags=_NO_WINDOW,
+                )
+                if probe.returncode != 0 or '"ok": true' not in (probe.stdout or "").lower():
+                    raise RuntimeError((probe.stderr or probe.stdout or "NVIDIA runtime probe failed")[-3000:])
+                installed_worker = activate_nvidia_pack(candidate, destination)
+                self.nvidia_worker = NvidiaWorker((str(installed_worker),), "installed RTX pack")
+                self.after(0, self._finish_nvidia_pack_install)
+            except Exception as exc:
+                self.log_queue.put(f"[ERROR] NVIDIA RTX pack install failed: {exc}")
+                self.after(0, lambda error=str(exc): self._finish_nvidia_pack_install(error))
+            finally:
+                archive.unlink(missing_ok=True)
+                if candidate.exists():
+                    shutil.rmtree(candidate, ignore_errors=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_nvidia_pack_install(self, error: str = "") -> None:
+        button = self.nvidia_profile_button
+        if error:
+            if button is not None:
+                button.configure(text="Install RTX", state=tk.NORMAL)
+            self.profile_guidance_var.set("NVIDIA RTX install failed; standard profiles are unchanged.")
+            messagebox.showerror("NVIDIA RTX install failed", error)
+            return
+        if button is not None:
+            button.configure(text="NVIDIA RTX", state=tk.NORMAL)
+            self.speed_profile_buttons["nvidia"] = button
+        self.profile_guidance_var.set("NVIDIA RTX engine verified and ready.")
+        messagebox.showinfo("NVIDIA RTX ready", "The NVIDIA RTX engine passed its GPU inference check and is ready.")
+        self._set_selected_speed_profile("nvidia")
 
     def _apply_live_profile(self) -> None:
         self._set_selected_upscaling_profile("live")

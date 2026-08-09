@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 .venv/
+.venv-nvidia/
 venv/
 .env
 .env.*

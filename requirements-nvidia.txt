@@ -1,0 +1,6 @@
+# Optional NVIDIA RTX Video Super Resolution worker (not part of the universal app).
+nvidia-vfx==0.1.0.1
+cupy-cuda12x==14.1.1
+numpy>=2.0.0,<2.6
+Pillow>=12.0.0,<13
+pyinstaller>=6.22.0,<7

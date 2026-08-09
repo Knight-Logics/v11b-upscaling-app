@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import hashlib
 import os
 import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -18,6 +20,13 @@ sys.path.insert(0, str(ROOT))
 from pixelforge.compare import align_before_after_images, build_compare_timestamp_plan
 from pixelforge.engines import REALCUGAN_MODEL_CONFIGS, RIFE_MODEL_DETAILS, SRMD_MODEL_CONFIGS
 from pixelforge.presets import MODEL_NATIVE_SCALES, get_profile_preset
+from pixelforge.nvidia import (
+    activate_nvidia_pack,
+    download_nvidia_pack,
+    frame_rate_choice,
+    install_nvidia_pack,
+    parse_nvidia_smi_row,
+)
 
 MODULE_PATH = ROOT / "process_full_video_ultimate.py"
 SPEC = importlib.util.spec_from_file_location("pixelforge_app", MODULE_PATH)
@@ -80,6 +89,104 @@ class ProfilePresetTests(unittest.TestCase):
             for content in ("live", "animation", "restore"):
                 with self.subTest(speed=speed, content=content):
                     self.assertFalse(get_profile_preset(speed, content)["enable_interpolation"])
+
+    def test_nvidia_profiles_use_official_rtx_vsr_with_content_modes(self) -> None:
+        expected_modes = {
+            "live": "auto-standard",
+            "animation": "auto-clean",
+            "restore": "auto-restore",
+        }
+        for content, mode in expected_modes.items():
+            with self.subTest(content=content):
+                preset = get_profile_preset("nvidia", content)
+                self.assertEqual(preset["model"], "nvidia-rtx-vsr")
+                self.assertEqual(preset["nvidia_vsr_mode"], mode)
+                self.assertFalse(preset["enable_interpolation"])
+
+
+class NvidiaCapabilityTests(unittest.TestCase):
+    def test_supported_rtx_requires_current_driver_and_vram(self) -> None:
+        detected = parse_nvidia_smi_row("NVIDIA GeForce RTX 5070 Ti, 610.62, 16303, 12.0")
+        self.assertTrue(detected.supported)
+        self.assertEqual(detected.vram_mb, 16303)
+
+    def test_old_driver_and_non_tensor_gpu_fail_closed(self) -> None:
+        self.assertFalse(parse_nvidia_smi_row("NVIDIA GeForce RTX 2080, 560.12, 8192, 7.5").supported)
+        self.assertFalse(parse_nvidia_smi_row("NVIDIA GeForce GTX 1080, 610.62, 8192, 6.1").supported)
+
+    def test_smooth_60_fps_is_target_driven(self) -> None:
+        self.assertEqual(frame_rate_choice("Smooth 60 FPS", 23.976), (True, 60))
+        self.assertEqual(frame_rate_choice("Keep source", 29.97), (False, 30))
+        self.assertEqual(frame_rate_choice("Smooth 60 FPS", 60.0), (False, 60))
+
+    def test_pack_download_verifies_hash_and_installs_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.zip"
+            with zipfile.ZipFile(source, "w") as bundle:
+                bundle.writestr("PixelForge-NVIDIA-Worker.exe", b"worker")
+                bundle.writestr("_internal/runtime.dat", b"runtime")
+            expected = hashlib.sha256(source.read_bytes()).hexdigest()
+            downloaded = download_nvidia_pack(
+                root / "downloaded.zip",
+                url=source.as_uri(),
+                expected_sha256=expected,
+            )
+            worker = install_nvidia_pack(downloaded, root / "installed")
+            self.assertEqual(worker.read_bytes(), b"worker")
+            self.assertEqual((worker.parent / "_internal" / "runtime.dat").read_bytes(), b"runtime")
+
+    def test_pack_installer_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive = root / "unsafe.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("../outside.txt", b"unsafe")
+                bundle.writestr("PixelForge-NVIDIA-Worker.exe", b"worker")
+            with self.assertRaises(RuntimeError):
+                install_nvidia_pack(archive, root / "installed")
+            self.assertFalse((root / "outside.txt").exists())
+
+    def test_verified_pack_activation_replaces_previous_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            candidate = root / "candidate"
+            destination = root / "nvidia-pack"
+            candidate.mkdir()
+            destination.mkdir()
+            (candidate / "PixelForge-NVIDIA-Worker.exe").write_bytes(b"new")
+            (destination / "PixelForge-NVIDIA-Worker.exe").write_bytes(b"old")
+
+            worker = activate_nvidia_pack(candidate, destination)
+
+            self.assertEqual(worker.read_bytes(), b"new")
+            self.assertFalse(candidate.exists())
+            self.assertFalse((root / "nvidia-pack.previous").exists())
+
+    def test_pack_activation_restores_previous_pack_if_promotion_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            candidate = root / "candidate"
+            destination = root / "nvidia-pack"
+            candidate.mkdir()
+            destination.mkdir()
+            (candidate / "PixelForge-NVIDIA-Worker.exe").write_bytes(b"new")
+            (destination / "PixelForge-NVIDIA-Worker.exe").write_bytes(b"old")
+            real_move = __import__("shutil").move
+            calls = 0
+
+            def fail_candidate_promotion(source, target):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated promotion failure")
+                return real_move(source, target)
+
+            with mock.patch("pixelforge.nvidia.shutil.move", side_effect=fail_candidate_promotion):
+                with self.assertRaises(OSError):
+                    activate_nvidia_pack(candidate, destination)
+
+            self.assertEqual((destination / "PixelForge-NVIDIA-Worker.exe").read_bytes(), b"old")
 
     def test_profile_validation_rejects_unknown_names(self) -> None:
         with self.assertRaises(ValueError):

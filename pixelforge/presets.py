@@ -7,6 +7,7 @@ Anime uses Real-CUGAN (preferred) and animevideov3 fallbacks.
 from __future__ import annotations
 
 MODEL_NATIVE_SCALES: dict[str, set[int]] = {
+    "nvidia-rtx-vsr": {4},
     "span-photo-x4": {4},
     "span-modern-animation-x2": {2},
     "realesrgan-x4plus": {4},
@@ -38,9 +39,10 @@ MODEL_NATIVE_SCALES: dict[str, set[int]] = {
 }
 
 SPEED_LABELS = {
-    "fast": "Quick Preview",
+    "fast": "Fast Preview",
     "balanced": "Balanced",
     "quality": "Max Detail",
+    "nvidia": "NVIDIA RTX",
 }
 
 CONTENT_LABELS = {
@@ -58,7 +60,7 @@ CONTENT_PICKER_COPY = {
 
 def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
     """Return a tested, internally compatible preset without touching Tk state."""
-    if speed_name not in {"fast", "balanced", "quality"}:
+    if speed_name not in {"fast", "balanced", "quality", "nvidia"}:
         raise ValueError(f"Unknown speed profile: {speed_name}")
     if content_name not in {"live", "animation", "restore"}:
         raise ValueError(f"Unknown content profile: {content_name}")
@@ -84,6 +86,8 @@ def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
 
     if speed_name == "fast":
         preset.update(image_format="jpg", encode_preset="veryfast", crf=21)
+    elif speed_name == "nvidia":
+        preset.update(image_format="png", encode_preset="slow", crf=15)
     elif speed_name == "quality":
         preset.update(image_format="png", encode_preset="slow", crf=15)
     else:
@@ -94,24 +98,33 @@ def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
             "fast": ("span-photo-x4", 4),
             "balanced": ("realsr-df2k", 4),
             "quality": ("realsr-df2k", 4),
+            "nvidia": ("nvidia-rtx-vsr", 4),
         },
         # Real-CUGAN is the preferred free anime stack (better line/texture retention than waifu2x).
         "animation": {
             "fast": ("span-modern-animation-x2", 2),
             "balanced": ("realcugan-se-x2-n1", 2),
             "quality": ("realcugan-se-x2-n0", 2),
+            "nvidia": ("nvidia-rtx-vsr", 4),
         },
         # SRMD for noisy/compressed sources; keep RealSR JPEG for max photo restore quality.
         "restore": {
             "fast": ("srmd-x2-n5", 2),
             "balanced": ("srmd-x4-n5", 4),
             "quality": ("realsr-df2k-jpeg", 4),
+            "nvidia": ("nvidia-rtx-vsr", 4),
         },
     }
     model, scale = content_presets[content_name][speed_name]
     if scale not in MODEL_NATIVE_SCALES.get(model, {scale}):
         raise ValueError(f"Preset {speed_name}/{content_name} uses non-native scale {scale} for {model}")
     preset.update(model=model, scale=scale)
+    if speed_name == "nvidia":
+        preset["nvidia_vsr_mode"] = {
+            "live": "auto-standard",
+            "animation": "auto-clean",
+            "restore": "auto-restore",
+        }[content_name]
     if content_name == "restore" and speed_name == "balanced":
         preset.update(enable_sharpen=True, cas_strength=0.08, unsharp1=0.0, unsharp2=0.0)
     return preset
