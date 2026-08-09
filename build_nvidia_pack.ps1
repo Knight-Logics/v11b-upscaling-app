@@ -1,5 +1,5 @@
 param(
-  [string]$AppVersion = "1.0.21"
+  [string]$AppVersion = "1.0.22"
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,7 +7,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 if ($AppVersion -notmatch '^\d+\.\d+\.\d+$') {
-  throw "AppVersion must use semantic form such as 1.0.21"
+  throw "AppVersion must use semantic form such as 1.0.22"
 }
 
 $venv = Join-Path $root ".venv-nvidia"

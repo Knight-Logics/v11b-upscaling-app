@@ -28,6 +28,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Build NVIDIA RTX pack
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          if ([string]::IsNullOrWhiteSpace($ver) -or $ver -eq "main") {
+            $match = Select-String -Path process_full_video_ultimate.py -Pattern '^APP_VERSION = "([^"]+)"$'
+            if (!$match -or !$match.Matches.Count) { throw "Could not read APP_VERSION" }
+            $ver = $match.Matches[0].Groups[1].Value
+          }
+          ./build_nvidia_pack.ps1 -AppVersion $ver
+
+      - name: Pin NVIDIA pack integrity
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          if ([string]::IsNullOrWhiteSpace($ver) -or $ver -eq "main") {
+            $match = Select-String -Path process_full_video_ultimate.py -Pattern '^APP_VERSION = "([^"]+)"$'
+            if (!$match -or !$match.Matches.Count) { throw "Could not read APP_VERSION" }
+            $ver = $match.Matches[0].Groups[1].Value
+          }
+          ./stamp_nvidia_release.ps1 -AppVersion $ver
+
       - name: Build executable
         shell: pwsh
         run: |
@@ -39,7 +61,7 @@ jobs:
           }
           ./build_release.ps1 -Version $ver
 
-      - name: Build NVIDIA RTX pack and all-in-one edition
+      - name: Build all-in-one NVIDIA edition
         shell: pwsh
         run: |
           $ver = "${{ github.ref_name }}" -replace '^v', ''
@@ -48,7 +70,7 @@ jobs:
             if (!$match -or !$match.Matches.Count) { throw "Could not read APP_VERSION" }
             $ver = $match.Matches[0].Groups[1].Value
           }
-          ./build_nvidia_pack.ps1 -AppVersion $ver
+          ./build_nvidia_edition.ps1 -AppVersion $ver
 
       - name: Generate release checksums
         shell: pwsh

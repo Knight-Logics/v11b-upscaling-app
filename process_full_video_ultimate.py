@@ -284,7 +284,7 @@ RIFE_MODEL_OPTIONS   = [key for key, _label in RIFE_MODEL_DETAILS]
 RIFE_MODEL_KEY_TO_LABEL = {key: label for key, label in RIFE_MODEL_DETAILS}
 RIFE_MODEL_LABEL_TO_KEY = {label: key for key, label in RIFE_MODEL_DETAILS}
 TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.22"
 
 # ---------------------------------------------------------------------------
 # Legacy recovery token helpers (developer mode only)

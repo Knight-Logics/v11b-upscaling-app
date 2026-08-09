@@ -18,7 +18,7 @@ Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, 
 - Direct in-app auto-update from GitHub Releases
 - Windows standalone EXE packaging
 
-## Engines (v1.0.21)
+## Engines (v1.0.22)
 
 | Content | Preferred free engine | Notes |
 |---|---|---|
@@ -69,17 +69,17 @@ python process_full_video_ultimate.py
 ## Build Standalone EXE
 
 ```powershell
-./build_release.ps1 -Version 1.0.21
+./build_release.ps1 -Version 1.0.22
 ```
 
 To reproducibly build the optional NVIDIA sidecar pack:
 
 ```powershell
-./build_nvidia_pack.ps1 -AppVersion 1.0.21
+./build_nvidia_pack.ps1 -AppVersion 1.0.22
 ```
 
 After both artifacts exist, the all-in-one archive can be regenerated without
-recompiling the worker by running `./build_nvidia_edition.ps1 -AppVersion 1.0.21`.
+recompiling the worker by running `./build_nvidia_edition.ps1 -AppVersion 1.0.22`.
 
 Build output is generated in `release/`:
 

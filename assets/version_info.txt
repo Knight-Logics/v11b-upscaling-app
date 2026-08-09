@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 21, 0),
-    prodvers=(1, 0, 21, 0),
+    filevers=(1, 0, 22, 0),
+    prodvers=(1, 0, 22, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'Knight Logics'),
           StringStruct('FileDescription', 'PixelForge AI local video and image enhancer'),
-          StringStruct('FileVersion', '1.0.21.0'),
+          StringStruct('FileVersion', '1.0.22.0'),
           StringStruct('InternalName', 'PixelForge-AI'),
           StringStruct('LegalCopyright', 'Copyright Knight Logics'),
           StringStruct('OriginalFilename', 'PixelForge-AI.exe'),
           StringStruct('ProductName', 'PixelForge AI'),
-          StringStruct('ProductVersion', '1.0.21.0')
+          StringStruct('ProductVersion', '1.0.22.0')
         ]
       )
     ]),

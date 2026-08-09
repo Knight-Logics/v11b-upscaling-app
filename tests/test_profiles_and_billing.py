@@ -110,7 +110,10 @@ class ProfilePresetTests(unittest.TestCase):
 class NvidiaCapabilityTests(unittest.TestCase):
     def test_app_downloads_the_current_verified_nvidia_pack(self) -> None:
         self.assertIn("/v1.0.21/PixelForge-NVIDIA-Pack_1.0.21_windows_x64.zip", NVIDIA_PACK_URL)
-        self.assertRegex(NVIDIA_PACK_SHA256, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            NVIDIA_PACK_SHA256,
+            "e420425e3a9a10859777747bc139acc9b58112ea34240dc85071a9a997c23ec0",
+        )
 
     def test_supported_rtx_requires_current_driver_and_vram(self) -> None:
         detected = parse_nvidia_smi_row("NVIDIA GeForce RTX 5070 Ti, 610.62, 16303, 12.0")
@@ -275,6 +278,16 @@ class EngineCatalogTests(unittest.TestCase):
         self.assertTrue((ROOT / "models-srmd" / "srmd_x4.bin").exists())
         self.assertTrue((ROOT / "rife-models" / "rife-v4.25").is_dir())
         self.assertTrue((ROOT / "onnx-models" / "4xSPANkendata_fp32.onnx").is_file())
+
+    def test_release_build_pins_the_pack_before_building_the_app(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        pack_step = workflow.index("- name: Build NVIDIA RTX pack")
+        pin_step = workflow.index("- name: Pin NVIDIA pack integrity")
+        app_step = workflow.index("- name: Build executable")
+        edition_step = workflow.index("- name: Build all-in-one NVIDIA edition")
+        self.assertLess(pack_step, pin_step)
+        self.assertLess(pin_step, app_step)
+        self.assertLess(app_step, edition_step)
 
 
 class CompareHonestyTests(unittest.TestCase):
