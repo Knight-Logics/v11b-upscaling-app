@@ -256,6 +256,7 @@ from pixelforge.media import (  # noqa: E402
 from pixelforge.quality import assess_quality  # noqa: E402
 from pixelforge.nvidia import (  # noqa: E402
     NVIDIA_MODEL_KEY,
+    NVIDIA_PACK_VERSION,
     NvidiaHardware,
     NvidiaWorker,
     activate_nvidia_pack,
@@ -283,7 +284,7 @@ RIFE_MODEL_OPTIONS   = [key for key, _label in RIFE_MODEL_DETAILS]
 RIFE_MODEL_KEY_TO_LABEL = {key: label for key, label in RIFE_MODEL_DETAILS}
 RIFE_MODEL_LABEL_TO_KEY = {label: key for key, label in RIFE_MODEL_DETAILS}
 TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
-APP_VERSION = "1.0.20"
+APP_VERSION = "1.0.21"
 
 # ---------------------------------------------------------------------------
 # Legacy recovery token helpers (developer mode only)
@@ -3039,7 +3040,7 @@ class V11BApp(tk.Tk):
         super().__init__()
         self.title("PixelForge AI")
         self._set_initial_window_size()
-        self.minsize(1040, 520)
+        self.minsize(1040, 640)
 
         self.log_queue: Queue[str] = Queue()
         self.stop_event = threading.Event()
@@ -3113,6 +3114,8 @@ class V11BApp(tk.Tk):
         self.app_data_dir = _PERSISTENT_DATA_DIR
         self.nvidia_hardware: NvidiaHardware = detect_nvidia_hardware()
         self.nvidia_worker: NvidiaWorker | None = discover_nvidia_worker(_APP_DIR, self.app_data_dir)
+        self.nvidia_auto_setup_marker = self.app_data_dir / "pixelforge_nvidia_auto_setup.json"
+        self._nvidia_auto_install_active = False
         self.billing_tokens_file = self.app_data_dir / "pixelforge_billing_tokens.json"
         self.billing_audit_file = self.app_data_dir / "pixelforge_billing_audit.jsonl"
         self.billing_state_file = self.app_data_dir / "pixelforge_billing_state.json"
@@ -3175,7 +3178,7 @@ class V11BApp(tk.Tk):
             if developer_local_billing
             else RemoteBillingBackend(self.billing_api_default, self.machine_id, APP_VERSION)
         )
-        self.free_trial_credits = max(0, int(os.environ.get("V11B_FREE_TRIAL_CREDITS", "20")))
+        self.free_trial_credits = max(0, int(os.environ.get("V11B_FREE_TRIAL_CREDITS", "8")))
         self._active_reservation_id = ""
         self.telemetry_enabled = not _env_is_truthy(os.environ.get("V11B_DISABLE_ANONYMOUS_DIAGNOSTICS", "0"))
         self.telemetry_first_launch_file = self.app_data_dir / "pixelforge_first_launch_recorded"
@@ -3200,34 +3203,61 @@ class V11BApp(tk.Tk):
         self._start_system_detection()
         self.after(120, self._poll_log_queue)
         self.after(1200, self._start_update_checks)
+        self.after(2400, self._maybe_offer_nvidia_auto_setup)
         if self._use_embedded_billing():
             self.after(1800, self._prompt_backup_email_on_login)
         self.after(500, self._record_startup_telemetry)
         self.after(900, self._retry_pending_billing_commits_async)
 
     def _set_initial_window_size(self) -> None:
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-        width = min(1500, max(1120, int(screen_w * 0.90)))
-        height = min(760, max(560, int(screen_h * 0.70)))
-        x = max(0, (screen_w - width) // 2)
-        y = max(0, (screen_h - height) // 2)
+        work_x, work_y, work_w, work_h = self._visible_work_area()
+        width = min(1500, max(1120, int(work_w * 0.94)))
+        height = min(900, max(680, int(work_h * 0.94)))
+        width = min(width, max(800, work_w - 12))
+        height = min(height, max(600, work_h - 12))
+        x = work_x + max(0, (work_w - width) // 2)
+        y = work_y + max(0, (work_h - height) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
-    def _clamp_window_to_visible_screen(self, width: int, height: int, x: int, y: int) -> tuple[int, int, int, int]:
+    def _visible_work_area(self) -> tuple[int, int, int, int]:
+        """Return the usable primary-screen area, excluding the Windows taskbar."""
         screen_w = max(800, int(self.winfo_screenwidth()))
         screen_h = max(600, int(self.winfo_screenheight()))
-        width = min(width, int(screen_w * 0.98))
-        height = min(height, int(screen_h * 0.95))
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                class _Rect(ctypes.Structure):
+                    _fields_ = [
+                        ("left", ctypes.c_long),
+                        ("top", ctypes.c_long),
+                        ("right", ctypes.c_long),
+                        ("bottom", ctypes.c_long),
+                    ]
+
+                rect = _Rect()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                    width = int(rect.right - rect.left)
+                    height = int(rect.bottom - rect.top)
+                    if width >= 800 and height >= 560:
+                        return int(rect.left), int(rect.top), width, height
+            except Exception:
+                pass
+        return 0, 0, screen_w, screen_h
+
+    def _clamp_window_to_visible_screen(self, width: int, height: int, x: int, y: int) -> tuple[int, int, int, int]:
+        work_x, work_y, screen_w, screen_h = self._visible_work_area()
+        width = min(width, max(800, screen_w - 8))
+        height = min(height, max(600, screen_h - 8))
         min_visible_x = min(80, max(0, width - 120))
-        min_visible_y = 0
-        max_x = max(0, screen_w - min_visible_x)
-        max_y = max(0, screen_h - 80)
-        if x < -width + min_visible_x or x > max_x or y < min_visible_y or y > max_y:
-            x = max(0, (screen_w - width) // 2)
-            y = max(0, (screen_h - height) // 2)
+        min_visible_y = work_y
+        max_x = work_x + max(0, screen_w - min_visible_x)
+        max_y = work_y + max(0, screen_h - 80)
+        if x < work_x - width + min_visible_x or x > max_x or y < min_visible_y or y > max_y:
+            x = work_x + max(0, (screen_w - width) // 2)
+            y = work_y + max(0, (screen_h - height) // 2)
         else:
-            x = max(-width + min_visible_x, min(x, max_x))
+            x = max(work_x - width + min_visible_x, min(x, max_x))
             y = max(min_visible_y, min(y, max_y))
         return width, height, x, y
 
@@ -3253,15 +3283,14 @@ class V11BApp(tk.Tk):
 
     def _fit_window_to_content(self) -> None:
         self.update_idletasks()
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
+        _work_x, _work_y, screen_w, screen_h = self._visible_work_area()
         req_w = self.winfo_reqwidth() + 24
         req_h = self.winfo_reqheight() + 24
         footer_visible = hasattr(self, "footer_frame") and bool(self.footer_frame.winfo_manager())
         min_w = 1280 if footer_visible else 1040
-        min_h = 520
-        width = min(max(req_w, min_w), int(screen_w * 0.96))
-        height = min(max(req_h, min_h), int(screen_h * 0.82))
+        min_h = 680 if footer_visible else 640
+        width = min(max(req_w, min_w), max(800, screen_w - 12))
+        height = min(max(req_h, min_h), max(600, screen_h - 12))
         x = self.winfo_x()
         y = self.winfo_y()
         width, height, x, y = self._clamp_window_to_visible_screen(width, height, x, y)
@@ -3357,7 +3386,7 @@ class V11BApp(tk.Tk):
         default_api = self.billing_api_default
         self.billing_api_base_var = tk.StringVar(value=default_api)
         self.billing_token_var = tk.StringVar(value=os.environ.get("V11B_BILLING_TOKEN", ""))
-        self.checkout_credits_var = tk.IntVar(value=68)
+        self.checkout_credits_var = tk.IntVar(value=30)
         self.checkout_session_var = tk.StringVar(value="")
         self.checkout_url_var = tk.StringVar(value="")
         self.checkout_amount_cents_override: int | None = None
@@ -3484,7 +3513,7 @@ class V11BApp(tk.Tk):
             lightcolor="#25466b",
             darkcolor="#102338",
             relief="flat",
-            padding=(10, 11),
+            padding=(10, 8),
             font=("Segoe UI", 9),
         )
         style.map(
@@ -3500,7 +3529,7 @@ class V11BApp(tk.Tk):
             lightcolor="#6aefc4",
             darkcolor=accent_dim,
             relief="flat",
-            padding=(10, 11),
+            padding=(10, 8),
             font=("Segoe UI", 9, "bold"),
         )
         style.map(
@@ -3555,51 +3584,29 @@ class V11BApp(tk.Tk):
         style.configure("BillingMuted.TLabel", background="#0f1829", foreground="#96abc9")
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self, padding=10, style="Root.TFrame")
+        top = ttk.Frame(self, padding=6, style="Root.TFrame")
         top.pack(fill=BOTH, expand=True)
 
         self._build_app_header(top)
 
         content = ttk.Frame(top, style="Root.TFrame")
-        content.pack(fill=BOTH, expand=True, pady=(10, 0))
+        content.pack(fill=BOTH, expand=True, pady=(6, 0))
 
-        left_container = ttk.Frame(content, style="Panel.TFrame")
-        left_container.pack(side=LEFT, fill=BOTH, expand=True)
-
-        left_canvas = tk.Canvas(
-            left_container,
-            bg="#121a2b",
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        left_canvas.pack(side=LEFT, fill=BOTH, expand=True)
-
-        left_panel = ttk.Frame(left_canvas, style="Panel.TFrame")
-        left_window = left_canvas.create_window((0, 0), window=left_panel, anchor="nw")
-
-        def _resize_scroll_region(_event=None) -> None:
-            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
-
-        def _resize_left_panel_width(event) -> None:
-            left_canvas.itemconfigure(left_window, width=event.width)
-
-        left_panel.bind("<Configure>", _resize_scroll_region)
-        left_canvas.bind("<Configure>", _resize_left_panel_width)
-
-        def _on_mousewheel(event) -> None:
-            delta = -1 * int(event.delta / 120) if event.delta else 0
-            left_canvas.yview_scroll(delta, "units")
-
-        left_canvas.bind("<MouseWheel>", _on_mousewheel)
-        left_panel.bind("<MouseWheel>", _on_mousewheel)
+        left_panel = ttk.Frame(content, style="Panel.TFrame")
+        left_panel.pack(side=LEFT, fill=BOTH, expand=True)
+        self.main_content_frame = content
+        self.left_panel = left_panel
 
         right_panel = ttk.Frame(content, style="Panel.TFrame")
-        right_panel.pack(side=RIGHT, fill=BOTH, expand=True, padx=(10, 0))
+        right_panel.pack(side=RIGHT, fill=BOTH, expand=True, padx=(6, 0))
+        self.right_panel = right_panel
 
+        # Allocate the Run card first at the bottom so variable-length guidance
+        # cannot push the primary action below the visible work area.
+        self._build_action_section(left_panel)
         self._build_input_section(left_panel)
         self._build_profile_section(left_panel)
         self._build_settings_notebook(left_panel)
-        self._build_action_section(left_panel)
 
         self._build_compare_panel(right_panel)
         self._build_log_panel(right_panel)
@@ -3756,7 +3763,7 @@ class V11BApp(tk.Tk):
             Path(__file__).with_name("assets") / "pixelforge_logo.png",
             Path(__file__).with_name("pixelforge_logo.png"),
         ]
-        self.header_logo_photo = self._load_logo_photo(logo_candidates, max_width=250, max_height=78)
+        self.header_logo_photo = self._load_logo_photo(logo_candidates, max_width=210, max_height=58)
         if self.header_logo_photo is not None:
             logo_label.configure(image=self.header_logo_photo)
 
@@ -3765,7 +3772,7 @@ class V11BApp(tk.Tk):
             text="PixelForge AI",
             fg="#f2f7ff",
             bg="#121a2b",
-            font=("Segoe UI", 18, "bold"),
+            font=("Segoe UI", 16, "bold"),
             anchor="w",
         ).grid(row=0, column=1, sticky="nw", pady=(0, 0))
 
@@ -3851,81 +3858,74 @@ class V11BApp(tk.Tk):
 
         self._set_header_registration_state(self._header_email_registered, self.recovery_email_var.get().strip())
 
-        ttk.Separator(parent).pack(fill=X, pady=(6, 0))
+        ttk.Separator(parent).pack(fill=X, pady=(4, 0))
 
     def _build_input_section(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="1 · Source", padding=12, style="Card.TLabelframe")
+        box = ttk.LabelFrame(parent, text="1 · Source", padding=8, style="Card.TLabelframe")
         box.pack(fill=X)
 
         ttk.Label(
             box,
-            text="Load a video or image, then review the three preview frames on the right before processing.",
-            wraplength=390,
+            text="Load a video or image; PixelForge builds three preview frames before processing.",
+            wraplength=520,
             justify=LEFT,
             style="Hint.TLabel",
-        ).pack(anchor=W, pady=(0, 8))
+        ).pack(anchor=W, pady=(0, 4))
 
         row1 = ttk.Frame(box)
-        row1.pack(fill=X, pady=4)
+        row1.pack(fill=X, pady=2)
         ttk.Label(row1, text="Input", width=10).pack(side=LEFT)
         ttk.Entry(row1, textvariable=self.input_video_var).pack(side=LEFT, fill=X, expand=True)
         ttk.Button(row1, text="Browse", command=self._pick_input).pack(side=LEFT, padx=(6, 0))
 
         row2 = ttk.Frame(box)
-        row2.pack(fill=X, pady=4)
+        row2.pack(fill=X, pady=2)
         ttk.Label(row2, text="Output", width=10).pack(side=LEFT)
         ttk.Entry(row2, textvariable=self.output_video_var).pack(side=LEFT, fill=X, expand=True)
         ttk.Button(row2, text="Browse", command=self._pick_output).pack(side=LEFT, padx=(6, 0))
 
-        target_row = ttk.Frame(box)
-        target_row.pack(fill=X, pady=(6, 0))
-        ttk.Label(target_row, text="Output size", width=10).pack(side=LEFT)
+        delivery_row = ttk.Frame(box)
+        delivery_row.pack(fill=X, pady=(4, 0))
+        ttk.Label(delivery_row, text="Output size", width=10).pack(side=LEFT)
         target_picker = ttk.Combobox(
-            target_row,
+            delivery_row,
             textvariable=self.output_target_var,
             values=OUTPUT_TARGETS,
             state="readonly",
-            width=16,
+            width=14,
         )
         target_picker.pack(side=LEFT)
         target_picker.bind("<<ComboboxSelected>>", lambda _event: self._apply_output_target())
-        ttk.Label(
-            target_row,
-            text="Choose the deliverable; PixelForge selects the engine's internal scale.",
-            style="Hint.TLabel",
-            wraplength=132,
-            justify=LEFT,
-        ).pack(side=LEFT, padx=(8, 0))
-
-        frame_rate_row = ttk.Frame(box)
-        frame_rate_row.pack(fill=X, pady=(6, 0))
-        ttk.Label(frame_rate_row, text="Frame rate", width=10).pack(side=LEFT)
+        ttk.Label(delivery_row, text="Frame rate", width=10).pack(side=LEFT, padx=(12, 0))
         frame_rate_picker = ttk.Combobox(
-            frame_rate_row,
+            delivery_row,
             textvariable=self.frame_rate_target_var,
             values=FRAME_RATE_TARGETS,
             state="readonly",
-            width=16,
+            width=14,
         )
         frame_rate_picker.pack(side=LEFT)
         frame_rate_picker.bind("<<ComboboxSelected>>", lambda _event: self._apply_frame_rate_target())
         ttk.Label(
-            frame_rate_row,
-            text="Keep the original motion, or create smooth 60 FPS with RIFE.",
+            box,
+            text="Target size is automatic. Keep source motion or create 60 FPS with RIFE.",
             style="Hint.TLabel",
-            wraplength=132,
+            wraplength=520,
             justify=LEFT,
-        ).pack(side=LEFT, padx=(8, 0))
+        ).pack(anchor=W, pady=(4, 0))
 
     def _build_profile_section(self, parent: ttk.Frame) -> None:
-        speed_box = ttk.LabelFrame(parent, text="2 · Speed", padding=12, style="Card.TLabelframe")
-        speed_box.pack(fill=X, pady=(10, 0))
+        speed_box = ttk.LabelFrame(parent, text="2 · Speed", padding=8, style="Card.TLabelframe")
+        speed_box.pack(fill=X, pady=(6, 0))
         ttk.Label(
             speed_box,
-            text="Start with Balanced. Use Fast Preview to test settings quickly.",
+            text=(
+                "Balanced = best overall · Max Detail = highest fidelity / slowest · "
+                "Fast Preview = quickest test · NVIDIA RTX = fastest compatible SDR"
+            ),
             style="Hint.TLabel",
-            wraplength=390,
-        ).pack(anchor=W, pady=(0, 8))
+            wraplength=520,
+        ).pack(anchor=W, pady=(0, 4))
         speed_row = ttk.Frame(speed_box, style="Panel.TFrame")
         speed_row.pack(fill=X)
         show_nvidia = bool(self.nvidia_hardware.supported)
@@ -3938,7 +3938,7 @@ class V11BApp(tk.Tk):
         quality_btn = ttk.Button(speed_row, text="Max Detail", command=self._apply_quality_profile, style="Profile.TButton")
         nvidia_btn = None
         if show_nvidia:
-            nvidia_text = "NVIDIA RTX" if self.nvidia_worker is not None else "Install RTX"
+            nvidia_text = "NVIDIA RTX" if self.nvidia_worker is not None else "Setup RTX"
             nvidia_btn = ttk.Button(
                 speed_row,
                 text=nvidia_text,
@@ -3952,14 +3952,14 @@ class V11BApp(tk.Tk):
         if nvidia_btn is not None:
             nvidia_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
-        content_box = ttk.LabelFrame(parent, text="3 · Content", padding=12, style="Card.TLabelframe")
-        content_box.pack(fill=X, pady=(8, 0))
+        content_box = ttk.LabelFrame(parent, text="3 · Content", padding=8, style="Card.TLabelframe")
+        content_box.pack(fill=X, pady=(6, 0))
         ttk.Label(
             content_box,
             text="Match the model stack to what you are enhancing.",
             style="Hint.TLabel",
             wraplength=780,
-        ).pack(anchor=W, pady=(0, 8))
+        ).pack(anchor=W, pady=(0, 4))
         content_row = ttk.Frame(content_box, style="Panel.TFrame")
         content_row.pack(fill=X)
         for col in range(3):
@@ -3994,27 +3994,27 @@ class V11BApp(tk.Tk):
             parent,
             textvariable=self.profile_summary_var,
             style="Hint.TLabel",
-            wraplength=390,
+            wraplength=520,
             justify=LEFT,
-        ).pack(anchor=W, pady=(8, 0))
+        ).pack(anchor=W, pady=(5, 0))
         ttk.Label(
             parent,
             textvariable=self.profile_guidance_var,
             style="Hint.TLabel",
-            wraplength=390,
+            wraplength=520,
             justify=LEFT,
-        ).pack(anchor=W, pady=(4, 0))
+        ).pack(anchor=W, pady=(2, 0))
         ttk.Label(
             parent,
             textvariable=self.quality_guard_notice_var,
             style="Hint.TLabel",
-            wraplength=390,
+            wraplength=520,
             justify=LEFT,
-        ).pack(anchor=W, pady=(4, 0))
+        ).pack(anchor=W, pady=(2, 0))
 
     def _build_settings_notebook(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent, style="Panel.TFrame")
-        header.pack(fill=X, pady=(12, 0))
+        header.pack(fill=X, pady=(5, 0))
         self.advanced_link_label = tk.Label(
             header,
             text="Advanced options  ·  fine-tune model, color, motion, and encode",
@@ -4370,9 +4370,9 @@ class V11BApp(tk.Tk):
 
         package_row = ttk.Frame(tab)
         package_row.pack(fill=X, pady=(0, 6))
-        ttk.Button(package_row, text="Starter 32 · $5", command=lambda: self.checkout_credits_var.set(32)).pack(side=LEFT)
-        ttk.Button(package_row, text="Creator 68 · $10", command=lambda: self.checkout_credits_var.set(68)).pack(side=LEFT, padx=6)
-        ttk.Button(package_row, text="Pro 144 · $20", command=lambda: self.checkout_credits_var.set(144)).pack(side=LEFT)
+        ttk.Button(package_row, text="Starter 12 · $5", command=lambda: self.checkout_credits_var.set(12)).pack(side=LEFT)
+        ttk.Button(package_row, text="Creator 30 · $10", command=lambda: self.checkout_credits_var.set(30)).pack(side=LEFT, padx=6)
+        ttk.Button(package_row, text="Studio 72 · $20", command=lambda: self.checkout_credits_var.set(72)).pack(side=LEFT)
 
         self._labeled_spin(tab, "Credits to purchase", self.checkout_credits_var, 1, 1000)
         self._labeled_entry(tab, "Checkout Session ID", self.checkout_session_var)
@@ -4414,11 +4414,12 @@ class V11BApp(tk.Tk):
         )
 
     def _build_action_section(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="4 · Run", padding=12, style="Card.TLabelframe")
-        box.pack(fill=X, pady=(10, 0))
+        box = ttk.LabelFrame(parent, text="4 · Run", padding=8, style="Card.TLabelframe")
+        box.pack(side="bottom", fill=X, pady=(6, 0))
+        self.run_section = box
 
         self.progress_container = ttk.Frame(box, style="Panel.TFrame")
-        self.progress_container.pack(fill=X, pady=(0, 10))
+        self.progress_container.pack(fill=X, pady=(0, 6))
 
         progress_header = ttk.Frame(self.progress_container, style="Panel.TFrame")
         progress_header.pack(fill=X, pady=(0, 4))
@@ -4442,7 +4443,7 @@ class V11BApp(tk.Tk):
         start_stack.pack(side=LEFT)
         self.start_processing_button = ttk.Button(start_stack, text="Start Processing", command=self._start_processing, style="Accent.TButton")
         self.start_processing_button.pack(anchor=W)
-        ttk.Label(start_stack, textvariable=self.start_button_credit_var, style="Hint.TLabel", justify="center").pack(anchor="center", pady=(4, 0))
+        ttk.Label(start_stack, textvariable=self.start_button_credit_var, style="Hint.TLabel", justify="center").pack(anchor="center", pady=(2, 0))
 
         self.stop_button = ttk.Button(button_row, text="Stop", command=self._stop_processing, style="Danger.TButton")
 
@@ -4484,7 +4485,7 @@ class V11BApp(tk.Tk):
             cursor="hand2",
             font=("Segoe UI", 10, "underline"),
         )
-        self.restore_account_link_label.pack(anchor="center", pady=(4, 0))
+        self.restore_account_link_label.pack(anchor="center", pady=(2, 0))
         self.restore_account_link_label.bind("<Button-1>", lambda _event: self._toggle_restore_code_panel())
 
         self.restore_code_panel = ttk.Frame(box, style="Panel.TFrame")
@@ -4920,20 +4921,20 @@ class V11BApp(tk.Tk):
         self._redeem_credit_code()
 
     def _build_compare_panel(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="Before / After Preview", padding=10, style="Card.TLabelframe")
-        box.pack(fill=BOTH, expand=True, pady=(0, 8))
+        box = ttk.LabelFrame(parent, text="Before / After Preview", padding=8, style="Card.TLabelframe")
+        box.pack(fill=BOTH, expand=True, pady=(0, 6))
 
         # Controls first so they stay visible (never clipped under a tall canvas).
         controls = ttk.Frame(box, style="Panel.TFrame")
-        controls.pack(side="bottom", fill=X, pady=(8, 0))
+        controls.pack(side="bottom", fill=X, pady=(5, 0))
 
         frame_row = ttk.Frame(controls, style="Panel.TFrame")
-        frame_row.pack(fill=X, pady=(0, 4))
+        frame_row.pack(fill=X, pady=(0, 2))
         ttk.Label(frame_row, text="Video frame", style="Section.TLabel").pack(side=LEFT)
         ttk.Label(frame_row, textvariable=self.compare_frame_label_var, style="Value.TLabel").pack(side=RIGHT)
 
         jump_row = ttk.Frame(controls, style="Panel.TFrame")
-        jump_row.pack(fill=X, pady=(0, 4))
+        jump_row.pack(fill=X, pady=(0, 2))
         for col, pct in enumerate(self.filmstrip_pcts):
             jump_row.columnconfigure(col, weight=1, uniform="frame_jump")
             button = ttk.Button(
@@ -4947,7 +4948,7 @@ class V11BApp(tk.Tk):
             self.filmstrip_buttons.append(button)
 
         preview_row = ttk.Frame(controls, style="Panel.TFrame")
-        preview_row.pack(fill=X, pady=(4, 0))
+        preview_row.pack(fill=X, pady=(2, 0))
         ttk.Label(preview_row, text="Preview area", style="Hint.TLabel").pack(side=LEFT)
         crop_picker = ttk.Combobox(
             preview_row,
@@ -4972,10 +4973,10 @@ class V11BApp(tk.Tk):
             state=tk.DISABLED,
         )
         self.preview_cancel_button.pack(side=RIGHT)
-        ttk.Label(controls, textvariable=self.preview_status_var, style="Hint.TLabel").pack(anchor=W, pady=(4, 0))
+        ttk.Label(controls, textvariable=self.preview_status_var, style="Hint.TLabel").pack(anchor=W, pady=(2, 0))
 
         top_copy = ttk.Frame(box, style="Panel.TFrame")
-        top_copy.pack(fill=X, pady=(0, 6))
+        top_copy.pack(fill=X, pady=(0, 4))
         ttk.Label(
             top_copy,
             text="Pick one of the three frames. In Detail crop mode, click the source preview to center the crop; drag the cyan line after generation to compare.",
@@ -4998,7 +4999,7 @@ class V11BApp(tk.Tk):
         self.compare_canvas = tk.Canvas(
             canvas_frame,
             width=520,
-            height=300,
+            height=260,
             bg="#090f1b",
             highlightthickness=1,
             highlightbackground="#355c93",
@@ -5045,12 +5046,13 @@ class V11BApp(tk.Tk):
         )
 
     def _build_log_panel(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="Processing Log", padding=8, style="Card.TLabelframe")
+        box = ttk.LabelFrame(parent, text="Processing Log", padding=6, style="Card.TLabelframe")
         box.pack(fill=X)
+        self.log_section = box
         self.log_text = tk.Text(
             box,
             width=48,
-            height=7,
+            height=5,
             wrap="word",
             bg="#08101d",
             fg="#cde3ff",
@@ -5079,14 +5081,14 @@ class V11BApp(tk.Tk):
         
         # Content area with fixed padding
         content = tk.Frame(self.footer_frame, bg="#0a1220")
-        content.pack(fill=X, padx=12, pady=6)
+        content.pack(fill=X, padx=8, pady=3)
         content.grid_columnconfigure(0, minsize=72)
         content.grid_columnconfigure(1, weight=1)
         
         # Row 1: ETA + Source
         tk.Label(content, text="ETA:", fg="#7df6c7", bg="#0a1220", font=("Segoe UI", 9, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
         row1_value = tk.Frame(content, bg="#0a1220")
-        row1_value.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+        row1_value.grid(row=0, column=1, sticky="ew", pady=(0, 1))
         tk.Label(row1_value, textvariable=self.estimate_summary_var, fg="#aaaaaa", bg="#0a1220", font=("Segoe UI", 9), anchor="w").pack(side=LEFT)
         tk.Label(row1_value, text="Source:", fg="#7df6c7", bg="#0a1220", font=("Segoe UI", 9, "bold"), anchor="w").pack(side=LEFT, padx=(36, 10))
         self.footer_source_value = tk.Label(row1_value, textvariable=self.estimate_source_var, fg="#aaaaaa", bg="#0a1220", font=("Segoe UI", 9), anchor="w")
@@ -5095,12 +5097,12 @@ class V11BApp(tk.Tk):
         # Row 2: System
         tk.Label(content, text="System:", fg="#7df6c7", bg="#0a1220", font=("Segoe UI", 9, "bold"), anchor="w").grid(row=1, column=0, sticky="nw")
         self.footer_system_value = tk.Label(content, textvariable=self.estimate_spec_var, fg="#aaaaaa", bg="#0a1220", font=("Segoe UI", 9), wraplength=1000, justify=LEFT, anchor="w")
-        self.footer_system_value.grid(row=1, column=1, sticky="ew", pady=(2, 0))
+        self.footer_system_value.grid(row=1, column=1, sticky="ew", pady=(1, 0))
 
         # Row 3: Stages
         tk.Label(content, text="Stages:", fg="#7df6c7", bg="#0a1220", font=("Segoe UI", 8, "bold"), anchor="w").grid(row=2, column=0, sticky="nw")
         self.footer_stages_value = tk.Label(content, textvariable=self.estimate_stage_var, fg="#999999", bg="#0a1220", font=("Segoe UI", 8), wraplength=1000, justify=LEFT, anchor="w")
-        self.footer_stages_value.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        self.footer_stages_value.grid(row=2, column=1, sticky="ew", pady=(1, 0))
         
         # Start hidden - show only when video is loaded
         self.footer_frame.pack_forget()
@@ -6413,42 +6415,60 @@ class V11BApp(tk.Tk):
         return f"${cents / 100:,.2f}"
 
     def _get_billing_package_definitions(self) -> list[dict[str, object]]:
-        packages: list[dict[str, object]] = [
+        fallback_packages: list[dict[str, object]] = [
             {
-                "title": "32 Credits",
-                "plan_id": "starter_32",
-                "credits": 32,
+                "title": "12 Credits",
+                "plan_id": "starter_12",
+                "credits": 12,
                 "price_cents": 500,
                 "accent": False,
                 "badge": "Starter",
-                "summary": "Cheapest entry pack for one focused job.",
+                "summary": "A low-cost pack for a previewed short clip.",
             },
             {
-                "title": "68 Credits",
-                "plan_id": "creator_68",
-                "credits": 68,
+                "title": "30 Credits",
+                "plan_id": "creator_30",
+                "credits": 30,
                 "price_cents": 1000,
                 "accent": True,
                 "badge": "Most Popular",
-                "summary": "Best everyday value for creators running multiple clips per session.",
+                "summary": "Best for several clips or one longer enhancement.",
             },
             {
-                "title": "144 Credits",
-                "plan_id": "pro_144",
-                "credits": 144,
+                "title": "72 Credits",
+                "plan_id": "studio_72",
+                "credits": 72,
                 "price_cents": 2000,
                 "accent": False,
                 "badge": "Best Value",
-                "summary": "Lowest per-credit price for production queues and reruns.",
+                "summary": "Lowest rate for 4K, 60 FPS, and production queues.",
             },
         ]
+        server_credit_packages: list[dict[str, object]] = []
+        lifetime_packages: list[dict[str, object]] = []
         for plan in getattr(self, "_server_billing_plans", []):
-            if str(plan.get("id") or "") != "pro_lifetime":
-                continue
+            plan_id = str(plan.get("id") or "").strip()
             amount = int(plan.get("amount_cents") or 0)
-            if amount < 1000:
+            credits = int(plan.get("credits") or 0)
+            if amount < 100 or not plan_id:
                 continue
-            packages.append(
+            if plan_id != "pro_lifetime" and credits > 0:
+                badge = str(plan.get("badge") or "")
+                server_credit_packages.append(
+                    {
+                        "title": str(plan.get("label") or f"{credits} Credits"),
+                        "plan_id": plan_id,
+                        "credits": credits,
+                        "price_cents": amount,
+                        "accent": badge.lower() == "most popular",
+                        "badge": badge,
+                        "summary": str(plan.get("summary") or "Server-authorized PixelForge processing credits."),
+                    }
+                )
+                continue
+            if plan_id != "pro_lifetime":
+                continue
+            lifetime_packages.append(
                 {
                     "title": str(plan.get("label") or "PixelForge AI Pro"),
                     "plan_id": "pro_lifetime",
@@ -6459,7 +6479,7 @@ class V11BApp(tk.Tk):
                     "summary": "Unlimited local renders on this licensed device; no per-render credit charge.",
                 }
             )
-        return packages
+        return (server_credit_packages or fallback_packages) + lifetime_packages
 
     def _build_billing_package_card(self, parent: tk.Misc, package: dict[str, object]) -> tk.Frame:
         title = str(package["title"])
@@ -6542,12 +6562,12 @@ class V11BApp(tk.Tk):
             return False
 
         credits = int(self.checkout_credits_var.get())
+        package_name = self.checkout_package_name_override
         if credits <= 0 and package_name != "pro_lifetime":
             messagebox.showwarning("Invalid Credits", "Credits must be greater than 0.")
             return False
 
         charge_cents = self.checkout_amount_cents_override
-        package_name = self.checkout_package_name_override
 
         # ── DEV MODE: bypass Stripe and add credits directly for local testing ──
         if self._is_dev_bypass_enabled():
@@ -7466,25 +7486,24 @@ class V11BApp(tk.Tk):
         model_label = MODEL_KEY_TO_LABEL.get(self.model_var.get().strip(), self.model_var.get().strip())
         target_label = self.output_target_var.get().strip() or "Same resolution"
         if self.apply_final_scale_var.get():
-            aspect_note = "preserve aspect" if self.preserve_aspect_ratio_var.get() else "stretch to fit"
-            output_dims = f"{target_label} — {int(self.target_width_var.get())}x{int(self.target_height_var.get())} ({aspect_note})"
+            output_dims = f"{target_label} {int(self.target_width_var.get())}x{int(self.target_height_var.get())}"
         else:
             output_dims = target_label
         interp = "60 FPS (RIFE)" if self.enable_interpolation_var.get() and self.target_fps_var.get() == 60 else "source FPS"
         self.profile_summary_var.set(
-            f"Active: {speed_label} + {upscaling_label} | model={model_label.split('(')[0].strip()} | "
-            f"output={output_dims} | motion={interp}"
+            f"Active: {speed_label} · {upscaling_label} · {model_label.split('(')[0].strip()} · "
+            f"{output_dims} · {interp}"
         )
         guidance = {
-            "live": "Recommended for phone/camera footage, people, products, and real-world scenes.",
-            "animation": "Use only for animation, line art, anime, or game captures.",
-            "restore": "Use for visibly compressed, blocky, noisy, or older footage; it intentionally smooths artifacts.",
+            "live": "For camera footage, people, products, and real-world scenes.",
+            "animation": "For animation, line art, anime, and game captures.",
+            "restore": "For compressed, noisy, blocky, or older footage.",
         }.get(self.selected_upscaling_profile, "")
         speed_guidance = {
-            "fast": "Fast Preview favors a faster model for testing.",
-            "balanced": "Balanced is the safest first full run for most files.",
-            "quality": "Max Detail uses the strongest model stack and can take substantially longer.",
-            "nvidia": "NVIDIA RTX uses the optional official VSR Ultra engine for compatible SDR media.",
+            "fast": "Favors speed for testing.",
+            "balanced": "Safest first full run.",
+            "quality": "Strongest model stack; substantially slower.",
+            "nvidia": "Fastest compatible SDR path; Max Detail is the highest-fidelity path.",
         }.get(self.selected_speed_profile, "")
         self.profile_guidance_var.set(f"{guidance} {speed_guidance}".strip())
 
@@ -8708,21 +8727,74 @@ class V11BApp(tk.Tk):
             return
         self._set_selected_speed_profile("nvidia")
 
-    def _install_nvidia_pack_async(self) -> None:
+    def _write_nvidia_auto_setup_marker(self, status: str) -> None:
+        try:
+            self.nvidia_auto_setup_marker.parent.mkdir(parents=True, exist_ok=True)
+            self.nvidia_auto_setup_marker.write_text(
+                json.dumps(
+                    {
+                        "pack_version": NVIDIA_PACK_VERSION,
+                        "status": str(status),
+                        "gpu": self.nvidia_hardware.name,
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.log_queue.put(f"[WARN] Could not save NVIDIA auto-setup preference: {exc}")
+
+    def _maybe_offer_nvidia_auto_setup(self) -> None:
+        """Offer one automatic first-run setup on genuinely compatible RTX systems."""
+        self.nvidia_worker = discover_nvidia_worker(_APP_DIR, self.app_data_dir)
+        if not self.nvidia_hardware.supported or self.nvidia_worker is not None:
+            return
+        if _env_is_truthy(os.environ.get("PIXELFORGE_DISABLE_NVIDIA_AUTO_SETUP", "0")):
+            return
+        try:
+            marker = json.loads(self.nvidia_auto_setup_marker.read_text(encoding="utf-8"))
+            if str(marker.get("pack_version") or "") == NVIDIA_PACK_VERSION:
+                return
+        except (OSError, ValueError, TypeError):
+            pass
+
+        confirmed = messagebox.askyesno(
+            "Set up NVIDIA RTX acceleration?",
+            f"PixelForge detected {self.nvidia_hardware.name} "
+            f"({self.nvidia_hardware.vram_mb // 1024} GB VRAM).\n\n"
+            "Set up the verified NVIDIA RTX engine automatically now?\n\n"
+            "Download: about 585 MB · Installed: about 1 GB\n"
+            "NVIDIA RTX is the fastest option for compatible SDR video.\n"
+            "Balanced remains the best overall default; Max Detail is the highest-fidelity, slowest path.\n\n"
+            "HDR/10-bit sources continue to use PixelForge's precision-safe DirectML path.",
+            parent=self,
+        )
+        if not confirmed:
+            self._write_nvidia_auto_setup_marker("declined")
+            self.profile_guidance_var.set("RTX setup skipped. Balanced remains the best overall default.")
+            return
+        self._nvidia_auto_install_active = True
+        self._install_nvidia_pack_async(confirm_install=False)
+
+    def _install_nvidia_pack_async(self, *, confirm_install: bool = True) -> None:
         if not self.nvidia_hardware.supported:
             messagebox.showinfo("NVIDIA RTX unavailable", self.nvidia_hardware.reason)
             return
-        confirmed = messagebox.askyesno(
-            "Install NVIDIA RTX engine",
-            "Install the optional NVIDIA RTX Video Super Resolution engine?\n\n"
-            "Download: about 585 MB\n"
-            "Installed size: about 1 GB\n"
-            f"Detected: {self.nvidia_hardware.name} ({self.nvidia_hardware.vram_mb // 1024} GB VRAM)\n\n"
-            "The RTX engine is for SDR media. HDR/10-bit sources continue to use PixelForge's precision-safe "
-            "DirectML path.",
-        )
-        if not confirmed:
-            return
+        if confirm_install:
+            confirmed = messagebox.askyesno(
+                "Set up NVIDIA RTX engine",
+                "Set up the verified NVIDIA RTX Video Super Resolution engine?\n\n"
+                "Download: about 585 MB\n"
+                "Installed size: about 1 GB\n"
+                f"Detected: {self.nvidia_hardware.name} ({self.nvidia_hardware.vram_mb // 1024} GB VRAM)\n\n"
+                "NVIDIA RTX is the fastest compatible SDR path. Balanced remains the best overall default, "
+                "and Max Detail is the highest-fidelity / slowest path. HDR/10-bit sources continue to use "
+                "PixelForge's precision-safe DirectML path.",
+                parent=self,
+            )
+            if not confirmed:
+                return
         button = self.nvidia_profile_button
         if button is not None:
             button.configure(text="Downloading 0%", state=tk.DISABLED)
@@ -8777,17 +8849,22 @@ class V11BApp(tk.Tk):
 
     def _finish_nvidia_pack_install(self, error: str = "") -> None:
         button = self.nvidia_profile_button
+        automatic = self._nvidia_auto_install_active
+        self._nvidia_auto_install_active = False
         if error:
             if button is not None:
-                button.configure(text="Install RTX", state=tk.NORMAL)
+                button.configure(text="Setup RTX", state=tk.NORMAL)
             self.profile_guidance_var.set("NVIDIA RTX install failed; standard profiles are unchanged.")
+            self._write_nvidia_auto_setup_marker("failed")
             messagebox.showerror("NVIDIA RTX install failed", error)
             return
         if button is not None:
             button.configure(text="NVIDIA RTX", state=tk.NORMAL)
             self.speed_profile_buttons["nvidia"] = button
-        self.profile_guidance_var.set("NVIDIA RTX engine verified and ready.")
-        messagebox.showinfo("NVIDIA RTX ready", "The NVIDIA RTX engine passed its GPU inference check and is ready.")
+        self._write_nvidia_auto_setup_marker("installed")
+        self.profile_guidance_var.set("NVIDIA RTX verified: fastest SDR path. Max Detail remains the highest-fidelity path.")
+        if not automatic:
+            messagebox.showinfo("NVIDIA RTX ready", "The NVIDIA RTX engine passed its GPU inference check and is ready.")
         self._set_selected_speed_profile("nvidia")
 
     def _apply_live_profile(self) -> None:

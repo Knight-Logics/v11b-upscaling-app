@@ -1,5 +1,5 @@
 param(
-  [string]$AppVersion = "1.0.20"
+  [string]$AppVersion = "1.0.21"
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,7 +7,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 if ($AppVersion -notmatch '^\d+\.\d+\.\d+$') {
-  throw "AppVersion must use semantic form such as 1.0.20"
+  throw "AppVersion must use semantic form such as 1.0.21"
 }
 
 $venv = Join-Path $root ".venv-nvidia"
@@ -64,7 +64,7 @@ Requires:
 - NVIDIA Windows driver 570.65 or newer
 - At least 4 GB VRAM (8 GB or more recommended)
 
-Install through PixelForge AI's Enable NVIDIA RTX control, or extract this
+Install through PixelForge AI's Setup RTX control, or extract this
 archive into the app data nvidia-pack folder. The standard PixelForge profiles
 do not require this pack.
 
@@ -79,6 +79,12 @@ if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force 
 Compress-Archive -Path (Join-Path $releaseRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
 $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath
 Set-Content -LiteralPath "$zipPath.sha256" -Value "$($hash.Hash.ToLowerInvariant())  $zipName" -Encoding ascii
+
+$appReleaseDir = Join-Path $root "release\v$AppVersion"
+$appExe = Join-Path $appReleaseDir "PixelForge-AI.exe"
+if (Test-Path -LiteralPath $appExe) {
+  & (Join-Path $root "build_nvidia_edition.ps1") -AppVersion $AppVersion
+}
 
 Write-Host "NVIDIA engine pack complete: $zipPath"
 Write-Host "SHA256: $($hash.Hash.ToLowerInvariant())"

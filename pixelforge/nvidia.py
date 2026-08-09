@@ -26,9 +26,9 @@ NVIDIA_MIN_WINDOWS_DRIVER = (570, 65)
 NVIDIA_PACK_VERSION = "0.1.0.1"
 NVIDIA_PACK_URL = (
     "https://github.com/Knight-Logics/v11b-upscaling-app/releases/download/"
-    "v1.0.20/PixelForge-NVIDIA-Pack_1.0.20_windows_x64.zip"
+    "v1.0.21/PixelForge-NVIDIA-Pack_1.0.21_windows_x64.zip"
 )
-NVIDIA_PACK_SHA256 = "d97d0ec4c39b9c968b113df288b0dd5adfad69705e1c438eb1405451d3754015"
+NVIDIA_PACK_SHA256 = "250d131ff0e598715fec739d315eb0133b24576152b3144f15db57fc00301188"
 
 
 @dataclass(frozen=True)
