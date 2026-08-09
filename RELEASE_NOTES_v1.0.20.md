@@ -9,5 +9,6 @@
 - Adds automatic interlace correction, HDR/10-bit precision-safe model routing, and an explicit warning before extreme enlargement above 4x.
 - Adds a reproducible matched-source PixelForge/Topaz comparison tool and claim gate.
 - Fixes checkout package plan IDs, verifies Stripe test checkout/idempotency, and prepares an optional server-priced lifetime Pro entitlement.
+- Removes unused NumPy and ONNX developer/test tooling from the Windows bundle while retaining their maintained runtime hooks.
 
 The directory-only NCNN and RIFE engines still use disk-backed frame checkpoints. HDR metadata is preserved, but the bundled SPAN models are not advertised as HDR-trained models.

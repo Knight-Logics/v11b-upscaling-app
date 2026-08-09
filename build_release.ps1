@@ -32,6 +32,8 @@ if (Test-Path $iconPath) {
   $iconArg = @("--icon", $iconPath)
 }
 
+# PyInstaller's maintained hooks collect the NumPy and ONNX Runtime DLLs. Explicit
+# collect-all flags also bundled their test suites and developer-only tooling.
 & "$root\.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed `
   --name "PixelForge-AI" `
   --distpath (Join-Path $buildDir "dist") `
@@ -41,8 +43,12 @@ if (Test-Path $iconPath) {
   --collect-data stripe `
   --collect-data certifi `
   --collect-all webview `
-  --collect-all onnxruntime `
-  --collect-all numpy `
+  --exclude-module onnxruntime.quantization `
+  --exclude-module onnxruntime.tools `
+  --exclude-module onnxruntime.transformers `
+  --exclude-module numpy.f2py `
+  --exclude-module numpy.testing `
+  --exclude-module numpy.tests `
   --version-file (Join-Path $root "assets\version_info.txt") `
   --add-binary "$(Join-Path $root 'realesrgan-ncnn-vulkan.exe');." `
   --add-binary "$(Join-Path $root 'realsr-ncnn-vulkan.exe');." `
