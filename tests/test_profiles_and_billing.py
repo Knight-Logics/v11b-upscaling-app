@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -21,6 +22,8 @@ from pixelforge.compare import align_before_after_images, build_compare_timestam
 from pixelforge.engines import REALCUGAN_MODEL_CONFIGS, RIFE_MODEL_DETAILS, SRMD_MODEL_CONFIGS
 from pixelforge.presets import MODEL_NATIVE_SCALES, get_profile_preset
 from pixelforge.nvidia import (
+    NVIDIA_PACK_SHA256,
+    NVIDIA_PACK_URL,
     activate_nvidia_pack,
     download_nvidia_pack,
     frame_rate_choice,
@@ -105,6 +108,10 @@ class ProfilePresetTests(unittest.TestCase):
 
 
 class NvidiaCapabilityTests(unittest.TestCase):
+    def test_app_downloads_the_current_verified_nvidia_pack(self) -> None:
+        self.assertIn("/v1.0.21/PixelForge-NVIDIA-Pack_1.0.21_windows_x64.zip", NVIDIA_PACK_URL)
+        self.assertRegex(NVIDIA_PACK_SHA256, r"^[0-9a-f]{64}$")
+
     def test_supported_rtx_requires_current_driver_and_vram(self) -> None:
         detected = parse_nvidia_smi_row("NVIDIA GeForce RTX 5070 Ti, 610.62, 16303, 12.0")
         self.assertTrue(detected.supported)
@@ -118,6 +125,55 @@ class NvidiaCapabilityTests(unittest.TestCase):
         self.assertEqual(frame_rate_choice("Smooth 60 FPS", 23.976), (True, 60))
         self.assertEqual(frame_rate_choice("Keep source", 29.97), (False, 30))
         self.assertEqual(frame_rate_choice("Smooth 60 FPS", 60.0), (False, 60))
+
+    def test_supported_rtx_gets_one_automatic_setup_offer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = object.__new__(APP.V11BApp)
+            app.app_data_dir = Path(temp_dir)
+            app.nvidia_auto_setup_marker = app.app_data_dir / "auto-setup.json"
+            app.nvidia_hardware = parse_nvidia_smi_row(
+                "NVIDIA GeForce RTX 5070 Ti, 610.62, 16303, 12.0"
+            )
+            app.nvidia_worker = None
+            app._nvidia_auto_install_active = False
+            app.profile_guidance_var = SimpleNamespace(set=mock.Mock())
+            app._install_nvidia_pack_async = mock.Mock()
+
+            with (
+                mock.patch.object(APP, "discover_nvidia_worker", return_value=None),
+                mock.patch.object(APP.messagebox, "askyesno", return_value=True) as prompt,
+                mock.patch.dict(os.environ, {"PIXELFORGE_DISABLE_NVIDIA_AUTO_SETUP": "0"}),
+            ):
+                app._maybe_offer_nvidia_auto_setup()
+
+            prompt.assert_called_once()
+            app._install_nvidia_pack_async.assert_called_once_with(confirm_install=False)
+            self.assertTrue(app._nvidia_auto_install_active)
+
+    def test_current_rtx_setup_marker_suppresses_repeat_offer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = object.__new__(APP.V11BApp)
+            app.app_data_dir = Path(temp_dir)
+            app.nvidia_auto_setup_marker = app.app_data_dir / "auto-setup.json"
+            app.nvidia_auto_setup_marker.write_text(
+                json.dumps({"pack_version": APP.NVIDIA_PACK_VERSION, "status": "declined"}),
+                encoding="utf-8",
+            )
+            app.nvidia_hardware = parse_nvidia_smi_row(
+                "NVIDIA GeForce RTX 5070 Ti, 610.62, 16303, 12.0"
+            )
+            app.nvidia_worker = None
+            app._install_nvidia_pack_async = mock.Mock()
+
+            with (
+                mock.patch.object(APP, "discover_nvidia_worker", return_value=None),
+                mock.patch.object(APP.messagebox, "askyesno") as prompt,
+                mock.patch.dict(os.environ, {"PIXELFORGE_DISABLE_NVIDIA_AUTO_SETUP": "0"}),
+            ):
+                app._maybe_offer_nvidia_auto_setup()
+
+            prompt.assert_not_called()
+            app._install_nvidia_pack_async.assert_not_called()
 
     def test_pack_download_verifies_hash_and_installs_safely(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -325,7 +381,7 @@ class BillingRegressionTests(unittest.TestCase):
     def test_checkout_packages_are_server_plan_ids(self) -> None:
         self.assertEqual(
             APP.RemoteBillingBackend.PLAN_BY_CREDITS,
-            {32: "starter_32", 68: "creator_68", 144: "pro_144"},
+            {12: "starter_12", 30: "creator_30", 72: "studio_72"},
         )
 
     def test_checkout_cards_send_plan_ids_and_optional_server_pro(self) -> None:
@@ -334,17 +390,28 @@ class BillingRegressionTests(unittest.TestCase):
         packages = app._get_billing_package_definitions()
         self.assertEqual(
             [package["plan_id"] for package in packages],
-            ["starter_32", "creator_68", "pro_144"],
+            ["starter_12", "creator_30", "studio_72"],
         )
         app._server_billing_plans = [
             {
+                "id": "server_pack",
+                "label": "24 Credits",
+                "credits": 24,
+                "amount_cents": 900,
+                "badge": "Most Popular",
+            },
+            {
                 "id": "pro_lifetime",
                 "label": "PixelForge AI Pro",
+                "credits": 0,
                 "amount_cents": 9900,
                 "badge": "One-time license",
             }
         ]
         packages = app._get_billing_package_definitions()
+        self.assertEqual(packages[0]["plan_id"], "server_pack")
+        self.assertEqual(packages[0]["credits"], 24)
+        self.assertTrue(packages[0]["accent"])
         self.assertEqual(packages[-1]["plan_id"], "pro_lifetime")
         self.assertEqual(packages[-1]["credits"], 0)
         self.assertEqual(packages[-1]["price_cents"], 9900)

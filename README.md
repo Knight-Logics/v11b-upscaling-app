@@ -18,7 +18,7 @@ Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, 
 - Direct in-app auto-update from GitHub Releases
 - Windows standalone EXE packaging
 
-## Engines (v1.0.20)
+## Engines (v1.0.21)
 
 | Content | Preferred free engine | Notes |
 |---|---|---|
@@ -40,7 +40,9 @@ Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, 
 
 ## Optional NVIDIA RTX Engine
 
-On supported Windows systems, PixelForge shows a fourth **NVIDIA RTX** speed profile. If the pack is absent, the same **Install RTX** button offers a one-click, SHA-256-verified installation. It is intentionally excluded from the universal EXE because the download is about 585 MiB and installs to about 1 GiB.
+On supported Windows systems, PixelForge shows a fourth **NVIDIA RTX** speed profile. If the pack is absent, the app offers automatic first-run setup after disclosing the download size, and the same **Setup RTX** button remains available later. Every download is SHA-256 verified and must pass a real inference probe before the profile is enabled.
+
+The universal EXE stays compact for AMD, Intel, and non-RTX systems. Releases also provide a larger `PixelForge-AI-NVIDIA_<version>_windows_x64.zip` with the verified engine already packaged as a sidecar, so compatible RTX owners can extract and run without a second download.
 
 Requirements: NVIDIA Tensor Core GPU (RTX/Turing or newer), Windows driver 570.65 or newer, and at least 4 GB VRAM (8 GB recommended). PixelForge runs a real VSR inference probe before enabling the installed pack and leaves the standard profiles unchanged if installation or verification fails.
 
@@ -52,7 +54,7 @@ PixelForge does not make an unmeasured universal "better than Topaz" claim. The 
 
 ## Secrets and Billing Configuration
 
-Customer builds use `POST https://knightlogics.com/api/pixelforge-license`. No Stripe, SMTP, database, or signing secret is shipped in the EXE. Packs: 32/$5.00, 68/$10.00, 144/$20.00.
+Customer builds use `POST https://knightlogics.com/api/pixelforge-license`. No Stripe, SMTP, database, or signing secret is shipped in the EXE. New accounts receive 8 trial credits. Packs: 12/$5.00, 30/$10.00, 72/$20.00.
 
 Anonymous diagnostics include only an app-scoped hashed device ID, app version, selected profile/model, coarse source dimensions/duration, and outcome. File names, media, computer name, raw machine identifiers, and email are not sent as diagnostics. Set `V11B_DISABLE_ANONYMOUS_DIAGNOSTICS=1` to opt out.
 
@@ -67,19 +69,23 @@ python process_full_video_ultimate.py
 ## Build Standalone EXE
 
 ```powershell
-./build_release.ps1 -Version 1.0.20
+./build_release.ps1 -Version 1.0.21
 ```
 
 To reproducibly build the optional NVIDIA sidecar pack:
 
 ```powershell
-./build_nvidia_pack.ps1 -AppVersion 1.0.20
+./build_nvidia_pack.ps1 -AppVersion 1.0.21
 ```
+
+After both artifacts exist, the all-in-one archive can be regenerated without
+recompiling the worker by running `./build_nvidia_edition.ps1 -AppVersion 1.0.21`.
 
 Build output is generated in `release/`:
 
 - `PixelForge-AI.exe` (single-file app)
 - `PixelForge-AI_<version>_windows_x64.zip`
+- `PixelForge-AI-NVIDIA_<version>_windows_x64.zip` (all-in-one RTX edition, when the NVIDIA pack is built)
 
 ## Release Asset Naming
 

@@ -32,14 +32,33 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${{ github.ref_name }}" -replace '^v', ''
-          if ([string]::IsNullOrWhiteSpace($ver) -or $ver -eq "main") { $ver = "manual" }
+          if ([string]::IsNullOrWhiteSpace($ver) -or $ver -eq "main") {
+            $match = Select-String -Path process_full_video_ultimate.py -Pattern '^APP_VERSION = "([^"]+)"$'
+            if (!$match -or !$match.Matches.Count) { throw "Could not read APP_VERSION" }
+            $ver = $match.Matches[0].Groups[1].Value
+          }
           ./build_release.ps1 -Version $ver
+
+      - name: Build NVIDIA RTX pack and all-in-one edition
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          if ([string]::IsNullOrWhiteSpace($ver) -or $ver -eq "main") {
+            $match = Select-String -Path process_full_video_ultimate.py -Pattern '^APP_VERSION = "([^"]+)"$'
+            if (!$match -or !$match.Matches.Count) { throw "Could not read APP_VERSION" }
+            $ver = $match.Matches[0].Groups[1].Value
+          }
+          ./build_nvidia_pack.ps1 -AppVersion $ver
 
       - name: Generate release checksums
         shell: pwsh
         run: |
-          $lines = Get-ChildItem release -File |
-            Where-Object { $_.Extension -in @('.exe', '.zip') } |
+          $lines = Get-ChildItem release -Recurse -File |
+            Where-Object {
+              $_.Extension -in @('.exe', '.zip') -and
+              ($_.Name -eq 'PixelForge-AI.exe' -or $_.Name -like 'PixelForge-AI_*.zip' -or
+               $_.Name -like 'PixelForge-AI-NVIDIA_*.zip' -or $_.Name -like 'PixelForge-NVIDIA-Pack_*.zip')
+            } |
             Sort-Object Name |
             ForEach-Object {
               $hash = Get-FileHash $_.FullName -Algorithm SHA256
@@ -51,8 +70,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/PixelForge-AI.exe
-            release/*.zip
+            release/v*/PixelForge-AI.exe
+            release/v*/PixelForge-AI_*.zip
+            release/v*/PixelForge-AI-NVIDIA_*.zip
+            release/PixelForge-NVIDIA-Pack_*.zip
+            release/PixelForge-NVIDIA-Pack_*.zip.sha256
             release/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

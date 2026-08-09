@@ -16,13 +16,14 @@ UNDEPLOYED_KNIGHT_ACCOUNT_API = "https://knightlogics.com/api/knight-account"
 
 # Must match MainSite api/_lib/pixelforge-billing.js PIXELFORGE_PLANS exactly.
 PIXELFORGE_PACKS = {
-    "starter_32": {"credits": 32, "price_cents": 500, "label": "Starter 32"},
-    "creator_68": {"credits": 68, "price_cents": 1000, "label": "Creator 68"},
-    "pro_144": {"credits": 144, "price_cents": 2000, "label": "Pro 144"},
+    "starter_12": {"credits": 12, "price_cents": 500, "label": "Starter 12"},
+    "creator_30": {"credits": 30, "price_cents": 1000, "label": "Creator 30"},
+    "studio_72": {"credits": 72, "price_cents": 2000, "label": "Studio 72"},
 }
 
-# Server-authoritative legacy credit packs retained until a Pro-license migration is chosen.
-PRICE_PER_CREDIT_CENTS_FLOOR = 14
+# Server checkout is authoritative. This floor is used only to format local
+# fallback estimates when the plan catalog has not loaded yet.
+PRICE_PER_CREDIT_CENTS_FLOOR = 27
 
 
 def is_loopback_url(url: str) -> bool:
