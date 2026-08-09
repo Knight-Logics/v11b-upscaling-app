@@ -2842,6 +2842,7 @@ class V11BApp(tk.Tk):
         self._compare_regen_pending: bool = False
         self.preview_cancel_event = threading.Event()
         self.preview_current_process: subprocess.Popen[str] | None = None
+        self.preview_cancel_button: ttk.Button | None = None
         self.preview_progress_var = tk.DoubleVar(value=0.0)
         self.preview_status_var = tk.StringVar(value="Load a source to build three previews.")
         self.preview_crop_mode_var = tk.StringVar(value="Detail crop (fast)")
@@ -4682,7 +4683,14 @@ class V11BApp(tk.Tk):
             maximum=100,
             style="Total.Horizontal.TProgressbar",
         ).pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
-        ttk.Button(preview_row, text="Cancel preview", command=self._cancel_preview, style="Danger.TButton").pack(side=RIGHT)
+        self.preview_cancel_button = ttk.Button(
+            preview_row,
+            text="Cancel preview",
+            command=self._cancel_preview,
+            style="Danger.TButton",
+            state=tk.DISABLED,
+        )
+        self.preview_cancel_button.pack(side=RIGHT)
         ttk.Label(controls, textvariable=self.preview_status_var, style="Hint.TLabel").pack(anchor=W, pady=(4, 0))
 
         top_copy = ttk.Frame(box, style="Panel.TFrame")
@@ -4970,6 +4978,7 @@ class V11BApp(tk.Tk):
             return
         self._cancel_preview()
         self.preview_cancel_event = threading.Event()
+        self._set_preview_cancel_enabled(True)
         self.preview_progress_var.set(0.0)
         self.preview_status_var.set("Reading source metadata…")
         self.preview_crop_center = (0.5, 0.5)
@@ -6790,10 +6799,18 @@ class V11BApp(tk.Tk):
         )
         self.preview_progress_var.set(100.0)
         self.preview_status_var.set("Cached preview ready instantly.")
+        self._set_preview_cancel_enabled(False)
         return True
+
+    def _set_preview_cancel_enabled(self, enabled: bool) -> None:
+        button = self.preview_cancel_button
+        if button is None or not button.winfo_exists():
+            return
+        button.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
     def _cancel_preview(self) -> None:
         self.preview_cancel_event.set()
+        self._set_preview_cancel_enabled(False)
         process = self.preview_current_process
         if process is not None and process.poll() is None:
             try:
@@ -7376,6 +7393,7 @@ class V11BApp(tk.Tk):
         crop_mode = self.preview_crop_mode_var.get()
         crop_center = tuple(self.preview_crop_center)
         cache_key = self._compare_cache_key_for_pct(pct)
+        self._set_preview_cancel_enabled(True)
         self.preview_progress_var.set(max(45.0, self.preview_progress_var.get()))
         self.preview_status_var.set("Preparing selected AI preview…")
         self.log_queue.put("[INFO] Preparing before/after compare frame...")
@@ -7658,6 +7676,8 @@ class V11BApp(tk.Tk):
             if self._compare_regen_pending:
                 self._compare_regen_pending = False
                 self.after(120, lambda: self._generate_compare_frame(silent=True))
+            else:
+                self.after(0, lambda: self._set_preview_cancel_enabled(False))
 
     def _open_large_compare_window(self) -> None:
         if self.compare_window and self.compare_window.winfo_exists():

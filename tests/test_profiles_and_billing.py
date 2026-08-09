@@ -145,6 +145,27 @@ class CompareHonestyTests(unittest.TestCase):
         self.assertEqual(chosen, 50.0)
 
 
+class PreviewUiStateTests(unittest.TestCase):
+    def test_preview_cancel_button_tracks_active_work(self) -> None:
+        class FakeButton:
+            def __init__(self) -> None:
+                self.state = None
+
+            def winfo_exists(self) -> bool:
+                return True
+
+            def configure(self, **kwargs) -> None:
+                self.state = kwargs.get("state")
+
+        app = object.__new__(APP.V11BApp)
+        app.preview_cancel_button = FakeButton()
+
+        app._set_preview_cancel_enabled(True)
+        self.assertEqual(app.preview_cancel_button.state, APP.tk.NORMAL)
+        app._set_preview_cancel_enabled(False)
+        self.assertEqual(app.preview_cancel_button.state, APP.tk.DISABLED)
+
+
 class BillingRegressionTests(unittest.TestCase):
     def test_stop_handler_does_not_add_or_restore_credits(self) -> None:
         tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
