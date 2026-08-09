@@ -22,10 +22,10 @@ Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, 
 
 | Content | Preferred free engine | Notes |
 |---|---|---|
-| People / camera | **SPAN Photo / RealSR DF2K** | Fast DirectML preview; benchmark-leading RealSR final presets |
+| People / camera | **SPAN Photo / RealSR DF2K** | Fast DirectML preview; quality-first RealSR final presets |
 | Anime / game | **ModernSpanimation / Real-CUGAN SE** | Fast current SPAN preview; conservative Real-CUGAN detail presets |
 | Old / noisy | **SRMD** (+ RealSR JPEG quality) | Fast denoise + restore |
-| Compatible NVIDIA RTX SDR | **NVIDIA VSR Ultra** (optional pack) | Content-aware clean, standard, denoise, and deblur modes |
+| Compatible NVIDIA RTX SDR | **NVIDIA VSR Ultra** (optional pack) | Measured speed/quality option; modes stay inside NVIDIA's valid operation combinations |
 | Frame interpolation | **RIFE v4.25** (recommended) | 4.22-lite for previews; 4.26 available as the newer optional model |
 
 ## Recommended First Run
@@ -48,7 +48,7 @@ The engine uses NVIDIA VFX Video Super Resolution 0.1.0.1. NVIDIA VFX is proprie
 
 DirectML SPAN video processing preserves high-bit sources as RGB48 through FP32 ONNX inference and feeds RGB48 directly to the final 10-bit encoder. The directory-only NCNN/RIFE and Pillow still-preview paths remain 8-bit; HDR metadata is preserved, but the bundled SPAN models are not advertised as HDR-trained models.
 
-PixelForge does not make an unmeasured universal "better than Topaz" claim. See `QUALITY_BENCHMARK.md` and `tools/compare_topaz.py` for the matched-source gate used before category-specific quality claims.
+PixelForge does not make an unmeasured universal "better than Topaz" claim. The v1.0.20 matched-source video run covers live action, animation, restoration, interlacing, and 30-to-60 FPS motion with full-reference VMAF/SSIM/PSNR. It refined the RTX animation mode to Ultra, confirmed Real-CUGAN as the quality-first animation path, and quantified the RTX path's large speed advantage on supported live-action sources. See `QUALITY_BENCHMARK.md`, `tools/benchmark_representative_video.py`, and `tools/compare_topaz.py` for the evidence and reproducible claim gate.
 
 ## Secrets and Billing Configuration
 

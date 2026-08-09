@@ -93,7 +93,7 @@ class ProfilePresetTests(unittest.TestCase):
     def test_nvidia_profiles_use_official_rtx_vsr_with_content_modes(self) -> None:
         expected_modes = {
             "live": "auto-standard",
-            "animation": "auto-clean",
+            "animation": "auto-standard",
             "restore": "auto-restore",
         }
         for content, mode in expected_modes.items():

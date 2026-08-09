@@ -122,7 +122,7 @@ def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
     if speed_name == "nvidia":
         preset["nvidia_vsr_mode"] = {
             "live": "auto-standard",
-            "animation": "auto-clean",
+            "animation": "auto-standard",
             "restore": "auto-restore",
         }[content_name]
     if content_name == "restore" and speed_name == "balanced":
