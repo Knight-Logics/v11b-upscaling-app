@@ -17,9 +17,11 @@ Turn `process_full_video_ultimate.py` into a finished desktop upscaling app for 
 ## Current Status
 - GUI includes adjustable settings for:
   - model, scale, threads, image format
-  - denoise and color controls
-  - sharpen controls
+  - denoise and color controls (sliders)
+  - sharpen controls (sliders)
   - interpolation and target FPS
   - final scaling, CRF, encoder preset, audio include
   - clip range (start time and duration)
-- Includes runtime estimator and speed-focused profiles (Fast Draft, Balanced, Quality).
+  - three-frame filmstrip preview with selectable AI compare frame
+- Includes runtime estimator and speed-focused profiles (Quick Preview, Balanced, Max Detail).
+- Main profile buttons use equal-width grid layout.

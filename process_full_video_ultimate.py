@@ -1,6 +1,6 @@
 """PixelForge AI - Video Upscaling Application.
 
-Single-file desktop app for Real-ESRGAN upscaling with configurable preprocessing,
+Single-file desktop app for Real-ESRGAN / Real-CUGAN / SRMD / RealSR upscaling with configurable preprocessing,
 sharpening, interpolation, scaling, encoding, and runtime estimation.
 """
 
@@ -17,6 +17,7 @@ import ctypes
 import platform
 import re
 import smtplib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,8 +26,10 @@ import time
 import traceback
 import uuid
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Callable
 from email.mime.text import MIMEText
 from pathlib import Path
 from queue import Empty, Queue
@@ -87,6 +90,18 @@ if PIL_AVAILABLE:
 
 MODEL_DETAILS = [
     (
+        "nvidia-rtx-vsr",
+        "nvidia-rtx-vsr (NVIDIA RTX Video Super Resolution Ultra — optional pack)",
+    ),
+    (
+        "span-photo-x4",
+        "span-photo-x4 (Modern SPAN photo/detail 4x — DirectML)",
+    ),
+    (
+        "span-modern-animation-x2",
+        "span-modern-animation-x2 (Modern animation restore 2x — DirectML)",
+    ),
+    (
         "realesrgan-x4plus",
         "realesrgan-x4plus (General real-world footage: natural videos/images)",
     ),
@@ -130,6 +145,50 @@ MODEL_DETAILS = [
         "waifu2x-anime-noise1",
         "waifu2x-anime-noise1 (2x/4x | Anime style: fastest, mild denoise)",
     ),
+    (
+        "realcugan-se-x2-n0",
+        "realcugan-se-x2-n0 (Anime | Real-CUGAN SE 2x conservative detail)",
+    ),
+    (
+        "realcugan-se-x2-n1",
+        "realcugan-se-x2-n1 (Anime | Real-CUGAN SE 2x mild denoise — recommended)",
+    ),
+    (
+        "realcugan-se-x2-n3",
+        "realcugan-se-x2-n3 (Anime | Real-CUGAN SE 2x strong denoise)",
+    ),
+    (
+        "realcugan-se-x3-n3",
+        "realcugan-se-x3-n3 (Anime | Real-CUGAN SE 3x strong denoise)",
+    ),
+    (
+        "realcugan-se-x4-n3",
+        "realcugan-se-x4-n3 (Anime | Real-CUGAN SE 4x strong denoise)",
+    ),
+    (
+        "realcugan-pro-x2-n3",
+        "realcugan-pro-x2-n3 (Anime | Real-CUGAN Pro 2x strong denoise)",
+    ),
+    (
+        "realcugan-pro-x3-n3",
+        "realcugan-pro-x3-n3 (Anime | Real-CUGAN Pro 3x strong denoise)",
+    ),
+    (
+        "srmd-x2-n5",
+        "srmd-x2-n5 (Restore | SRMD 2x denoise 5 — fast noisy footage)",
+    ),
+    (
+        "srmd-x4-n5",
+        "srmd-x4-n5 (Restore | SRMD 4x denoise 5)",
+    ),
+    (
+        "srmd-x4-n8",
+        "srmd-x4-n8 (Restore | SRMD 4x denoise 8 — heavy compression)",
+    ),
+    (
+        "srmd-x4-nf",
+        "srmd-x4-nf (Restore | SRMD 4x no denoise)",
+    ),
 ]
 MODEL_OPTIONS = [key for key, _label in MODEL_DETAILS]
 MODEL_KEY_TO_LABEL = {key: label for key, label in MODEL_DETAILS}
@@ -149,98 +208,82 @@ WAIFU2X_MODEL_CONFIGS: dict[str, tuple[str, str]] = {
     "waifu2x-anime-noise1": ("models-upconv_7_anime_style_art_rgb",  "1"),
 }
 
-# Native model scales must match the bundled NCNN network. Passing 2x or 3x to
-# an x4-only network can produce tiled/cropped output instead of a true upscale.
-MODEL_NATIVE_SCALES: dict[str, set[int]] = {
-    "realesrgan-x4plus": {4},
-    "realesrgan-x4plus-anime": {4},
-    "realesr-animevideov3-x2": {2},
-    "realesr-animevideov3-x3": {3},
-    "realesr-animevideov3-x4": {4},
-    "realsr-df2k": {4},
-    "realsr-df2k-jpeg": {4},
-    "waifu2x-cunet-noise3": {1, 2, 4},
-    "waifu2x-cunet-noise1": {1, 2, 4},
-    "waifu2x-anime-noise3": {1, 2, 4},
-    "waifu2x-anime-noise1": {1, 2, 4},
-}
+# Ensure local package imports work for source runs and PyInstaller.
+_APP_DIR = Path(__file__).resolve().parent
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
 
-
-def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
-    """Return a tested, internally compatible preset without touching Tk state."""
-    if speed_name not in {"fast", "balanced", "quality"}:
-        raise ValueError(f"Unknown speed profile: {speed_name}")
-    if content_name not in {"live", "animation", "restore"}:
-        raise ValueError(f"Unknown content profile: {content_name}")
-
-    preset: dict[str, object] = {
-        # Neutral image processing is the safe baseline. The previous automatic
-        # color/sharpen stack visibly shifted skin tones and amplified halos.
-        "denoise": 0.0,
-        "enable_color": False,
-        "vibrance": 0.0,
-        "contrast": 1.0,
-        "brightness": 0.0,
-        "saturation": 1.0,
-        "gamma": 1.0,
-        "enable_sharpen": False,
-        "cas_strength": 0.20,
-        "unsharp1": 0.0,
-        "unsharp2": 0.0,
-        # Interpolation changes motion rather than image detail, so it remains
-        # an explicit Advanced option instead of a surprise Max Detail cost.
-        "enable_interpolation": False,
-        "target_fps": 30,
-        "apply_final_scale": False,
-    }
-
-    if speed_name == "fast":
-        preset.update(image_format="jpg", encode_preset="veryfast", crf=22)
-    elif speed_name == "quality":
-        preset.update(image_format="png", encode_preset="slow", crf=16)
-    else:
-        preset.update(image_format="png", encode_preset="medium", crf=17)
-
-    content_presets: dict[str, dict[str, tuple[str, int]]] = {
-        "live": {
-            "fast": ("realesr-animevideov3-x2", 2),
-            "balanced": ("waifu2x-cunet-noise1", 2),
-            "quality": ("realesrgan-x4plus", 4),
-        },
-        "animation": {
-            "fast": ("realesr-animevideov3-x2", 2),
-            "balanced": ("realesr-animevideov3-x3", 3),
-            "quality": ("realesr-animevideov3-x4", 4),
-        },
-        "restore": {
-            "fast": ("waifu2x-cunet-noise1", 2),
-            "balanced": ("waifu2x-cunet-noise3", 2),
-            "quality": ("realsr-df2k-jpeg", 4),
-        },
-    }
-    model, scale = content_presets[content_name][speed_name]
-    preset.update(model=model, scale=scale)
-    return preset
+# Native scales + presets live in pixelforge.presets (live footage never uses waifu2x).
+from pixelforge.presets import (  # noqa: E402
+    CONTENT_LABELS as PRESET_CONTENT_LABELS,
+    CONTENT_PICKER_COPY,
+    MODEL_NATIVE_SCALES,
+    SPEED_LABELS as PRESET_SPEED_LABELS,
+    get_profile_preset,
+)
+from pixelforge.compare import (  # noqa: E402
+    align_before_after_images,
+    build_compare_timestamp_plan,
+    mean_luma,
+    pick_default_filmstrip_pct,
+)
+from pixelforge.billing_client import (  # noqa: E402
+    DEFAULT_KNIGHT_API,
+    PIXELFORGE_PACKS,
+    KnightAccountClient,
+)
+from pixelforge.engines import (  # noqa: E402
+    ENGINE_COST_FACTORS,
+    REALCUGAN_MODEL_CONFIGS,
+    RIFE_MODEL_DETAILS as ENGINE_RIFE_MODEL_DETAILS,
+    SRMD_MODEL_CONFIGS,
+)
+from pixelforge.onnx_upscale import (  # noqa: E402
+    MODEL_CATALOG as ONNX_MODEL_CATALOG,
+    OnnxUpscaler,
+)
+from pixelforge.targets import OUTPUT_TARGETS, target_dimensions  # noqa: E402
+from pixelforge.media import (  # noqa: E402
+    VIDEO_CODEC_OPTIONS,
+    available_ffmpeg_encoders,
+    color_metadata_args,
+    deinterlace_filter,
+    ensure_workspace_capacity,
+    estimate_workspace_bytes,
+    probe_media,
+    video_encode_args,
+)
+from pixelforge.quality import assess_quality  # noqa: E402
+from pixelforge.nvidia import (  # noqa: E402
+    NVIDIA_MODEL_KEY,
+    NvidiaHardware,
+    NvidiaWorker,
+    activate_nvidia_pack,
+    detect_nvidia_hardware,
+    discover_nvidia_worker,
+    download_nvidia_pack,
+    frame_rate_choice,
+    install_nvidia_pack,
+    nvidia_worker_command,
+)
 
 ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 IMAGE_FORMATS = ["png", "jpg"]
 IMAGE_INPUT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 FPS_OPTIONS = [24, 30, 48, 60]
+FRAME_RATE_TARGETS = ("Keep source", "Smooth 60 FPS")
 
 INTERP_ENGINE_OPTIONS = ["RIFE (GPU — fast, high quality)", "minterpolate (CPU — slower, compatible)"]
 INTERP_ENGINE_RIFE     = "RIFE (GPU — fast, high quality)"
 INTERP_ENGINE_MINTERP  = "minterpolate (CPU — slower, compatible)"
 
-# RIFE model options: key in rife-models/, label shown in UI
-RIFE_MODEL_DETAILS = [
-    ("rife-v4.6", "rife-v4.6  (recommended — fast, high quality)"),
-    ("rife-v4",   "rife-v4    (legacy baseline)"),
-]
+# RIFE model options: key in rife-models/, label shown in UI (TNTwise newer models included)
+RIFE_MODEL_DETAILS = list(ENGINE_RIFE_MODEL_DETAILS)
 RIFE_MODEL_OPTIONS   = [key for key, _label in RIFE_MODEL_DETAILS]
 RIFE_MODEL_KEY_TO_LABEL = {key: label for key, label in RIFE_MODEL_DETAILS}
 RIFE_MODEL_LABEL_TO_KEY = {label: key for key, label in RIFE_MODEL_DETAILS}
 TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.20"
 
 # ---------------------------------------------------------------------------
 # Legacy recovery token helpers (developer mode only)
@@ -519,6 +562,14 @@ _WAIFU2X_MODELS_DIR: Path = _resolve_runtime_path("waifu2x-models")
 
 _RIFE_EXE: Path = _resolve_runtime_path("rife-ncnn-vulkan.exe")
 _RIFE_MODELS_DIR: Path = _resolve_runtime_path("rife-models")
+
+_REALCUGAN_EXE: Path = _resolve_runtime_path("realcugan-ncnn-vulkan.exe")
+_REALCUGAN_MODELS_DIR: Path = _resolve_runtime_path("realcugan-models")
+
+_SRMD_EXE: Path = _resolve_runtime_path("srmd-ncnn-vulkan.exe")
+_SRMD_MODELS_DIR: Path = _resolve_runtime_path("models-srmd")
+
+_ONNX_MODELS_DIR: Path = _resolve_runtime_path("onnx-models")
 
 
 def _configure_stripe_tls_bundle() -> None:
@@ -1134,126 +1185,25 @@ def _pixelforge_machine_id() -> str:
     return hashlib.sha256(f"pixelforge-ai-device-v1|{source}".encode("utf-8", errors="ignore")).hexdigest()
 
 
-class RemoteBillingBackend:
-    """Server-authoritative PixelForge credits, checkout, and anonymous diagnostics."""
+class RemoteBillingBackend(KnightAccountClient):
+    """Compatibility wrapper: PixelForge talks to the live pixelforge-license API."""
 
-    PLAN_BY_CREDITS = {32: "starter_32", 68: "creator_68", 144: "pro_144"}
+    PLAN_BY_CREDITS = KnightAccountClient.PLAN_BY_CREDITS
 
     def __init__(self, api_base: str, machine_id: str, app_version: str):
-        self.api_base = str(api_base or "").strip().rstrip("/")
-        self.machine_id = machine_id
-        self.app_version = app_version
-        self.stripe_mode = "server"
-        self.price_per_credit_cents = 16
-        parsed = urlparse(self.api_base)
-        if parsed.scheme != "https" and not _is_loopback_url(self.api_base):
-            raise RuntimeError("PixelForge billing requires HTTPS (or a loopback developer server).")
-
-    @property
-    def endpoint(self) -> str:
-        return f"{self.api_base}/api/pixelforge-license"
-
-    def _post(self, action: str, payload: dict | None = None, timeout: int = 20, allow_error: bool = False) -> dict:
-        body = {
-            "action": action,
-            "machine_id": self.machine_id,
-            "app_version": self.app_version,
-            **(payload or {}),
-        }
-        request = Request(
-            self.endpoint,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                data = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
-        except HTTPError as exc:
-            try:
-                data = json.loads(exc.read().decode("utf-8", errors="replace") or "{}")
-            except Exception:
-                data = {"ok": False, "error": f"Billing server returned HTTP {exc.code}."}
-            data.setdefault("ok", False)
-            data["http_status"] = int(exc.code)
-            if allow_error:
-                return data
-            raise RuntimeError(str(data.get("error") or f"Billing server returned HTTP {exc.code}.")) from exc
-        except (URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"Could not reach PixelForge billing: {exc}") from exc
-        if not isinstance(data, dict):
-            raise RuntimeError("PixelForge billing returned an invalid response.")
-        if not data.get("ok", False) and not allow_error:
-            raise RuntimeError(str(data.get("error") or "PixelForge billing request failed."))
-        return data
-
-    def get_status(self, token: str = "") -> dict:
-        return self._post("status")
-
-    def reserve_credits(self, token: str, credits: int, metadata: dict | None = None) -> dict:
-        return self._post(
-            "reserve",
-            {
-                "credits": int(credits),
-                "metadata": metadata or {},
-                "event_id": uuid.uuid4().hex,
-            },
-            allow_error=True,
-        )
-
-    def commit_reservation(self, token: str, reservation_id: str) -> dict:
-        last_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                return self._post("commit", {"reservation_id": reservation_id})
-            except Exception as exc:
-                last_error = exc
-                if attempt < 2:
-                    time.sleep(0.6 * (attempt + 1))
-        raise RuntimeError(str(last_error or "Could not commit the render charge."))
-
-    def release_reservation(self, token: str, reservation_id: str) -> dict:
-        return self._post("release", {"reservation_id": reservation_id}, allow_error=True)
-
-    def create_checkout_session(
-        self,
-        token: str,
-        credits: int,
-        charge_cents: int | None = None,
-        package_name: str | None = None,
-        success_url_override: str | None = None,
-        cancel_url_override: str | None = None,
-    ) -> dict:
-        plan_id = self.PLAN_BY_CREDITS.get(int(credits))
-        if not plan_id:
-            raise RuntimeError("Choose one of the displayed PixelForge credit packages.")
-        return self._post(
-            "create_checkout",
-            {
-                "plan_id": plan_id,
-                "success_url": str(success_url_override or ""),
-                "cancel_url": str(cancel_url_override or ""),
-                "event_id": uuid.uuid4().hex,
-            },
-        )
-
-    def confirm_checkout_session(self, session_id: str) -> dict:
-        return self._post(
-            "confirm_session",
-            {"session_id": str(session_id), "event_id": uuid.uuid4().hex},
-        )
-
-    def record_event(self, event_name: str, metadata: dict | None = None) -> dict:
-        return self._post(
-            "event",
-            {
-                "event_name": event_name,
-                "event_id": uuid.uuid4().hex,
-                "metadata": metadata or {},
-            },
-            timeout=8,
-            allow_error=True,
-        )
+        base = str(api_base or "").strip().rstrip("/")
+        # Never send traffic to undeployed /api/knight-account (404 = no checkout / no income).
+        if base.endswith("/api/knight-account"):
+            base = base[: -len("/api/knight-account")] + "/api/pixelforge-license"
+        elif base.endswith("/api/pixelforge-license"):
+            pass
+        elif "/api/" not in base:
+            base = f"{base}/api/pixelforge-license"
+        else:
+            # Unknown API path — still require HTTPS via parent ctor.
+            base = base
+        super().__init__(base, machine_id, app_version, product_id="pixelforge")
+        self.price_per_credit_cents = 14
 
 
 @dataclass
@@ -1287,8 +1237,15 @@ class PipelineSettings:
     target_height: int
     crf: int
     encode_preset: str
+    video_codec: str
+    prefer_hardware_encode: bool
+    preserve_media: bool
+    chunk_size: int
+    resume_job: bool
     include_audio: bool
     keep_intermediate: bool
+    auto_deinterlace: bool = True
+    nvidia_vsr_mode: str = "auto-standard"
 
 
 class PipelineRunner:
@@ -1615,8 +1572,12 @@ class PipelineRunner:
         duration = duration_override if duration_override is not None else cls.get_video_duration(video_path)
         return max(1, int(duration * fps))
 
-    def _build_pre_filter(self) -> str | None:
+    def _build_pre_filter(self, media_props=None) -> str | None:
         filters: list[str] = []
+        if media_props is not None:
+            interlace_filter = deinterlace_filter(media_props, self.settings.auto_deinterlace)
+            if interlace_filter:
+                filters.append(interlace_filter)
         if self.settings.denoise > 0:
             value = f"{self.settings.denoise:.2f}"
             filters.append(f"hqdn3d={value}:{value}")
@@ -1658,18 +1619,775 @@ class PipelineRunner:
             args.extend(["-t", str(self.settings.clip_duration)])
         return args
 
+    def _upscale_onnx_directory(
+        self,
+        model_key: str,
+        frames_in: Path,
+        frames_out: Path,
+        expected_frames: int,
+    ) -> None:
+        """Run a modern ONNX model once per frame with one shared DirectML session."""
+        if not PIL_AVAILABLE:
+            raise RuntimeError("Pillow is required for the DirectML upscale engines")
+        model = ONNX_MODEL_CATALOG.get(model_key)
+        if model is None:
+            raise ValueError(f"Unknown ONNX model: {model_key}")
+        model_path = _ONNX_MODELS_DIR / model.filename
+        runner = OnnxUpscaler(model_path, model.scale, tile_size=256, context=16)
+        self.log(f"[INFO] ONNX provider: {runner.provider}")
+        candidates = sorted(
+            item for item in frames_in.iterdir()
+            if item.is_file() and item.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        total = max(1, len(candidates) or int(expected_frames))
+        frames_out.mkdir(parents=True, exist_ok=True)
+        self._set_stage_progress(2, 0.0, stage_name="DirectML AI upscale")
+        for index, source_path in enumerate(candidates, start=1):
+            if self.stop_event.is_set():
+                raise RuntimeError("Canceled by user")
+            destination = frames_out / source_path.name
+            if destination.is_file() and destination.stat().st_size > 0:
+                if not self.settings.keep_intermediate:
+                    source_path.unlink(missing_ok=True)
+                self._set_stage_progress(2, index / total, stage_name="DirectML AI upscale (resumed)")
+                continue
+            with Image.open(source_path) as source:
+                enhanced = runner.upscale_image(source, cancel_event=self.stop_event)
+            if self.settings.image_format == "jpg":
+                enhanced.save(destination, format="JPEG", quality=95, subsampling=0)
+            else:
+                enhanced.save(destination, format="PNG", compress_level=1)
+            if not self.settings.keep_intermediate:
+                source_path.unlink(missing_ok=True)
+            self._set_stage_progress(2, index / total, stage_name="DirectML AI upscale")
+        if not candidates:
+            completed = sum(1 for item in frames_out.iterdir() if item.is_file())
+            if completed < expected_frames:
+                raise FileNotFoundError(f"No decoded frames found in {frames_in}")
+            self._set_stage_progress(2, 1.0, stage_name="DirectML AI upscale (resumed)")
+        completed = sum(1 for item in frames_out.iterdir() if item.is_file())
+        if completed < expected_frames:
+            raise RuntimeError(f"DirectML upscale produced {completed:,} of {expected_frames:,} expected frames")
+
+    @staticmethod
+    def _read_exact(stream, byte_count: int) -> bytes:
+        """Read one raw-video frame even when a pipe returns partial chunks."""
+        chunks: list[bytes] = []
+        remaining = int(byte_count)
+        while remaining > 0:
+            chunk = stream.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _resolve_nvidia_worker(self) -> NvidiaWorker:
+        worker = discover_nvidia_worker(_APP_DIR, _PERSISTENT_DATA_DIR)
+        if worker is None:
+            raise FileNotFoundError(
+                "The optional NVIDIA RTX engine pack is not installed. Use Install RTX in PixelForge, "
+                "then retry. The standard DirectML/Vulkan profiles remain available."
+            )
+        return worker
+
+    def _nvidia_native_output_dimensions(self, width: int, height: int) -> tuple[int, int]:
+        """Use the requested deliverable directly, bounded by NVIDIA VSR's 4x limit."""
+        source_w = max(1, int(width))
+        source_h = max(1, int(height))
+        if self.settings.apply_final_scale:
+            desired_w = max(1, int(self.settings.target_width))
+            desired_h = max(1, int(self.settings.target_height))
+        else:
+            desired_w = source_w * 4
+            desired_h = source_h * 4
+        # VSR does not downscale. Same-resolution modes enhance/restore; FFmpeg
+        # performs any requested downscale in the one final encode.
+        output_w = max(source_w, min(desired_w, source_w * 4))
+        output_h = max(source_h, min(desired_h, source_h * 4))
+        return output_w, output_h
+
+    def _nvidia_quality_for_dimensions(self, width: int, height: int, output_width: int, output_height: int) -> str:
+        mode = str(self.settings.nvidia_vsr_mode or "auto-standard")
+        same_resolution = int(width) == int(output_width) and int(height) == int(output_height)
+        if same_resolution:
+            return {
+                "auto-clean": "deblur-low",
+                "auto-restore": "denoise-high",
+                "auto-standard": "deblur-medium",
+            }.get(mode, mode if mode.startswith(("denoise-", "deblur-")) else "deblur-medium")
+        return {
+            "auto-clean": "clean-ultra",
+            "auto-restore": "ultra",
+            "auto-standard": "ultra",
+        }.get(mode, mode if not mode.startswith(("denoise-", "deblur-")) else "ultra")
+
+    def _start_nvidia_worker(
+        self,
+        width: int,
+        height: int,
+        output_width: int,
+        output_height: int,
+        *,
+        stderr,
+    ) -> subprocess.Popen[bytes]:
+        worker = self._resolve_nvidia_worker()
+        quality = self._nvidia_quality_for_dimensions(width, height, output_width, output_height)
+        command = nvidia_worker_command(
+            worker,
+            [
+                "--width", str(width),
+                "--height", str(height),
+                "--output-width", str(output_width),
+                "--output-height", str(output_height),
+                "--quality", quality,
+            ],
+        )
+        environment = os.environ.copy()
+        environment.setdefault("PIXELFORGE_NVIDIA_CACHE", str(_PERSISTENT_DATA_DIR / "nvidia-cache"))
+        self.log(
+            f"[INFO] NVIDIA RTX worker: {worker.source} | mode={quality} | "
+            f"{width}x{height} -> {output_width}x{output_height}"
+        )
+        return subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            env=environment,
+            creationflags=_NO_WINDOW,
+            bufsize=0,
+        )
+
+    def _upscale_nvidia_directory(
+        self,
+        frames_in: Path,
+        frames_out: Path,
+        expected_frames: int,
+    ) -> None:
+        if not PIL_AVAILABLE:
+            raise RuntimeError("Pillow is required for NVIDIA RTX image/frame processing")
+        candidates = sorted(
+            item for item in frames_in.iterdir()
+            if item.is_file() and item.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        if not candidates:
+            completed = sum(1 for item in frames_out.iterdir() if item.is_file())
+            if completed >= expected_frames:
+                self._set_stage_progress(2, 1.0, stage_name="NVIDIA RTX VSR (resumed)")
+                return
+            raise FileNotFoundError(f"No decoded frames found in {frames_in}")
+        with Image.open(candidates[0]) as first:
+            width, height = first.size
+        output_width, output_height = self._nvidia_native_output_dimensions(width, height)
+        input_bytes = width * height * 3
+        output_bytes = output_width * output_height * 3
+        frames_out.mkdir(parents=True, exist_ok=True)
+        worker_log = tempfile.TemporaryFile(mode="w+b")
+        worker_process = self._start_nvidia_worker(
+            width, height, output_width, output_height, stderr=worker_log
+        )
+        try:
+            if worker_process.stdin is None or worker_process.stdout is None:
+                raise RuntimeError("Unable to open NVIDIA RTX worker pipes")
+            total = max(1, len(candidates) or int(expected_frames))
+            for index, source_path in enumerate(candidates, start=1):
+                if self.stop_event.is_set():
+                    raise RuntimeError("Canceled by user")
+                destination = frames_out / source_path.name
+                if destination.is_file() and destination.stat().st_size > 0:
+                    if not self.settings.keep_intermediate:
+                        source_path.unlink(missing_ok=True)
+                    self._set_stage_progress(2, index / total, stage_name="NVIDIA RTX VSR (resumed)")
+                    continue
+                with Image.open(source_path) as source:
+                    rgb = source.convert("RGB")
+                    if rgb.size != (width, height):
+                        raise RuntimeError("NVIDIA frame sequence changed dimensions unexpectedly")
+                    payload = rgb.tobytes()
+                if len(payload) != input_bytes:
+                    raise RuntimeError("NVIDIA input frame has an unexpected byte size")
+                worker_process.stdin.write(payload)
+                worker_process.stdin.flush()
+                restored = self._read_exact(worker_process.stdout, output_bytes)
+                if len(restored) != output_bytes:
+                    worker_log.seek(0)
+                    details = worker_log.read().decode("utf-8", errors="replace")[-4000:]
+                    raise RuntimeError(f"NVIDIA RTX worker returned a partial frame.\n{details}")
+                enhanced = Image.frombytes("RGB", (output_width, output_height), restored)
+                if self.settings.image_format == "jpg":
+                    enhanced.save(destination, format="JPEG", quality=95, subsampling=0)
+                else:
+                    enhanced.save(destination, format="PNG", compress_level=1)
+                if not self.settings.keep_intermediate:
+                    source_path.unlink(missing_ok=True)
+                self._set_stage_progress(2, index / total, stage_name="NVIDIA RTX Video Super Resolution")
+            worker_process.stdin.close()
+            worker_code = worker_process.wait(timeout=30)
+            if worker_code != 0:
+                worker_log.seek(0)
+                details = worker_log.read().decode("utf-8", errors="replace")[-4000:]
+                raise RuntimeError(f"NVIDIA RTX worker failed with exit code {worker_code}.\n{details}")
+        finally:
+            if worker_process.poll() is None:
+                worker_process.terminate()
+            worker_log.close()
+        completed = sum(1 for item in frames_out.iterdir() if item.is_file())
+        if completed < expected_frames:
+            raise RuntimeError(f"NVIDIA RTX VSR produced {completed:,} of {expected_frames:,} expected frames")
+
+    def _run_onnx_streaming_video(
+        self,
+        *,
+        model_key: str,
+        input_path: Path,
+        output_path: Path,
+        media_props,
+        source_fps: float,
+        frame_count: int,
+        work_duration: float,
+        pre_filter: str | None,
+        post_filter: str | None,
+        interpolation_enabled: bool,
+    ) -> None:
+        """Decode -> AI worker -> final encoder with one frame resident at a time."""
+        uses_nvidia = model_key == NVIDIA_MODEL_KEY
+        model = None if uses_nvidia else ONNX_MODEL_CATALOG[model_key]
+        runner = None if uses_nvidia else OnnxUpscaler(
+            _ONNX_MODELS_DIR / model.filename, model.scale, tile_size=256, context=16
+        )
+        if runner is not None:
+            self.log(f"[INFO] ONNX provider: {runner.provider}")
+
+        high_precision = bool(media_props.is_hdr or media_props.is_high_bit_depth)
+        if uses_nvidia and high_precision:
+            raise RuntimeError(
+                "NVIDIA RTX VSR currently accepts 8-bit SDR frames. Keep the precision guard enabled so "
+                "HDR/10-bit media uses the FP32 DirectML profile."
+            )
+        raw_pix_fmt = "rgb48le" if high_precision else "rgb24"
+        sample_dtype = None if runner is None else (runner.np.dtype("<u2") if high_precision else runner.np.uint8)
+        bytes_per_sample = 2 if high_precision else 1
+        input_width = int(media_props.width)
+        input_height = int(media_props.height)
+        if uses_nvidia:
+            output_width, output_height = self._nvidia_native_output_dimensions(input_width, input_height)
+        else:
+            output_width = input_width * model.scale
+            output_height = input_height * model.scale
+        input_frame_bytes = input_width * input_height * 3 * bytes_per_sample
+        output_frame_bytes = output_width * output_height * 3 * bytes_per_sample
+
+        if high_precision:
+            self.log(
+                "[INFO] High-bit DirectML path active: FFmpeg rgb48le -> FP32 ONNX inference -> "
+                "rgb48le final encoder input (no 8-bit frame quantization)."
+            )
+            if media_props.is_hdr:
+                self.log(
+                    "[WARN] HDR transfer/color metadata is preserved, but the selected SPAN model was not "
+                    "trained specifically for scene-linear HDR imagery."
+                )
+        elif uses_nvidia:
+            self.log("[INFO] SDR NVIDIA RTX VSR streaming path active: no decoded or enhanced frame directories.")
+        else:
+            self.log("[INFO] SDR DirectML streaming path active: no decoded or enhanced frame directories.")
+
+        decode_command = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        decode_command += self._trim_input_args()
+        decode_command += ["-i", str(input_path), "-map", "0:v:0", "-vsync", "0"]
+        if pre_filter:
+            decode_command += ["-vf", pre_filter]
+        decode_command += ["-f", "rawvideo", "-pix_fmt", raw_pix_fmt, "pipe:1"]
+
+        suffix = output_path.suffix.lower()
+        if suffix not in {".mp4", ".mkv", ".mov"}:
+            raise ValueError("Streaming video output must use .mp4, .mkv, or .mov.")
+        if self.settings.video_codec == "ProRes 422 HQ" and suffix != ".mov":
+            raise ValueError("ProRes 422 HQ requires a .mov output file.")
+
+        encode_args, encoder_label = video_encode_args(
+            self.settings.video_codec,
+            prefer_hardware=self.settings.prefer_hardware_encode,
+            crf=self.settings.crf,
+            encode_preset=self.settings.encode_preset,
+            source=media_props,
+            encoders=available_ffmpeg_encoders(),
+        )
+        encode_filters = [value for value in [post_filter] if value]
+        final_fps = float(source_fps)
+        if interpolation_enabled:
+            encode_filters.append(
+                f"minterpolate=fps={self.settings.target_fps}:mi_mode=mci:mc_mode=aobmc:"
+                "me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"
+            )
+            final_fps = float(self.settings.target_fps)
+
+        encode_command = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pixel_format", raw_pix_fmt,
+            "-video_size", f"{output_width}x{output_height}",
+            "-framerate", f"{source_fps:.8f}", "-i", "pipe:0",
+        ]
+        encode_command += self._trim_input_args()
+        encode_command += ["-i", str(input_path), "-map", "0:v:0"]
+        if self.settings.include_audio:
+            encode_command += ["-map", "1:a?"] if self.settings.preserve_media else ["-map", "1:a:0?"]
+        if self.settings.preserve_media:
+            encode_command += ["-map", "1:s?", "-map_metadata", "1", "-map_chapters", "1"]
+            if suffix == ".mkv":
+                encode_command += ["-map", "1:t?"]
+        encode_command += encode_args
+        if encode_filters:
+            encode_command += ["-vf", ",".join(encode_filters)]
+        encode_command += color_metadata_args(media_props)
+        if self.settings.include_audio:
+            encode_command += ["-c:a", "copy"]
+        if self.settings.preserve_media and media_props.subtitle_streams:
+            encode_command += ["-c:s", "mov_text" if suffix in {".mp4", ".mov"} else "copy"]
+        if self.settings.preserve_media and suffix == ".mkv" and media_props.attachment_streams:
+            encode_command += ["-c:t", "copy"]
+        encode_command += ["-t", f"{work_duration:.6f}", "-max_muxing_queue_size", "4096"]
+        if suffix in {".mp4", ".mov"}:
+            encode_command += ["-movflags", "+faststart"]
+        encode_command.append(str(output_path))
+
+        self.log("[1/6] Streaming source frames (bounded memory)")
+        self.log("[2/6] NVIDIA RTX Video Super Resolution" if uses_nvidia else "[2/6] DirectML AI upscale")
+        self.log("[3/6] Post-processing in final FFmpeg graph" if post_filter else "[3/6] Post-processing skipped")
+        self.log("[4/6] No intermediate video or frame checkpoint encode")
+        self.log("[5/6] FFmpeg minterpolate in final graph" if interpolation_enabled else "[5/6] Interpolation skipped")
+        self.log(f"[6/6] Single final encode and media mux — {encoder_label}")
+
+        decoded_log = tempfile.TemporaryFile(mode="w+b")
+        encoded_log = tempfile.TemporaryFile(mode="w+b")
+        decoder = None
+        encoder = None
+        ai_worker = None
+        ai_worker_log = tempfile.TemporaryFile(mode="w+b") if uses_nvidia else None
+        processed = 0
+        try:
+            encoder = subprocess.Popen(
+                encode_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=encoded_log,
+                creationflags=_NO_WINDOW,
+                bufsize=0,
+            )
+            self.current_process = encoder
+            if uses_nvidia:
+                ai_worker = self._start_nvidia_worker(
+                    input_width,
+                    input_height,
+                    output_width,
+                    output_height,
+                    stderr=ai_worker_log,
+                )
+            decoder = subprocess.Popen(
+                decode_command,
+                stdout=subprocess.PIPE,
+                stderr=decoded_log,
+                creationflags=_NO_WINDOW,
+                bufsize=0,
+            )
+            if decoder.stdout is None or encoder.stdin is None:
+                raise RuntimeError("Unable to open the AI streaming pipes")
+            if uses_nvidia and (ai_worker is None or ai_worker.stdin is None or ai_worker.stdout is None):
+                raise RuntimeError("Unable to open the NVIDIA RTX worker pipes")
+
+            while True:
+                if self.stop_event.is_set():
+                    raise RuntimeError("Canceled by user")
+                raw_frame = self._read_exact(decoder.stdout, input_frame_bytes)
+                if not raw_frame:
+                    break
+                if len(raw_frame) != input_frame_bytes:
+                    raise RuntimeError(
+                        f"FFmpeg returned a partial raw frame ({len(raw_frame):,} of {input_frame_bytes:,} bytes)"
+                    )
+                if uses_nvidia:
+                    ai_worker.stdin.write(raw_frame)
+                    ai_worker.stdin.flush()
+                    payload = self._read_exact(ai_worker.stdout, output_frame_bytes)
+                    if len(payload) != output_frame_bytes:
+                        ai_worker_log.seek(0)
+                        details = ai_worker_log.read().decode("utf-8", errors="replace")[-4000:]
+                        raise RuntimeError(f"NVIDIA RTX worker returned a partial frame.\n{details}")
+                else:
+                    source = runner.np.frombuffer(raw_frame, dtype=sample_dtype).reshape(input_height, input_width, 3)
+                    enhanced = runner.upscale_array(source, cancel_event=self.stop_event)
+                    if high_precision:
+                        payload = enhanced.astype("<u2", copy=False).tobytes(order="C")
+                    else:
+                        payload = enhanced.tobytes(order="C")
+                encoder.stdin.write(payload)
+                processed += 1
+                fraction = min(0.99, processed / max(1, frame_count))
+                self._set_stage_progress(1, fraction, stage_name="stream decode")
+                self._set_stage_progress(
+                    2,
+                    fraction,
+                    stage_name="NVIDIA RTX VSR" if uses_nvidia else "DirectML AI upscale",
+                )
+                self._set_stage_progress(6, fraction, stage_name="single final encode")
+
+            decoder.stdout.close()
+            decoder_code = decoder.wait()
+            if ai_worker is not None:
+                ai_worker.stdin.close()
+                ai_worker_code = ai_worker.wait(timeout=30)
+                if ai_worker_code != 0:
+                    ai_worker_log.seek(0)
+                    details = ai_worker_log.read().decode("utf-8", errors="replace")[-4000:]
+                    raise RuntimeError(f"NVIDIA RTX worker failed with exit code {ai_worker_code}.\n{details}")
+            encoder.stdin.close()
+            encoder_code = encoder.wait()
+            self.current_process = None
+            if decoder_code != 0 or encoder_code != 0:
+                decoded_log.seek(0)
+                encoded_log.seek(0)
+                details = (decoded_log.read() + b"\n" + encoded_log.read()).decode("utf-8", errors="replace")[-6000:]
+                raise RuntimeError(
+                    f"Streaming pipeline failed (decoder={decoder_code}, encoder={encoder_code}).\n{details}"
+                )
+        except Exception:
+            for process in (decoder, ai_worker, encoder):
+                if process is not None and process.poll() is None:
+                    process.terminate()
+            raise
+        finally:
+            self.current_process = None
+            decoded_log.close()
+            encoded_log.close()
+            if ai_worker_log is not None:
+                ai_worker_log.close()
+
+        if processed < 1 or not output_path.is_file():
+            raise RuntimeError("Streaming pipeline produced no output frames")
+        output_duration = self.get_video_duration(output_path)
+        duration_drift = output_duration - work_duration
+        output_frame_count = self.get_frame_count(output_path)
+        self.log(
+            f"Integrity check: expected {work_duration:.3f}s, output {output_duration:.3f}s, "
+            f"drift {duration_drift:+.3f}s."
+        )
+        self.log(
+            f"Frame summary: streamed {processed:,}, output {output_frame_count:,}, "
+            f"output FPS {self.get_fps(output_path):.3f} (target {final_fps:.3f})"
+        )
+        self.log(
+            f"Media preserved: audio={media_props.audio_streams if self.settings.include_audio else 0}, "
+            f"subtitles={media_props.subtitle_streams if self.settings.preserve_media else 0}, "
+            f"chapters={media_props.chapters if self.settings.preserve_media else 0}."
+        )
+        self._set_stage_progress(1, 1.0, stage_name="stream decode complete")
+        self._set_stage_progress(2, 1.0, stage_name="NVIDIA RTX VSR complete" if uses_nvidia else "DirectML upscale complete")
+        self._set_stage_progress(3, 1.0, stage_name="post-processing complete")
+        self._set_stage_progress(4, 1.0, stage_name="frame stream complete")
+        self._set_stage_progress(5, 1.0, stage_name="interpolation complete")
+        self._emit_progress(100.0, stage_index=6, stage_fraction=1.0, stage_name="finalizing output")
+        self.log("=" * 78)
+        self.log("Completed successfully")
+        self.log(f"Output: {output_path}")
+        self.log(f"Output size: {output_path.stat().st_size / 1024**2:.2f} MB")
+        self.log("=" * 78)
+
+    @staticmethod
+    def _replace_command_path(cmd: list[str], flag: str, value: Path) -> list[str]:
+        updated = list(cmd)
+        index = updated.index(flag) + 1
+        updated[index] = str(value)
+        return updated
+
+    def _run_upscale_in_chunks(
+        self,
+        base_cmd: list[str],
+        frames_in: Path,
+        frames_out: Path,
+        frame_count: int,
+        engine_label: str,
+        work_dir: Path,
+    ) -> None:
+        """Bound native-engine directory scans and make completed batches resumable."""
+        candidates = sorted(
+            item for item in frames_in.iterdir()
+            if item.is_file() and item.suffix.lower() == f".{self.settings.image_format.lower()}"
+        )
+        total = max(1, len(candidates) or frame_count)
+        chunk_size = max(30, int(self.settings.chunk_size))
+        chunks_root = work_dir / "upscale_chunks"
+        chunks_root.mkdir(parents=True, exist_ok=True)
+
+        for chunk_index, start in enumerate(range(0, len(candidates), chunk_size), start=1):
+            batch = candidates[start:start + chunk_size]
+            missing = [item for item in batch if not (frames_out / item.name).is_file()]
+            if not missing:
+                if not self.settings.keep_intermediate:
+                    for source in batch:
+                        source.unlink(missing_ok=True)
+                self._set_stage_progress(2, min(1.0, (start + len(batch)) / total), stage_name=f"{engine_label} upscale (resumed)")
+                continue
+            chunk_root = chunks_root / f"chunk_{chunk_index:06d}"
+            chunk_in = chunk_root / "in"
+            chunk_out = chunk_root / "out"
+            chunk_in.mkdir(parents=True, exist_ok=True)
+            chunk_out.mkdir(parents=True, exist_ok=True)
+            for source in missing:
+                link = chunk_in / source.name
+                if not link.exists():
+                    try:
+                        os.link(source, link)
+                    except OSError:
+                        shutil.copy2(source, link)
+
+            command = self._replace_command_path(base_cmd, "-i", chunk_in)
+            command = self._replace_command_path(command, "-o", chunk_out)
+            self._run_command(command, f"{engine_label} batch {chunk_index}", 2)
+            for rendered in chunk_out.iterdir():
+                if rendered.is_file():
+                    destination = frames_out / rendered.name
+                    if destination.exists():
+                        destination.unlink()
+                    rendered.replace(destination)
+            incomplete = [item.name for item in missing if not (frames_out / item.name).is_file()]
+            if incomplete:
+                raise RuntimeError(
+                    f"{engine_label} batch {chunk_index} did not render {len(incomplete)} frame(s); "
+                    f"first missing frame: {incomplete[0]}"
+                )
+            if not self.settings.keep_intermediate:
+                for source in batch:
+                    source.unlink(missing_ok=True)
+            completed = sum(1 for item in frames_out.iterdir() if item.is_file())
+            self._set_stage_progress(2, min(1.0, completed / total), stage_name=f"{engine_label} upscale")
+            shutil.rmtree(chunk_root, ignore_errors=True)
+
+        shutil.rmtree(chunks_root, ignore_errors=True)
+        completed = sum(1 for item in frames_out.iterdir() if item.is_file())
+        if completed < frame_count:
+            raise RuntimeError(f"{engine_label} produced {completed:,} of {frame_count:,} expected frames")
+
+    @staticmethod
+    def _checkpoint_load(path: Path) -> dict[str, object]:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"completed": []}
+
+    @staticmethod
+    def _checkpoint_mark(path: Path, checkpoint: dict[str, object], stage: str, **values: object) -> None:
+        completed = list(checkpoint.get("completed", []))
+        if stage not in completed:
+            completed.append(stage)
+        checkpoint.update(values)
+        checkpoint["completed"] = completed
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(checkpoint, indent=2, sort_keys=True), encoding="utf-8")
+        temp_path.replace(path)
+
+    def _finalize_video_from_frames(
+        self,
+        *,
+        source_frame_dir: Path,
+        frame_pattern: str,
+        frame_count: int,
+        effective_source_fps: float,
+        work_duration: float,
+        input_path: Path,
+        output_path: Path,
+        work_dir: Path,
+        checkpoint_path: Path,
+        checkpoint: dict[str, object],
+        media_props,
+        interpolation_enabled: bool,
+    ) -> None:
+        """Interpolate before the only lossy encode, then preserve compatible streams."""
+        self.log("[4/6] Preparing final frame stream (no intermediate H.264 encode)")
+        self._set_stage_progress(4, 1.0, stage_name="frame stream ready")
+
+        final_frame_dir = source_frame_dir
+        final_pattern = frame_pattern
+        final_fps = effective_source_fps
+        encode_filter: str | None = None
+
+        if interpolation_enabled and self.settings.interp_engine == INTERP_ENGINE_RIFE:
+            self.log(f"[5/6] Frame interpolation — RIFE (model: {self.settings.rife_model})")
+            rife_frames_out = work_dir / "rife_out"
+            rife_frames_out.mkdir(exist_ok=True)
+            if not _RIFE_EXE.exists():
+                raise FileNotFoundError(f"rife-ncnn-vulkan.exe not found: {_RIFE_EXE}")
+            rife_model_path = _RIFE_MODELS_DIR / self.settings.rife_model
+            if not rife_model_path.exists():
+                raise FileNotFoundError(f"RIFE model not found: {rife_model_path}")
+            fps_factor = max(2, round(self.settings.target_fps / max(1.0, effective_source_fps)))
+            expected_rife_frames = frame_count * fps_factor
+            existing_rife_frames = sum(1 for item in rife_frames_out.iterdir() if item.suffix.lower() == ".png")
+            if "interpolation" in checkpoint.get("completed", []) and existing_rife_frames >= expected_rife_frames - 2:
+                self.log(f"[INFO] Resuming: reusing {existing_rife_frames:,} interpolated frames")
+                self._set_stage_progress(5, 1.0, stage_name="RIFE interpolation (resumed)")
+            else:
+                rife_cmd = [
+                    str(_RIFE_EXE),
+                    "-i", str(source_frame_dir),
+                    "-o", str(rife_frames_out),
+                    "-m", str(rife_model_path),
+                    "-f", "frame_%08d.png",
+                    "-j", "4:4:4",
+                ]
+                if max(self.settings.target_width, self.settings.target_height) >= 1440:
+                    rife_cmd.append("-u")
+                rife_cmd.extend(["-n", str(expected_rife_frames)])
+                self._run_command(
+                    rife_cmd,
+                    "RIFE interpolation",
+                    5,
+                    progress_mode="upscale",
+                    progress_target=expected_rife_frames,
+                    progress_path=rife_frames_out,
+                )
+                self._checkpoint_mark(checkpoint_path, checkpoint, "interpolation")
+            final_frame_dir = rife_frames_out
+            final_pattern = "frame_%08d.png"
+            final_fps = float(self.settings.target_fps)
+        elif interpolation_enabled:
+            self.log("[5/6] Frame interpolation — FFmpeg minterpolate during final encode")
+            encode_filter = (
+                f"minterpolate=fps={self.settings.target_fps}:mi_mode=mci:mc_mode=aobmc:"
+                "me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"
+            )
+            final_fps = float(self.settings.target_fps)
+            self._set_stage_progress(5, 1.0, stage_name="minterpolate planned")
+        else:
+            self.log("[5/6] Skipping interpolation")
+            self._set_stage_progress(5, 1.0, stage_name="interpolation (skipped)")
+
+        if self.settings.video_codec == "Image sequence (PNG)":
+            sequence_dir = output_path.with_suffix("").with_name(output_path.stem + "_frames")
+            sequence_dir.mkdir(parents=True, exist_ok=True)
+            for index, source in enumerate(sorted(final_frame_dir.glob(final_pattern.replace("%08d", "*"))), start=1):
+                destination = sequence_dir / f"frame_{index:08d}.png"
+                if source.suffix.lower() == ".png":
+                    shutil.copy2(source, destination)
+                else:
+                    self._run_command(
+                        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), str(destination)],
+                        "image sequence conversion",
+                        6,
+                    )
+            (sequence_dir / "media-properties.json").write_text(
+                json.dumps(vars(media_props), indent=2, sort_keys=True), encoding="utf-8"
+            )
+            self.log(f"Image sequence written to: {sequence_dir}")
+            self._emit_progress(100.0, stage_index=6, stage_fraction=1.0, stage_name="image sequence complete")
+            return
+
+        suffix = output_path.suffix.lower()
+        if suffix not in {".mp4", ".mkv", ".mov"}:
+            raise ValueError("Video output must use .mp4, .mkv, or .mov (or choose Image sequence).")
+        if self.settings.video_codec == "ProRes 422 HQ" and suffix != ".mov":
+            raise ValueError("ProRes 422 HQ requires a .mov output file.")
+
+        encoders = available_ffmpeg_encoders()
+        encode_args, encoder_label = video_encode_args(
+            self.settings.video_codec,
+            prefer_hardware=self.settings.prefer_hardware_encode,
+            crf=self.settings.crf,
+            encode_preset=self.settings.encode_preset,
+            source=media_props,
+            encoders=encoders,
+        )
+        self.log(f"[6/6] Final encode and media mux — {encoder_label}")
+        command = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
+            "-framerate", f"{final_fps:.8f}",
+            "-i", str(final_frame_dir / final_pattern),
+        ]
+        command += self._trim_input_args()
+        command += ["-i", str(input_path), "-map", "0:v:0"]
+        if self.settings.include_audio:
+            command += ["-map", "1:a?"] if self.settings.preserve_media else ["-map", "1:a:0?"]
+        if self.settings.preserve_media:
+            command += ["-map", "1:s?", "-map_metadata", "1", "-map_chapters", "1"]
+            if suffix == ".mkv":
+                command += ["-map", "1:t?"]
+        command += encode_args
+        if encode_filter:
+            command += ["-vf", encode_filter]
+        command += color_metadata_args(media_props)
+        if self.settings.include_audio:
+            command += ["-c:a", "copy"]
+        if self.settings.preserve_media and media_props.subtitle_streams:
+            command += ["-c:s", "mov_text" if suffix in {".mp4", ".mov"} else "copy"]
+        if self.settings.preserve_media and suffix == ".mkv" and media_props.attachment_streams:
+            command += ["-c:t", "copy"]
+        command += ["-t", f"{work_duration:.6f}", "-max_muxing_queue_size", "4096"]
+        if suffix in {".mp4", ".mov"}:
+            command += ["-movflags", "+faststart"]
+        command.append(str(output_path))
+        self._run_command(command, "final encode and media mux", 6, progress_mode="time", progress_target=work_duration)
+        self._checkpoint_mark(checkpoint_path, checkpoint, "finalize", output=str(output_path))
+
+        output_duration = self.get_video_duration(output_path)
+        duration_drift = output_duration - work_duration
+        duration_drift_pct = (abs(duration_drift) / max(0.001, work_duration)) * 100.0
+        output_fps = self.get_fps(output_path)
+        output_frame_count = self.get_frame_count(output_path)
+        self.log(
+            f"Integrity check: expected {work_duration:.3f}s, output {output_duration:.3f}s, "
+            f"drift {duration_drift:+.3f}s ({duration_drift_pct:.2f}%)."
+        )
+        self.log(
+            f"Media preserved: audio={media_props.audio_streams if self.settings.include_audio else 0}, "
+            f"subtitles={media_props.subtitle_streams if self.settings.preserve_media else 0}, "
+            f"chapters={media_props.chapters if self.settings.preserve_media else 0}, "
+            f"attachments={media_props.attachment_streams if self.settings.preserve_media and suffix == '.mkv' else 0}."
+        )
+        self.log(f"Frame summary: source {frame_count:,}, output {output_frame_count:,}, output FPS {output_fps:.3f}")
+        if media_props.is_hdr or media_props.is_high_bit_depth:
+            self.log(
+                "[WARN] HDR/10-bit metadata and a 10-bit delivery codec were preserved, but current NCNN/Pillow "
+                "AI inference is RGB 8-bit. Full precision HDR inference requires a future float/16-bit model path."
+            )
+
+        if not self.settings.keep_intermediate:
+            self.log("Cleaning completed checkpoint workspace…")
+            shutil.rmtree(work_dir, ignore_errors=True)
+        self.log("=" * 78)
+        self.log("Completed successfully")
+        self.log(f"Output: {output_path}")
+        self.log(f"Output size: {output_path.stat().st_size / 1024**2:.2f} MB")
+        self.log("=" * 78)
+        self._emit_progress(100.0, stage_index=6, stage_fraction=1.0, stage_name="finalizing output")
+
     def run(self) -> None:
         input_path = self.settings.input_video
         output_path = self.settings.output_video
         model_key = self.settings.model
 
         # Determine which binary family handles this model
-        if model_key.startswith("realsr-"):
+        uses_onnx = model_key in ONNX_MODEL_CATALOG
+        uses_nvidia = model_key == NVIDIA_MODEL_KEY
+        if uses_nvidia:
+            worker = self._resolve_nvidia_worker()
+            exe_path = Path(worker.command[0])
+            exe_label = "NVIDIA RTX VSR"
+        elif uses_onnx:
+            exe_path = _ONNX_MODELS_DIR / ONNX_MODEL_CATALOG[model_key].filename
+            exe_label = "SPAN DirectML"
+        elif model_key.startswith("realsr-"):
             exe_path = _REALSR_EXE
             exe_label = "RealSR"
         elif model_key.startswith("waifu2x-"):
             exe_path = _WAIFU2X_EXE
             exe_label = "Waifu2x"
+        elif model_key.startswith("realcugan-"):
+            exe_path = _REALCUGAN_EXE
+            exe_label = "Real-CUGAN"
+        elif model_key.startswith("srmd-"):
+            exe_path = _SRMD_EXE
+            exe_label = "SRMD"
         else:
             exe_path = _REALESRGAN_EXE
             exe_label = "Real-ESRGAN"
@@ -1682,10 +2400,24 @@ class PipelineRunner:
         if not exe_path.exists():
             raise FileNotFoundError(
                 f"{exe_label} exe not found (looked in bundled/app paths; final candidate: {exe_path})\n"
-                f"Download {exe_label} from its GitHub releases page and place it next to PixelForge-AI.exe."
+                f"Reinstall the latest PixelForge AI build; the selected engine/model is missing."
             )
 
-        if model_key.startswith("realsr-"):
+        if uses_nvidia:
+            hardware = detect_nvidia_hardware()
+            if not hardware.supported:
+                raise RuntimeError(f"NVIDIA RTX VSR is unavailable: {hardware.reason}")
+            self.log(
+                f"[INFO] NVIDIA RTX hardware: {hardware.name} | driver={hardware.driver} | "
+                f"VRAM={hardware.vram_mb} MiB | CUDA capability={hardware.compute_capability}"
+            )
+        elif uses_onnx:
+            model = ONNX_MODEL_CATALOG[model_key]
+            self.log(
+                f"[INFO] Modern model: {model.label} | license={model.license_name} | "
+                f"attribution={model.attribution}"
+            )
+        elif model_key.startswith("realsr-"):
             self.log(f"[INFO] RealSR models dir: {_REALSR_MODELS_DIR}")
             if not _REALSR_MODELS_DIR.exists():
                 raise FileNotFoundError(
@@ -1714,6 +2446,31 @@ class PipelineRunner:
                     f"Waifu2x model subfolder '{waifu_subdir}' not found inside {_WAIFU2X_MODELS_DIR}\n"
                     f"Make sure waifu2x-models/{waifu_subdir}/ contains the .bin and .param files."
                 )
+        elif model_key.startswith("realcugan-"):
+            cfg = REALCUGAN_MODEL_CONFIGS.get(model_key)
+            if not cfg:
+                raise ValueError(f"Unknown Real-CUGAN model key: {model_key}")
+            family_dir = _REALCUGAN_MODELS_DIR / f"models-{cfg['family']}"
+            self.log(
+                f"[INFO] Real-CUGAN models dir: {family_dir} | scale={cfg['scale']} noise={cfg['noise']}"
+            )
+            if not family_dir.exists():
+                raise FileNotFoundError(
+                    f"Real-CUGAN models folder not found: {family_dir}\n"
+                    f"Expected realcugan-models/models-se (and models-pro) next to PixelForge-AI.exe."
+                )
+        elif model_key.startswith("srmd-"):
+            cfg = SRMD_MODEL_CONFIGS.get(model_key)
+            if not cfg:
+                raise ValueError(f"Unknown SRMD model key: {model_key}")
+            self.log(
+                f"[INFO] SRMD models dir: {_SRMD_MODELS_DIR} | scale={cfg['scale']} noise={cfg['noise']}"
+            )
+            if not _SRMD_MODELS_DIR.exists():
+                raise FileNotFoundError(
+                    f"SRMD models folder not found: {_SRMD_MODELS_DIR}\n"
+                    f"Expected models-srmd/ next to PixelForge-AI.exe."
+                )
         else:
             self.log(f"[INFO] Real-ESRGAN models dir: {_REALESRGAN_MODELS_DIR}")
             if not _REALESRGAN_MODELS_DIR.exists():
@@ -1724,6 +2481,7 @@ class PipelineRunner:
 
         duration_full = self.get_video_duration(input_path)
         source_fps = self.get_fps(input_path)
+        media_props = probe_media(input_path)
         source_r_fps_text = self._ffprobe_value(input_path, "r_frame_rate")
         source_r_fps = source_fps
         try:
@@ -1743,7 +2501,12 @@ class PipelineRunner:
 
         frame_count = self.get_frame_count(input_path, duration_override=work_duration)
         initial_frame_count = frame_count
-        pre_filter = self._build_pre_filter()
+        pre_filter = self._build_pre_filter(media_props)
+        if media_props.is_interlaced:
+            if self.settings.auto_deinterlace:
+                self.log(f"[INFO] Interlaced source detected ({media_props.field_order}); automatic BWDIF correction active.")
+            else:
+                self.log("[WARN] Interlaced source detected but automatic deinterlacing is disabled.")
         post_filter = self._build_post_filter()
         interpolation_enabled = self.settings.enable_interpolation and self.settings.target_fps > int(round(source_fps))
 
@@ -1755,16 +2518,75 @@ class PipelineRunner:
             interpolation_enabled=interpolation_enabled,
         )
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        can_stream_ai = (
+            (uses_onnx or uses_nvidia)
+            and not self.is_image_input(input_path)
+            and not self.is_image_output(output_path)
+            and self.settings.video_codec != "Image sequence (PNG)"
+            and not self.settings.keep_intermediate
+            and not (interpolation_enabled and self.settings.interp_engine == INTERP_ENGINE_RIFE)
+        )
+        if can_stream_ai:
+            if self.settings.resume_job:
+                self.log(
+                    "[INFO] Bounded-memory AI streaming selected. This path restarts the video after an "
+                    "interruption; choose RIFE, image sequence, or Keep intermediate files when frame checkpoints "
+                    "are required."
+                )
+            self._run_onnx_streaming_video(
+                model_key=model_key,
+                input_path=input_path,
+                output_path=output_path,
+                media_props=media_props,
+                source_fps=source_fps,
+                frame_count=frame_count,
+                work_duration=work_duration,
+                pre_filter=pre_filter,
+                post_filter=post_filter,
+                interpolation_enabled=interpolation_enabled,
+            )
+            return
+
         runtime_root = Path(tempfile.gettempdir()) / "pixelforge_runtime"
         runtime_root.mkdir(parents=True, exist_ok=True)
-        work_dir = runtime_root / f"v11b_work_{stamp}_{uuid.uuid4().hex[:8]}"
+        job_payload = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(self.settings).items()
+        }
+        job_payload["input_mtime_ns"] = input_path.stat().st_mtime_ns
+        job_key = hashlib.sha256(json.dumps(job_payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+        if self.settings.resume_job:
+            work_dir = runtime_root / "jobs" / job_key
+        else:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            work_dir = runtime_root / f"pixelforge_work_{stamp}_{uuid.uuid4().hex[:8]}"
         frames_in = work_dir / "frames_in"
         frames_out = work_dir / "frames_out"
         frames_final = work_dir / "frames_final"
         work_dir.mkdir(parents=True, exist_ok=True)
         frames_in.mkdir(exist_ok=True)
         frames_out.mkdir(exist_ok=True)
+        checkpoint_path = work_dir / "checkpoint.json"
+        checkpoint = self._checkpoint_load(checkpoint_path) if self.settings.resume_job else {"completed": []}
+
+        interpolation_factor = (
+            max(2, round(self.settings.target_fps / max(1.0, source_fps)))
+            if interpolation_enabled else 1
+        )
+        required_bytes = estimate_workspace_bytes(
+            media_props.width,
+            media_props.height,
+            frame_count,
+            self.settings.scale,
+            image_format=self.settings.image_format,
+            post_enabled=bool(post_filter),
+            interpolation_factor=interpolation_factor,
+        )
+        required_bytes, free_bytes = ensure_workspace_capacity(work_dir, required_bytes)
+        self.log(
+            f"[INFO] Disk preflight passed: estimated {required_bytes / 1024**3:.1f} GiB required, "
+            f"{free_bytes / 1024**3:.1f} GiB free."
+        )
 
         frame_pattern = f"frame_%08d.{self.settings.image_format}"
 
@@ -1782,28 +2604,49 @@ class PipelineRunner:
         self._emit_progress(0.0, stage_index=1, stage_fraction=0.0, stage_name="frame extraction")
 
         # 1) Extract frames
-        self.log("[1/6] Extracting frames")
-        extract_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info"]
-        extract_cmd += self._trim_input_args()
-        if self.is_image_input(input_path):
-            extract_cmd += ["-loop", "1"]
-        extract_cmd += ["-i", str(input_path)]
-        if self.is_image_input(input_path):
-            extract_cmd += ["-frames:v", "1"]
-        # Keep all decoded frames; prevents dup/drop sync behavior that shortens output videos.
-        extract_cmd += ["-vsync", "0"]
-        # Prefer explicit passthrough on newer ffmpeg builds for variable frame rate inputs.
-        extract_cmd += ["-fps_mode", "passthrough"]
-        if pre_filter:
-            extract_cmd += ["-vf", pre_filter]
-        if self.settings.image_format == "jpg":
-            extract_cmd += ["-q:v", "2"]
+        frame_suffix = f".{self.settings.image_format}"
+        decoded_names = {
+            item.name for item in frames_in.iterdir()
+            if item.is_file() and item.suffix.lower() == frame_suffix
+        }
+        enhanced_names = {
+            item.name for item in frames_out.iterdir()
+            if item.is_file() and item.suffix.lower() == frame_suffix
+        }
+        known_frame_names = decoded_names | enhanced_names
+        extracted_existing = len(known_frame_names)
+        extraction_resumed = "extraction" in checkpoint.get("completed", []) and extracted_existing > 0
+        if extraction_resumed:
+            self.log(
+                f"[1/6] Resuming: reusing {len(decoded_names):,} decoded and "
+                f"{len(enhanced_names):,} enhanced frame checkpoints"
+            )
+            self._set_stage_progress(1, 1.0, stage_name="frame extraction (resumed)")
         else:
-            extract_cmd += ["-qscale:v", "1"]
-        extract_cmd += [str(frames_in / frame_pattern)]
-        self._run_command(extract_cmd, "frame extraction", 1, progress_mode="frames", progress_target=frame_count)
+            self.log("[1/6] Extracting frames")
+            extract_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info"]
+            extract_cmd += self._trim_input_args()
+            if self.is_image_input(input_path):
+                extract_cmd += ["-loop", "1"]
+            extract_cmd += ["-i", str(input_path)]
+            if self.is_image_input(input_path):
+                extract_cmd += ["-frames:v", "1"]
+            extract_cmd += ["-vsync", "0", "-fps_mode", "passthrough"]
+            if pre_filter:
+                extract_cmd += ["-vf", pre_filter]
+            if self.settings.image_format == "jpg":
+                extract_cmd += ["-q:v", "2"]
+            else:
+                extract_cmd += ["-qscale:v", "1"]
+            extract_cmd += [str(frames_in / frame_pattern)]
+            self._run_command(extract_cmd, "frame extraction", 1, progress_mode="frames", progress_target=frame_count)
+            self._checkpoint_mark(checkpoint_path, checkpoint, "extraction")
 
-        extracted_count = sum(1 for item in frames_in.iterdir() if item.is_file() and item.suffix.lower() == f".{self.settings.image_format}")
+        extracted_count = len({
+            item.name for frame_dir in (frames_in, frames_out)
+            for item in frame_dir.iterdir()
+            if item.is_file() and item.suffix.lower() == frame_suffix
+        })
         if extracted_count > 0:
             frame_count = extracted_count
         effective_source_fps = max(1.0, frame_count / max(0.1, work_duration))
@@ -1823,7 +2666,13 @@ class PipelineRunner:
 
         # 2) Upscale
         self.log(f"[2/6] {exe_label} upscaling")
-        if model_key.startswith("waifu2x-"):
+        if uses_nvidia:
+            self._upscale_nvidia_directory(frames_in, frames_out, frame_count)
+            upscale_cmd = []
+        elif uses_onnx:
+            self._upscale_onnx_directory(model_key, frames_in, frames_out, frame_count)
+            upscale_cmd = []
+        elif model_key.startswith("waifu2x-"):
             waifu_subdir, waifu_noise = WAIFU2X_MODEL_CONFIGS.get(model_key, ("models-cunet", "3"))
             waifu_scale = self.settings.scale if self.settings.scale in (1, 2, 4, 8, 16, 32) else 2
             if waifu_scale != self.settings.scale:
@@ -1849,6 +2698,32 @@ class PipelineRunner:
                 "-f", self.settings.image_format,
                 "-j", self.settings.threads,
             ]
+        elif model_key.startswith("realcugan-"):
+            cfg = REALCUGAN_MODEL_CONFIGS[model_key]
+            # -c 3 = strongest sync-gap (reduces anime flicker across adjacent frames)
+            upscale_cmd = [
+                str(exe_path),
+                "-i", str(frames_in),
+                "-o", str(frames_out),
+                "-m", str(_REALCUGAN_MODELS_DIR / f"models-{cfg['family']}"),
+                "-n", str(cfg["noise"]),
+                "-s", str(cfg["scale"]),
+                "-c", "3",
+                "-f", self.settings.image_format,
+                "-j", self.settings.threads,
+            ]
+        elif model_key.startswith("srmd-"):
+            cfg = SRMD_MODEL_CONFIGS[model_key]
+            upscale_cmd = [
+                str(exe_path),
+                "-i", str(frames_in),
+                "-o", str(frames_out),
+                "-m", str(_SRMD_MODELS_DIR),
+                "-n", str(cfg["noise"]),
+                "-s", str(cfg["scale"]),
+                "-f", self.settings.image_format,
+                "-j", self.settings.threads,
+            ]
         else:
             upscale_cmd = [
                 str(exe_path),
@@ -1860,35 +2735,48 @@ class PipelineRunner:
                 "-f", self.settings.image_format,
                 "-j", self.settings.threads,
             ]
-        self.log(f"[INFO] {exe_label} upscale cmd: {' '.join(str(a) for a in upscale_cmd)}")
-        self._run_command(upscale_cmd, f"{exe_label} upscale", 2, progress_mode="upscale", progress_target=frame_count, progress_path=frames_out)
+        if upscale_cmd:
+            self.log(f"[INFO] {exe_label} upscale cmd: {' '.join(str(a) for a in upscale_cmd)}")
+            self._run_upscale_in_chunks(
+                upscale_cmd,
+                frames_in,
+                frames_out,
+                frame_count,
+                exe_label,
+                work_dir,
+            )
+        self._checkpoint_mark(checkpoint_path, checkpoint, "upscale")
         source_frame_dir = frames_out
         if post_filter:
-            self.log("[3/6] Post-processing (sharpen and/or final scale)")
             frames_final.mkdir(exist_ok=True)
-            post_cmd = [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "info",
-                "-i",
-                str(frames_out / frame_pattern),
-                "-vf",
-                post_filter,
-            ]
-            if self.settings.image_format == "jpg":
-                post_cmd += ["-q:v", "2"]
+            final_existing = sum(
+                1 for item in frames_final.iterdir()
+                if item.is_file() and item.suffix.lower() == f".{self.settings.image_format}"
+            )
+            if "post" in checkpoint.get("completed", []) and final_existing >= frame_count:
+                self.log(f"[3/6] Resuming: reusing {final_existing:,} post-processed frames")
+                self._set_stage_progress(3, 1.0, stage_name="post-processing (resumed)")
             else:
-                post_cmd += ["-qscale:v", "1"]
-            post_cmd += [str(frames_final / frame_pattern)]
-            self._run_command(post_cmd, "post-processing", 3, progress_mode="frames", progress_target=frame_count)
+                self.log("[3/6] Post-processing (sharpen and/or final scale)")
+                post_cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
+                    "-i", str(frames_out / frame_pattern), "-vf", post_filter,
+                ]
+                if self.settings.image_format == "jpg":
+                    post_cmd += ["-q:v", "2"]
+                else:
+                    post_cmd += ["-qscale:v", "1"]
+                post_cmd += [str(frames_final / frame_pattern)]
+                self._run_command(post_cmd, "post-processing", 3, progress_mode="frames", progress_target=frame_count)
+                self._checkpoint_mark(checkpoint_path, checkpoint, "post")
             source_frame_dir = frames_final
         else:
             self.log("[3/6] Skipping post-processing (disabled)")
             self._set_stage_progress(3, 1.0, stage_name="post-processing (skipped)")
 
-        if self.is_image_output(output_path):
+        if self.is_image_output(output_path) and (
+            self.is_image_input(input_path) or self.settings.video_codec != "Image sequence (PNG)"
+        ):
             self.log("[4/6] Writing image output (skipping video reassembly)")
             self._set_stage_progress(4, 1.0, stage_name="image export")
             self._set_stage_progress(5, 1.0, stage_name="interpolation (skipped)")
@@ -1911,6 +2799,23 @@ class PipelineRunner:
             self._emit_progress(100.0, stage_index=6, stage_fraction=1.0, stage_name="finalize")
             return
 
+        self._finalize_video_from_frames(
+            source_frame_dir=source_frame_dir,
+            frame_pattern=frame_pattern,
+            frame_count=frame_count,
+            effective_source_fps=effective_source_fps,
+            work_duration=work_duration,
+            input_path=input_path,
+            output_path=output_path,
+            work_dir=work_dir,
+            checkpoint_path=checkpoint_path,
+            checkpoint=checkpoint,
+            media_props=media_props,
+            interpolation_enabled=interpolation_enabled,
+        )
+        return
+
+        # Legacy implementation retained below for release-diff readability; unreachable.
         # 4) Reassemble
         self.log("[4/6] Reassembling video")
         temp_video = work_dir / "temp_reassembled.mp4"
@@ -1988,6 +2893,15 @@ class PipelineRunner:
                     "-f", "frame_%08d.png",
                     "-j", "4:4:4",
                 ]
+                # UHD mode improves high-res flow estimation (free quality win on 1440p+ frames)
+                try:
+                    rife_w = int(self._ffprobe_value(temp_video, "width") or 0)
+                    rife_h = int(self._ffprobe_value(temp_video, "height") or 0)
+                    if max(rife_w, rife_h) >= 1440:
+                        rife_cmd.append("-u")
+                        self.log(f"[INFO] RIFE UHD mode enabled ({rife_w}x{rife_h})")
+                except Exception:
+                    pass
                 # -n = total target frame count in output (N input frames × fps_factor = 2x, 3x…)
                 rife_n = extracted_rife * fps_factor
                 rife_cmd.extend(["-n", str(rife_n)])
@@ -2145,9 +3059,31 @@ class V11BApp(tk.Tk):
         self.billing_window: tk.Toplevel | None = None
         self.billing_debug_window: tk.Toplevel | None = None
         self.compare_canvas_large: tk.Canvas | None = None
+        self.filmstrip_pcts: tuple[float, ...] = (25.0, 50.0, 75.0)
+        self.filmstrip_source_images: dict[float, Image.Image] = {}
+        self.filmstrip_frame_numbers: dict[float, int] = {}
+        self.filmstrip_total_frames: int = 0
+        self.filmstrip_buttons: list[ttk.Button] = []
+        self.filmstrip_button_photos: list[ImageTk.PhotoImage | None] = [None, None, None]
+        self.filmstrip_worker_thread: threading.Thread | None = None
+        self._filmstrip_after_id: str | None = None
+        self._filmstrip_regen_pending: bool = False
+        self.compare_frame_index_var = tk.IntVar(value=1)
+        self.compare_frame_label_var = tk.StringVar(value="Sample 2 of 3")
+        self._source_preview_pil: Image.Image | None = None
+        self._compare_cache: dict[str, tuple[Image.Image, Image.Image]] = {}
+        self._compare_cache_key: str | None = None
+        self._frame_slider_widget: ttk.Scale | None = None
         self._estimate_after_id: str | None = None
         self._compare_after_id: str | None = None
         self._compare_regen_pending: bool = False
+        self.preview_cancel_event = threading.Event()
+        self.preview_current_process: subprocess.Popen[str] | None = None
+        self.preview_cancel_button: ttk.Button | None = None
+        self.preview_progress_var = tk.DoubleVar(value=0.0)
+        self.preview_status_var = tk.StringVar(value="Load a source to build three previews.")
+        self.preview_crop_mode_var = tk.StringVar(value="Detail crop (fast)")
+        self.preview_crop_center: tuple[float, float] = (0.5, 0.5)
         self._charged_token: str | None = None
         self._charged_credits: int = 0
         self._stop_requested_by_user: bool = False
@@ -2169,11 +3105,14 @@ class V11BApp(tk.Tk):
         self.stage_timing_profile = self._load_stage_timing_profile()
 
         self.speed_profile_buttons: dict[str, ttk.Button] = {}
+        self.nvidia_profile_button: ttk.Button | None = None
         self.upscaling_profile_buttons: dict[str, ttk.Button] = {}
         self.selected_speed_profile: str = "balanced"
         self.selected_upscaling_profile: str = "live"
 
         self.app_data_dir = _PERSISTENT_DATA_DIR
+        self.nvidia_hardware: NvidiaHardware = detect_nvidia_hardware()
+        self.nvidia_worker: NvidiaWorker | None = discover_nvidia_worker(_APP_DIR, self.app_data_dir)
         self.billing_tokens_file = self.app_data_dir / "pixelforge_billing_tokens.json"
         self.billing_audit_file = self.app_data_dir / "pixelforge_billing_audit.jsonl"
         self.billing_state_file = self.app_data_dir / "pixelforge_billing_state.json"
@@ -2256,6 +3195,7 @@ class V11BApp(tk.Tk):
         self._build_ui()
         self._configure_window_icons()
         self._fit_window_to_content()
+        self.after(50, self._ensure_window_visible)
         self.after(100, self._refresh_billing_status_async)
         self._start_system_detection()
         self.after(120, self._poll_log_queue)
@@ -2274,6 +3214,43 @@ class V11BApp(tk.Tk):
         y = max(0, (screen_h - height) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
+    def _clamp_window_to_visible_screen(self, width: int, height: int, x: int, y: int) -> tuple[int, int, int, int]:
+        screen_w = max(800, int(self.winfo_screenwidth()))
+        screen_h = max(600, int(self.winfo_screenheight()))
+        width = min(width, int(screen_w * 0.98))
+        height = min(height, int(screen_h * 0.95))
+        min_visible_x = min(80, max(0, width - 120))
+        min_visible_y = 0
+        max_x = max(0, screen_w - min_visible_x)
+        max_y = max(0, screen_h - 80)
+        if x < -width + min_visible_x or x > max_x or y < min_visible_y or y > max_y:
+            x = max(0, (screen_w - width) // 2)
+            y = max(0, (screen_h - height) // 2)
+        else:
+            x = max(-width + min_visible_x, min(x, max_x))
+            y = max(min_visible_y, min(y, max_y))
+        return width, height, x, y
+
+    def _ensure_window_visible(self) -> None:
+        try:
+            self.update_idletasks()
+            if self.state() == "iconic":
+                self.deiconify()
+            parts = self.geometry().split("+")
+            size = parts[0].split("x")
+            width = int(size[0])
+            height = int(size[1])
+            x = int(parts[1]) if len(parts) > 1 else 0
+            y = int(parts[2]) if len(parts) > 2 else 0
+            width, height, x, y = self._clamp_window_to_visible_screen(width, height, x, y)
+            self.geometry(f"{width}x{height}+{x}+{y}")
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(350, lambda: self.attributes("-topmost", False))
+            self.focus_force()
+        except Exception:
+            pass
+
     def _fit_window_to_content(self) -> None:
         self.update_idletasks()
         screen_w = self.winfo_screenwidth()
@@ -2285,9 +3262,9 @@ class V11BApp(tk.Tk):
         min_h = 520
         width = min(max(req_w, min_w), int(screen_w * 0.96))
         height = min(max(req_h, min_h), int(screen_h * 0.82))
-        # Preserve user's current monitor/location exactly; do not clamp to primary display.
         x = self.winfo_x()
         y = self.winfo_y()
+        width, height, x, y = self._clamp_window_to_visible_screen(width, height, x, y)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _start_update_checks(self) -> None:
@@ -2305,47 +3282,60 @@ class V11BApp(tk.Tk):
         self._update_check_after_id = self.after(45 * 60 * 1000, self._start_update_checks)
 
     def _build_variables(self) -> None:
+        default_preset = get_profile_preset("balanced", "live")
         self.input_video_var = tk.StringVar(value="")
         self.output_video_var = tk.StringVar(value="")
 
-        self.model_var = tk.StringVar(value="waifu2x-cunet-noise1")
+        self.model_var = tk.StringVar(value=str(default_preset["model"]))
         self.model_display_var = tk.StringVar(value=MODEL_KEY_TO_LABEL[self.model_var.get()])
-        self.scale_var = tk.IntVar(value=2)
-        self.image_format_var = tk.StringVar(value="png")
+        self.scale_var = tk.IntVar(value=int(default_preset["scale"]))
+        self.image_format_var = tk.StringVar(value=str(default_preset["image_format"]))
         self._auto_threads_value = self._recommend_realesrgan_threads()
         self.threads_var = tk.StringVar(value=self._auto_threads_value)
 
         self.start_time_var = tk.DoubleVar(value=0.0)
         self.clip_duration_var = tk.DoubleVar(value=0.0)
 
-        self.denoise_var = tk.DoubleVar(value=0.0)
-        self.enable_color_var = tk.BooleanVar(value=False)
-        self.vibrance_var = tk.DoubleVar(value=0.0)
-        self.contrast_var = tk.DoubleVar(value=1.0)
-        self.brightness_var = tk.DoubleVar(value=0.0)
-        self.saturation_var = tk.DoubleVar(value=1.0)
-        self.gamma_var = tk.DoubleVar(value=1.0)
+        self.denoise_var = tk.DoubleVar(value=float(default_preset["denoise"]))
+        self.enable_color_var = tk.BooleanVar(value=bool(default_preset["enable_color"]))
+        self.vibrance_var = tk.DoubleVar(value=float(default_preset["vibrance"]))
+        self.contrast_var = tk.DoubleVar(value=float(default_preset["contrast"]))
+        self.brightness_var = tk.DoubleVar(value=float(default_preset["brightness"]))
+        self.saturation_var = tk.DoubleVar(value=float(default_preset["saturation"]))
+        self.gamma_var = tk.DoubleVar(value=float(default_preset["gamma"]))
 
-        self.enable_sharpen_var = tk.BooleanVar(value=False)
-        self.cas_strength_var = tk.DoubleVar(value=0.20)
-        self.unsharp1_var = tk.DoubleVar(value=0.0)
-        self.unsharp2_var = tk.DoubleVar(value=0.0)
+        self.enable_sharpen_var = tk.BooleanVar(value=bool(default_preset["enable_sharpen"]))
+        self.cas_strength_var = tk.DoubleVar(value=float(default_preset["cas_strength"]))
+        self.unsharp1_var = tk.DoubleVar(value=float(default_preset["unsharp1"]))
+        self.unsharp2_var = tk.DoubleVar(value=float(default_preset["unsharp2"]))
 
-        self.enable_interpolation_var = tk.BooleanVar(value=False)
+        self.enable_interpolation_var = tk.BooleanVar(value=bool(default_preset["enable_interpolation"]))
+        self.auto_deinterlace_var = tk.BooleanVar(value=bool(default_preset["auto_deinterlace"]))
+        self.protect_high_bit_precision_var = tk.BooleanVar(value=True)
         self.interp_engine_var = tk.StringVar(value=INTERP_ENGINE_RIFE)
-        self.rife_model_var = tk.StringVar(value="rife-v4.6")
-        self.rife_model_display_var = tk.StringVar(value=RIFE_MODEL_KEY_TO_LABEL["rife-v4.6"])
-        self.target_fps_var = tk.IntVar(value=30)
+        self.rife_model_var = tk.StringVar(value=str(default_preset["rife_model"]))
+        self.rife_model_display_var = tk.StringVar(
+            value=RIFE_MODEL_KEY_TO_LABEL.get(str(default_preset["rife_model"]), RIFE_MODEL_KEY_TO_LABEL["rife-v4.25"])
+        )
+        self.target_fps_var = tk.IntVar(value=int(default_preset["target_fps"]))
+        self.frame_rate_target_var = tk.StringVar(value="Keep source")
+        self.nvidia_vsr_mode_var = tk.StringVar(value="auto-standard")
 
-        self.apply_final_scale_var = tk.BooleanVar(value=False)
+        self.apply_final_scale_var = tk.BooleanVar(value=bool(default_preset["apply_final_scale"]))
         self.preserve_aspect_ratio_var = tk.BooleanVar(value=True)
         self.target_width_var = tk.IntVar(value=1920)
         self.target_height_var = tk.IntVar(value=1080)
 
-        self.crf_var = tk.IntVar(value=16)
-        self.encode_preset_var = tk.StringVar(value="slow")
+        self.crf_var = tk.IntVar(value=int(default_preset["crf"]))
+        self.encode_preset_var = tk.StringVar(value=str(default_preset["encode_preset"]))
+        self.video_codec_var = tk.StringVar(value="Auto (best local)")
+        self.prefer_hardware_encode_var = tk.BooleanVar(value=True)
+        self.preserve_media_var = tk.BooleanVar(value=True)
+        self.chunk_size_var = tk.IntVar(value=240)
+        self.resume_job_var = tk.BooleanVar(value=True)
         self.include_audio_var = tk.BooleanVar(value=True)
         self.keep_intermediate_var = tk.BooleanVar(value=False)
+        self.output_target_var = tk.StringVar(value="Same resolution")
 
         self.estimate_var = tk.StringVar(value="Select input to calculate expected processing time.")
         self.estimate_summary_var = tk.StringVar(value="")
@@ -2357,6 +3347,9 @@ class V11BApp(tk.Tk):
         self.compare_frame_pct_var = tk.DoubleVar(value=50.0)
         self.profile_summary_var = tk.StringVar(value="")
         self.profile_guidance_var = tk.StringVar(value="")
+        self.quality_guard_notice_var = tk.StringVar(value="")
+        self._current_media_properties = None
+        self._current_media_properties_path = ""
         self.compare_dragging = False
         self.compare_hover_near_line = False
         self.compare_separator_x = 0
@@ -2364,7 +3357,7 @@ class V11BApp(tk.Tk):
         default_api = self.billing_api_default
         self.billing_api_base_var = tk.StringVar(value=default_api)
         self.billing_token_var = tk.StringVar(value=os.environ.get("V11B_BILLING_TOKEN", ""))
-        self.checkout_credits_var = tk.IntVar(value=25)
+        self.checkout_credits_var = tk.IntVar(value=68)
         self.checkout_session_var = tk.StringVar(value="")
         self.checkout_url_var = tk.StringVar(value="")
         self.checkout_amount_cents_override: int | None = None
@@ -2405,120 +3398,159 @@ class V11BApp(tk.Tk):
             self._refresh_billing_status(silent=True)
 
     def _configure_theme(self) -> None:
-        self.configure(bg="#0a1220")
+        self.configure(bg="#0b1220")
         style = ttk.Style(self)
         style.theme_use("clam")
 
-        field_bg = "#cfd9e8"
-        field_fg = "#000000"
+        field_bg = "#e8eef7"
+        field_fg = "#0b1220"
+        panel = "#121a2b"
+        root_bg = "#0b1220"
+        accent = "#2ad4a3"
+        accent_dim = "#1a9f78"
+        text = "#e6eefc"
+        muted = "#9aafcc"
 
-        style.configure("Root.TFrame", background="#0a1220")
-        style.configure("Panel.TFrame", background="#111b2f")
-        style.configure("TFrame", background="#111b2f")
-        style.configure("Card.TLabelframe", background="#111b2f", foreground="#6de1ff", bordercolor="#2a4b78")
-        style.configure("Card.TLabelframe.Label", background="#111b2f", foreground="#6de1ff")
-        style.configure("TLabel", background="#111b2f", foreground="#d8e6ff")
-        style.configure("Hint.TLabel", background="#111b2f", foreground="#9bb3d7")
-        # Global button system: metallic green family for consistent visual language.
+        style.configure("Root.TFrame", background=root_bg)
+        style.configure("Panel.TFrame", background=panel)
+        style.configure("TFrame", background=panel)
+        style.configure(
+            "Card.TLabelframe",
+            background=panel,
+            foreground="#8fd6ff",
+            bordercolor="#2a3f63",
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure("Card.TLabelframe.Label", background=panel, foreground="#8fd6ff", font=("Segoe UI", 10, "bold"))
+        style.configure("TLabel", background=panel, foreground=text, font=("Segoe UI", 9))
+        style.configure("Hint.TLabel", background=panel, foreground=muted, font=("Segoe UI", 9))
+        style.configure("Value.TLabel", background=panel, foreground=accent, font=("Segoe UI", 9, "bold"))
+        style.configure("Section.TLabel", background=panel, foreground="#c5d7f2", font=("Segoe UI", 9, "bold"))
+
         style.configure(
             "TButton",
-            background="#0a6f50",
-            foreground="#e8fff4",
-            bordercolor="#4ec9a3",
-            lightcolor="#38b58d",
-            darkcolor="#074c37",
-            relief="raised",
+            background="#156b52",
+            foreground="#f2fffa",
+            bordercolor="#3db892",
+            lightcolor="#2a9a74",
+            darkcolor="#0d4a38",
+            relief="flat",
+            padding=(12, 7),
+            font=("Segoe UI", 9),
         )
         style.map(
             "TButton",
-            background=[("active", "#138765"), ("pressed", "#085d44")],
-            foreground=[("active", "#f4fff9"), ("pressed", "#ddfff0")],
+            background=[("active", "#1b8364"), ("pressed", "#115743")],
+            foreground=[("active", "#ffffff"), ("pressed", "#e8fff6")],
         )
         style.configure(
             "Accent.TButton",
-            background="#23efaa",
-            foreground="#002a1d",
-            bordercolor="#b8ffdf",
-            lightcolor="#77ffd0",
-            darkcolor="#17ab7a",
-            relief="raised",
+            background=accent,
+            foreground="#042419",
+            bordercolor="#b8ffe0",
+            lightcolor="#6aefc4",
+            darkcolor=accent_dim,
+            relief="flat",
+            padding=(14, 8),
+            font=("Segoe UI", 10, "bold"),
         )
         style.map(
             "Accent.TButton",
-            background=[("active", "#45ffbf"), ("pressed", "#18cf96")],
-            foreground=[("active", "#001f15"), ("pressed", "#003122")],
+            background=[("active", "#45e7b4"), ("pressed", "#1fb888")],
+            foreground=[("active", "#031910"), ("pressed", "#042419")],
         )
         style.configure(
             "Danger.TButton",
-            background="#c43a3a",
-            foreground="#fff1f1",
-            bordercolor="#ff9e9e",
-            lightcolor="#e35b5b",
-            darkcolor="#8f2020",
-            relief="raised",
+            background="#b93838",
+            foreground="#fff5f5",
+            bordercolor="#ef8f8f",
+            lightcolor="#d45454",
+            darkcolor="#812424",
+            relief="flat",
+            padding=(12, 7),
         )
         style.map(
             "Danger.TButton",
-            background=[("active", "#dd4b4b"), ("pressed", "#a92d2d")],
+            background=[("active", "#d04848"), ("pressed", "#962c2c")],
             foreground=[("active", "#ffffff"), ("pressed", "#fff4f4")],
         )
 
-        # Speed profile buttons use one consistent metallic-green family.
         style.configure(
             "Profile.TButton",
-            background="#0b7b58",
-            foreground="#dfffee",
-            bordercolor="#67d8b4",
-            lightcolor="#44c79a",
-            darkcolor="#085b41",
-            relief="raised",
+            background="#18324f",
+            foreground="#d7e7fb",
+            bordercolor="#355985",
+            lightcolor="#25466b",
+            darkcolor="#102338",
+            relief="flat",
+            padding=(10, 11),
+            font=("Segoe UI", 9),
         )
         style.map(
             "Profile.TButton",
-            background=[("active", "#149369"), ("pressed", "#08694b")],
-            foreground=[("active", "#f0fff7"), ("pressed", "#d7ffed")],
+            background=[("active", "#214266"), ("pressed", "#152a43")],
+            foreground=[("active", "#ffffff"), ("pressed", "#d7e7fb")],
         )
         style.configure(
             "ProfileSelected.TButton",
-            background="#23efaa",
-            foreground="#002d1f",
-            bordercolor="#b8ffdf",
-            lightcolor="#7dffd0",
-            darkcolor="#16aa7a",
-            relief="sunken",
+            background=accent,
+            foreground="#042419",
+            bordercolor="#b8ffe0",
+            lightcolor="#6aefc4",
+            darkcolor=accent_dim,
+            relief="flat",
+            padding=(10, 11),
+            font=("Segoe UI", 9, "bold"),
         )
         style.map(
             "ProfileSelected.TButton",
-            background=[("active", "#47ffc2"), ("pressed", "#1ad198")],
-            foreground=[("active", "#001f15"), ("pressed", "#003021")],
+            background=[("active", "#45e7b4"), ("pressed", "#1fb888")],
+            foreground=[("active", "#031910"), ("pressed", "#042419")],
         )
-        style.configure("TNotebook", background="#0f1829", bordercolor="#284568")
-        style.configure("TNotebook.Tab", background="#1a2740", foreground="#cde2ff", padding=(12, 6))
+        style.configure("TNotebook", background="#0f1728", bordercolor="#284568")
+        style.configure("TNotebook.Tab", background="#1a2740", foreground="#cde2ff", padding=(14, 7), font=("Segoe UI", 9))
         style.map("TNotebook.Tab", background=[("selected", "#2a4f7f")])
         style.configure(
             "Total.Horizontal.TProgressbar",
             troughcolor="#0d1626",
-            background="#23efaa",
+            background=accent,
             bordercolor="#355c93",
             lightcolor="#77ffd0",
-            darkcolor="#17ab7a",
+            darkcolor=accent_dim,
+        )
+        style.configure(
+            "Horizontal.TScale",
+            background=panel,
+            troughcolor="#1a2740",
+            bordercolor="#2a3f63",
+            lightcolor=accent,
+            darkcolor=accent_dim,
+            sliderthickness=16,
         )
 
-        style.configure("TEntry", fieldbackground=field_bg, foreground=field_fg)
-        style.configure("TSpinbox", fieldbackground=field_bg, foreground=field_fg, arrowsize=12)
-        style.configure("TCombobox", fieldbackground=field_bg, foreground=field_fg, background=field_bg, arrowcolor="#0d1b30")
+        style.configure("TEntry", fieldbackground=field_bg, foreground=field_fg, padding=4)
+        style.configure("TSpinbox", fieldbackground=field_bg, foreground=field_fg, arrowsize=12, padding=3)
+        style.configure(
+            "TCombobox",
+            fieldbackground=field_bg,
+            foreground=field_fg,
+            background=field_bg,
+            arrowcolor="#0d1b30",
+            padding=3,
+        )
         style.map(
             "TCombobox",
             fieldbackground=[("readonly", field_bg), ("!disabled", field_bg)],
             foreground=[("readonly", field_fg), ("!disabled", field_fg)],
         )
-        style.configure("TCheckbutton", background="#111b2f", foreground="#d8e6ff")
+        style.configure("TCheckbutton", background=panel, foreground=text, font=("Segoe UI", 9))
         style.configure("BillingHero.TFrame", background="#13243d")
         style.configure("BillingActions.TFrame", background="#0f1829")
         style.configure("BillingStatus.TFrame", background="#0d1626")
         style.configure("BillingHeroTitle.TLabel", background="#13243d", foreground="#f5fbff", font=("Segoe UI", 18, "bold"))
         style.configure("BillingHeroSub.TLabel", background="#13243d", foreground="#b7ccea", font=("Segoe UI", 10))
-        style.configure("BillingSectionTitle.TLabel", background="#0a1220", foreground="#ecf6ff", font=("Segoe UI", 12, "bold"))
+        style.configure("BillingSectionTitle.TLabel", background=root_bg, foreground="#ecf6ff", font=("Segoe UI", 12, "bold"))
         style.configure("BillingStatus.TLabel", background="#0d1626", foreground="#d8e6ff")
         style.configure("BillingMuted.TLabel", background="#0f1829", foreground="#96abc9")
 
@@ -2536,7 +3568,7 @@ class V11BApp(tk.Tk):
 
         left_canvas = tk.Canvas(
             left_container,
-            bg="#111b2f",
+            bg="#121a2b",
             highlightthickness=0,
             borderwidth=0,
         )
@@ -2562,7 +3594,7 @@ class V11BApp(tk.Tk):
         left_panel.bind("<MouseWheel>", _on_mousewheel)
 
         right_panel = ttk.Frame(content, style="Panel.TFrame")
-        right_panel.pack(side=RIGHT, fill=BOTH, padx=(10, 0))
+        right_panel.pack(side=RIGHT, fill=BOTH, expand=True, padx=(10, 0))
 
         self._build_input_section(left_panel)
         self._build_profile_section(left_panel)
@@ -2716,7 +3748,7 @@ class V11BApp(tk.Tk):
         header.pack(fill=X)
         header.columnconfigure(1, weight=1)
 
-        logo_label = tk.Label(header, bg="#111b2f")
+        logo_label = tk.Label(header, bg="#121a2b")
         logo_label.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(8, 10), pady=(0, 0))
 
         logo_candidates = [
@@ -2730,18 +3762,18 @@ class V11BApp(tk.Tk):
 
         tk.Label(
             header,
-            text="PixelForge AI Video Enhancer",
-            fg="#dff6ff",
-            bg="#111b2f",
-            font=("Segoe UI", 16, "bold"),
+            text="PixelForge AI",
+            fg="#f2f7ff",
+            bg="#121a2b",
+            font=("Segoe UI", 18, "bold"),
             anchor="w",
         ).grid(row=0, column=1, sticky="nw", pady=(0, 0))
 
         tk.Label(
             header,
-            text="Professional AI upscaling, restoration, and finishing workflow",
-            fg="#8fb0d7",
-            bg="#111b2f",
+            text="Professional AI upscaling · restore · finish",
+            fg="#8fa6c4",
+            bg="#121a2b",
             font=("Segoe UI", 9),
             anchor="w",
         ).grid(row=1, column=1, sticky="nw", pady=(1, 0))
@@ -2756,12 +3788,12 @@ class V11BApp(tk.Tk):
             built_row,
             text="Built By",
             fg="#9ab6d9",
-            bg="#111b2f",
+            bg="#121a2b",
             font=("Segoe UI", 8, "bold"),
             anchor="e",
         ).pack(side=LEFT, padx=(0, 6))
 
-        kl_logo_label = tk.Label(built_row, bg="#111b2f")
+        kl_logo_label = tk.Label(built_row, bg="#121a2b")
         kl_logo_label.pack(side=LEFT, padx=(0, 6))
 
         knight_logo_candidates = [
@@ -2775,7 +3807,7 @@ class V11BApp(tk.Tk):
             built_row,
             text="Knight Logics | KnightLogics.com",
             fg="#d3e6ff",
-            bg="#111b2f",
+            bg="#121a2b",
             font=("Segoe UI", 9),
             anchor="e",
             cursor="hand2",
@@ -2787,30 +3819,30 @@ class V11BApp(tk.Tk):
             built_by,
             text=f"Release: v{APP_VERSION}",
             fg="#9ab6d9",
-            bg="#111b2f",
+            bg="#121a2b",
             font=("Segoe UI", 8),
             anchor="e",
         ).pack(anchor="e", pady=(1, 0))
 
-        demo_row = tk.Frame(built_by, bg="#111b2f")
+        demo_row = tk.Frame(built_by, bg="#121a2b")
         demo_row.pack(anchor="e", pady=(1, 0))
         demo_link = tk.Label(
             demo_row,
             text="▶ Watch Demo",
             fg="#7df6c7",
-            bg="#111b2f",
+            bg="#121a2b",
             font=("Segoe UI", 8, "underline"),
             anchor="e",
             cursor="hand2",
         )
         demo_link.pack(side=LEFT)
         demo_link.bind("<Button-1>", lambda _event: webbrowser.open("https://youtu.be/6Rk3b037s8o"))
-        tk.Label(demo_row, text="|", fg="#3a5070", bg="#111b2f", font=("Segoe UI", 8)).pack(side=LEFT, padx=(6, 6))
+        tk.Label(demo_row, text="|", fg="#3a5070", bg="#121a2b", font=("Segoe UI", 8)).pack(side=LEFT, padx=(6, 6))
         self.header_registration_label = tk.Label(
             demo_row,
             textvariable=self.header_registration_var,
             fg="#ff6b6b",
-            bg="#111b2f",
+            bg="#121a2b",
             font=("Segoe UI", 8, "underline"),
             anchor="e",
             cursor="hand2",
@@ -2822,63 +3854,133 @@ class V11BApp(tk.Tk):
         ttk.Separator(parent).pack(fill=X, pady=(6, 0))
 
     def _build_input_section(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="Video Input / Output", padding=10, style="Card.TLabelframe")
+        box = ttk.LabelFrame(parent, text="1 · Source", padding=12, style="Card.TLabelframe")
         box.pack(fill=X)
 
         ttk.Label(
             box,
-            text=(
-                "Choose the source video and output destination for your PixelForge enhancement run."
-            ),
-            wraplength=780,
+            text="Load a video or image, then review the three preview frames on the right before processing.",
+            wraplength=390,
             justify=LEFT,
             style="Hint.TLabel",
         ).pack(anchor=W, pady=(0, 8))
 
         row1 = ttk.Frame(box)
         row1.pack(fill=X, pady=4)
-        ttk.Label(row1, text="Input video or image", width=16).pack(side=LEFT)
+        ttk.Label(row1, text="Input", width=10).pack(side=LEFT)
         ttk.Entry(row1, textvariable=self.input_video_var).pack(side=LEFT, fill=X, expand=True)
         ttk.Button(row1, text="Browse", command=self._pick_input).pack(side=LEFT, padx=(6, 0))
 
         row2 = ttk.Frame(box)
         row2.pack(fill=X, pady=4)
-        ttk.Label(row2, text="Output video", width=16).pack(side=LEFT)
+        ttk.Label(row2, text="Output", width=10).pack(side=LEFT)
         ttk.Entry(row2, textvariable=self.output_video_var).pack(side=LEFT, fill=X, expand=True)
         ttk.Button(row2, text="Browse", command=self._pick_output).pack(side=LEFT, padx=(6, 0))
 
+        target_row = ttk.Frame(box)
+        target_row.pack(fill=X, pady=(6, 0))
+        ttk.Label(target_row, text="Output size", width=10).pack(side=LEFT)
+        target_picker = ttk.Combobox(
+            target_row,
+            textvariable=self.output_target_var,
+            values=OUTPUT_TARGETS,
+            state="readonly",
+            width=16,
+        )
+        target_picker.pack(side=LEFT)
+        target_picker.bind("<<ComboboxSelected>>", lambda _event: self._apply_output_target())
+        ttk.Label(
+            target_row,
+            text="Choose the deliverable; PixelForge selects the engine's internal scale.",
+            style="Hint.TLabel",
+            wraplength=132,
+            justify=LEFT,
+        ).pack(side=LEFT, padx=(8, 0))
+
+        frame_rate_row = ttk.Frame(box)
+        frame_rate_row.pack(fill=X, pady=(6, 0))
+        ttk.Label(frame_rate_row, text="Frame rate", width=10).pack(side=LEFT)
+        frame_rate_picker = ttk.Combobox(
+            frame_rate_row,
+            textvariable=self.frame_rate_target_var,
+            values=FRAME_RATE_TARGETS,
+            state="readonly",
+            width=16,
+        )
+        frame_rate_picker.pack(side=LEFT)
+        frame_rate_picker.bind("<<ComboboxSelected>>", lambda _event: self._apply_frame_rate_target())
+        ttk.Label(
+            frame_rate_row,
+            text="Keep the original motion, or create smooth 60 FPS with RIFE.",
+            style="Hint.TLabel",
+            wraplength=132,
+            justify=LEFT,
+        ).pack(side=LEFT, padx=(8, 0))
+
     def _build_profile_section(self, parent: ttk.Frame) -> None:
-        speed_box = ttk.LabelFrame(parent, text="Speed Profiles", padding=10, style="Card.TLabelframe")
+        speed_box = ttk.LabelFrame(parent, text="2 · Speed", padding=12, style="Card.TLabelframe")
         speed_box.pack(fill=X, pady=(10, 0))
+        ttk.Label(
+            speed_box,
+            text="Start with Balanced. Use Fast Preview to test settings quickly.",
+            style="Hint.TLabel",
+            wraplength=390,
+        ).pack(anchor=W, pady=(0, 8))
         speed_row = ttk.Frame(speed_box, style="Panel.TFrame")
         speed_row.pack(fill=X)
+        show_nvidia = bool(self.nvidia_hardware.supported)
+        speed_columns = 4 if show_nvidia else 3
+        for col in range(speed_columns):
+            speed_row.columnconfigure(col, weight=1, uniform="speed_profiles")
 
-        fast_btn = ttk.Button(speed_row, text="Quick Preview", command=self._apply_fast_profile, style="Profile.TButton")
-        balanced_btn = ttk.Button(speed_row, text="Balanced Workflow", command=self._apply_balanced_profile, style="Profile.TButton")
+        fast_btn = ttk.Button(speed_row, text="Fast Preview", command=self._apply_fast_profile, style="Profile.TButton")
+        balanced_btn = ttk.Button(speed_row, text="Balanced", command=self._apply_balanced_profile, style="Profile.TButton")
         quality_btn = ttk.Button(speed_row, text="Max Detail", command=self._apply_quality_profile, style="Profile.TButton")
+        nvidia_btn = None
+        if show_nvidia:
+            nvidia_text = "NVIDIA RTX" if self.nvidia_worker is not None else "Install RTX"
+            nvidia_btn = ttk.Button(
+                speed_row,
+                text=nvidia_text,
+                command=self._apply_nvidia_profile,
+                style="Profile.TButton",
+            )
 
-        fast_btn.pack(side=LEFT)
-        balanced_btn.pack(side=LEFT, padx=6)
-        quality_btn.pack(side=LEFT)
+        fast_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        balanced_btn.grid(row=0, column=1, sticky="ew", padx=4)
+        quality_btn.grid(row=0, column=2, sticky="ew", padx=4 if show_nvidia else (4, 0))
+        if nvidia_btn is not None:
+            nvidia_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
-        content_box = ttk.LabelFrame(parent, text="Upscaling Profile", padding=10, style="Card.TLabelframe")
+        content_box = ttk.LabelFrame(parent, text="3 · Content", padding=12, style="Card.TLabelframe")
         content_box.pack(fill=X, pady=(8, 0))
+        ttk.Label(
+            content_box,
+            text="Match the model stack to what you are enhancing.",
+            style="Hint.TLabel",
+            wraplength=780,
+        ).pack(anchor=W, pady=(0, 8))
         content_row = ttk.Frame(content_box, style="Panel.TFrame")
         content_row.pack(fill=X)
+        for col in range(3):
+            content_row.columnconfigure(col, weight=1, uniform="content_profiles")
 
-        live_btn = ttk.Button(content_row, text="Natural Footage", command=self._apply_live_profile, style="Profile.TButton")
-        anime_btn = ttk.Button(content_row, text="Animation / Anime", command=self._apply_anime_profile, style="Profile.TButton")
-        restore_btn = ttk.Button(content_row, text="Legacy / Noisy Repair", command=self._apply_restore_profile, style="Profile.TButton")
+        live_btn = ttk.Button(content_row, text="People / camera", command=self._apply_live_profile, style="Profile.TButton")
+        anime_btn = ttk.Button(content_row, text="Anime / game", command=self._apply_anime_profile, style="Profile.TButton")
+        restore_btn = ttk.Button(content_row, text="Old / noisy", command=self._apply_restore_profile, style="Profile.TButton")
 
-        live_btn.pack(side=LEFT)
-        anime_btn.pack(side=LEFT, padx=6)
-        restore_btn.pack(side=LEFT)
+        live_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        anime_btn.grid(row=0, column=1, sticky="ew", padx=4)
+        restore_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         self.speed_profile_buttons = {
             "fast": fast_btn,
             "balanced": balanced_btn,
             "quality": quality_btn,
         }
+        if nvidia_btn is not None and self.nvidia_worker is not None:
+            self.speed_profile_buttons["nvidia"] = nvidia_btn
+        self.nvidia_profile_button = nvidia_btn
         self.upscaling_profile_buttons = {
             "live": live_btn,
             "animation": anime_btn,
@@ -2892,27 +3994,34 @@ class V11BApp(tk.Tk):
             parent,
             textvariable=self.profile_summary_var,
             style="Hint.TLabel",
-            wraplength=780,
+            wraplength=390,
             justify=LEFT,
         ).pack(anchor=W, pady=(8, 0))
         ttk.Label(
             parent,
             textvariable=self.profile_guidance_var,
             style="Hint.TLabel",
-            wraplength=780,
+            wraplength=390,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(4, 0))
+        ttk.Label(
+            parent,
+            textvariable=self.quality_guard_notice_var,
+            style="Hint.TLabel",
+            wraplength=390,
             justify=LEFT,
         ).pack(anchor=W, pady=(4, 0))
 
     def _build_settings_notebook(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent, style="Panel.TFrame")
-        header.pack(fill=X, pady=(10, 0))
+        header.pack(fill=X, pady=(12, 0))
         self.advanced_link_label = tk.Label(
             header,
-            text="Advanced Options",
-            fg="#6de1ff",
-            bg="#111b2f",
+            text="Advanced options  ·  fine-tune model, color, motion, and encode",
+            fg="#7ec8ff",
+            bg="#121a2b",
             cursor="hand2",
-            font=("Segoe UI", 10, "underline"),
+            font=("Segoe UI", 9, "underline"),
         )
         self.advanced_link_label.pack(anchor=W)
         self.advanced_link_label.bind("<Button-1>", lambda _event: self._open_advanced_options_window())
@@ -2937,6 +4046,8 @@ class V11BApp(tk.Tk):
             "unsharp1_var",
             "unsharp2_var",
             "enable_interpolation_var",
+            "auto_deinterlace_var",
+            "protect_high_bit_precision_var",
             "target_fps_var",
             "apply_final_scale_var",
             "preserve_aspect_ratio_var",
@@ -2944,6 +4055,11 @@ class V11BApp(tk.Tk):
             "target_height_var",
             "crf_var",
             "encode_preset_var",
+            "video_codec_var",
+            "prefer_hardware_encode_var",
+            "preserve_media_var",
+            "chunk_size_var",
+            "resume_job_var",
             "include_audio_var",
             "keep_intermediate_var",
         ]
@@ -3007,7 +4123,7 @@ class V11BApp(tk.Tk):
 
         ttk.Label(
             frame,
-            text="Adjust advanced processing controls here. Apply/Save commits these values on top of your selected profiles.",
+            text="Fine-tune processing. Drag the sliders for image/encode values. Apply / Save keeps these on top of your selected profiles.",
             style="Hint.TLabel",
             wraplength=900,
             justify=LEFT,
@@ -3049,11 +4165,11 @@ class V11BApp(tk.Tk):
         ttk.Label(
             tab,
             text=(
-                "1) Pick Input video and Output video path.\n"
-                "2) Click Fast Draft for a quick test render first.\n"
-                "3) Compare frame and estimate are generated automatically.\n"
-                "4) Drag the separator line in the compare view to check quality.\n"
-                "5) When satisfied, switch to Balanced or Quality and click Start Processing."
+                "1) Pick Input and Output paths.\n"
+                "2) Choose Content type, then Speed (Fast Preview for tests).\n"
+                "3) Pick one of the three preview frames on the right.\n"
+                "4) Drag the separator to inspect before/after quality.\n"
+                "5) When satisfied, use Balanced or Max Detail and Start Processing."
             ),
             justify=LEFT,
             style="Hint.TLabel",
@@ -3065,7 +4181,7 @@ class V11BApp(tk.Tk):
             tab,
             text=(
                 "Upscale: AI model, upscale amount, and clip range for test runs.\n"
-                "Image: Denoise, color, and sharpening.\n"
+                "Image: Denoise, color, and sharpening (slider controls).\n"
                 "Motion: Frame interpolation and output FPS (major time cost).\n"
                 "Output: Final resolution, compression quality (CRF), encoding speed, and audio."
             ),
@@ -3092,7 +4208,7 @@ class V11BApp(tk.Tk):
     def _populate_upscale_tab(self, tab: ttk.Frame) -> None:
         ttk.Label(
             tab,
-            text="Use Fast Draft first, then increase quality after you confirm results.",
+            text="Use Fast Preview first, then increase quality after you confirm results.",
             style="Hint.TLabel",
             wraplength=740,
         ).pack(anchor=W, pady=(0, 8))
@@ -3101,23 +4217,34 @@ class V11BApp(tk.Tk):
         model_row.pack(fill=X, pady=2)
         model_row.columnconfigure(0, weight=1)
         model_row.columnconfigure(1, weight=1)
-        ttk.Label(model_row, text="AI Upscale Model (content type guidance)", anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ttk.Label(model_row, text="AI Upscale Model", anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 5))
         model_combo = ttk.Combobox(
             model_row,
             textvariable=self.model_display_var,
-            values=[label for _key, label in MODEL_DETAILS],
+            values=[
+                label for key, label in MODEL_DETAILS
+                if key != NVIDIA_MODEL_KEY or self.nvidia_hardware.supported
+            ],
             state="readonly",
         )
         model_combo.grid(row=0, column=1, sticky="ew")
         model_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_model_from_display())
 
-        self._labeled_spin(tab, "Upscale Multiplier (2-4, higher = slower/more detail)", self.scale_var, 1, 4)
-        self._labeled_combo(tab, "Working Frame Format (png=cleaner, jpg=faster/smaller)", self.image_format_var, IMAGE_FORMATS)
-        self._labeled_entry(tab, "Advanced GPU Threads (-j load:proc:save)", self.threads_var)
+        self._labeled_slider(tab, "Upscale multiplier", self.scale_var, 1, 4, resolution=1, value_format="{:.0f}")
+        self._labeled_combo(tab, "Working frame format", self.image_format_var, IMAGE_FORMATS)
+        self._labeled_entry(tab, "GPU threads (-j load:proc:save)", self.threads_var)
 
         ttk.Separator(tab).pack(fill=X, pady=8)
-        self._labeled_spin_float(tab, "Start At (seconds, trims beginning)", self.start_time_var, 0.0, 999999.0, 0.1)
-        self._labeled_spin_float(tab, "Process Length (0 = full video; this field shortens output)", self.clip_duration_var, 0.0, 999999.0, 0.1)
+        self._labeled_slider(tab, "Start at (seconds)", self.start_time_var, 0.0, 7200.0, resolution=0.1, value_format="{:.1f}")
+        self._labeled_slider(
+            tab,
+            "Process length (0 = full video)",
+            self.clip_duration_var,
+            0.0,
+            7200.0,
+            resolution=0.5,
+            value_format="{:.1f}",
+        )
 
     def _populate_image_tab(self, tab: ttk.Frame) -> None:
         ttk.Label(
@@ -3127,20 +4254,20 @@ class V11BApp(tk.Tk):
             wraplength=740,
         ).pack(anchor=W, pady=(0, 8))
 
-        self._labeled_spin_float(tab, "Denoise Strength (removes compression/noise; higher can soften)", self.denoise_var, 0.0, 4.0, 0.1)
-        ttk.Checkbutton(tab, text="Enable color enhancement (applies vibrance/contrast/saturation/gamma)", variable=self.enable_color_var).pack(anchor=W, pady=(4, 6))
+        self._labeled_slider(tab, "Denoise strength", self.denoise_var, 0.0, 4.0, resolution=0.1, value_format="{:.1f}")
+        ttk.Checkbutton(tab, text="Enable color enhancement", variable=self.enable_color_var).pack(anchor=W, pady=(8, 6))
 
-        self._labeled_spin_float(tab, "Vibrance intensity (boost muted colors)", self.vibrance_var, 0.0, 1.5, 0.05)
-        self._labeled_spin_float(tab, "Contrast (difference between dark/light)", self.contrast_var, 0.5, 2.0, 0.05)
-        self._labeled_spin_float(tab, "Brightness (overall lightness)", self.brightness_var, -0.3, 0.3, 0.01)
-        self._labeled_spin_float(tab, "Saturation (overall color strength)", self.saturation_var, 0.5, 2.5, 0.05)
-        self._labeled_spin_float(tab, "Gamma (mid-tone emphasis)", self.gamma_var, 0.5, 2.0, 0.05)
+        self._labeled_slider(tab, "Vibrance", self.vibrance_var, 0.0, 1.5, resolution=0.05, value_format="{:.2f}")
+        self._labeled_slider(tab, "Contrast", self.contrast_var, 0.5, 2.0, resolution=0.05, value_format="{:.2f}")
+        self._labeled_slider(tab, "Brightness", self.brightness_var, -0.3, 0.3, resolution=0.01, value_format="{:.2f}")
+        self._labeled_slider(tab, "Saturation", self.saturation_var, 0.5, 2.5, resolution=0.05, value_format="{:.2f}")
+        self._labeled_slider(tab, "Gamma", self.gamma_var, 0.5, 2.0, resolution=0.05, value_format="{:.2f}")
 
         ttk.Separator(tab).pack(fill=X, pady=8)
-        ttk.Checkbutton(tab, text="Enable sharpening (adds edge detail)", variable=self.enable_sharpen_var).pack(anchor=W, pady=(4, 6))
-        self._labeled_spin_float(tab, "CAS strength (edge-aware sharpening)", self.cas_strength_var, 0.0, 1.5, 0.05)
-        self._labeled_spin_float(tab, "Unsharp Pass 1 (primary sharpness)", self.unsharp1_var, 0.0, 3.0, 0.05)
-        self._labeled_spin_float(tab, "Unsharp Pass 2 (fine detail boost)", self.unsharp2_var, 0.0, 3.0, 0.05)
+        ttk.Checkbutton(tab, text="Enable sharpening", variable=self.enable_sharpen_var).pack(anchor=W, pady=(4, 6))
+        self._labeled_slider(tab, "CAS strength", self.cas_strength_var, 0.0, 1.5, resolution=0.05, value_format="{:.2f}")
+        self._labeled_slider(tab, "Unsharp pass 1", self.unsharp1_var, 0.0, 3.0, resolution=0.05, value_format="{:.2f}")
+        self._labeled_slider(tab, "Unsharp pass 2", self.unsharp2_var, 0.0, 3.0, resolution=0.05, value_format="{:.2f}")
 
     def _populate_motion_tab(self, tab: ttk.Frame) -> None:
         ttk.Label(
@@ -3150,13 +4277,18 @@ class V11BApp(tk.Tk):
             wraplength=740,
         ).pack(anchor=W, pady=(0, 8))
 
-        ttk.Checkbutton(tab, text="Enable frame interpolation (creates new in-between frames)", variable=self.enable_interpolation_var).pack(anchor=W, pady=(4, 4))
-        self._labeled_combo(tab, "Interpolation Engine", self.interp_engine_var, INTERP_ENGINE_OPTIONS)
+        ttk.Checkbutton(tab, text="Enable frame interpolation", variable=self.enable_interpolation_var).pack(anchor=W, pady=(4, 4))
+        ttk.Checkbutton(
+            tab,
+            text="Automatically correct interlaced sources (recommended)",
+            variable=self.auto_deinterlace_var,
+        ).pack(anchor=W, pady=(0, 6))
+        self._labeled_combo(tab, "Interpolation engine", self.interp_engine_var, INTERP_ENGINE_OPTIONS)
         rife_row = ttk.Frame(tab)
         rife_row.pack(fill=X, pady=2)
         rife_row.columnconfigure(0, weight=1)
         rife_row.columnconfigure(1, weight=1)
-        ttk.Label(rife_row, text="RIFE Model", anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ttk.Label(rife_row, text="RIFE model", anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 5))
         rife_combo = ttk.Combobox(
             rife_row,
             textvariable=self.rife_model_display_var,
@@ -3165,7 +4297,7 @@ class V11BApp(tk.Tk):
         )
         rife_combo.grid(row=0, column=1, sticky="ew")
         rife_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_rife_model_from_display())
-        self._labeled_combo(tab, "Final FPS (higher is smoother but slower)", self.target_fps_var, FPS_OPTIONS)
+        self._labeled_combo(tab, "Final FPS", self.target_fps_var, FPS_OPTIONS)
 
         tips = ttk.Label(
             tab,
@@ -3173,9 +4305,10 @@ class V11BApp(tk.Tk):
                 "Major speed reducers:\n"
                 "- Interpolation is mainly useful for 24/30 -> 60 FPS\n"
                 "- If source FPS is already at/above target FPS, interpolation is auto-skipped\n"
-                "- Use Fast Draft profile when testing"
+                "- Use Fast Preview when testing"
             ),
             justify=LEFT,
+            style="Hint.TLabel",
         )
         tips.pack(anchor=W, pady=(12, 0))
 
@@ -3187,28 +4320,42 @@ class V11BApp(tk.Tk):
             wraplength=740,
         ).pack(anchor=W, pady=(0, 8))
 
-        ttk.Checkbutton(tab, text="Apply final scaling (optional resize to target dimensions)", variable=self.apply_final_scale_var).pack(anchor=W, pady=(4, 4))
+        ttk.Checkbutton(tab, text="Apply final scaling", variable=self.apply_final_scale_var).pack(anchor=W, pady=(4, 4))
         ttk.Checkbutton(
             tab,
-            text="Preserve source aspect ratio when final scaling (recommended — avoids forced 9:16 stretch)",
+            text="Preserve source aspect ratio when final scaling (recommended)",
             variable=self.preserve_aspect_ratio_var,
         ).pack(anchor=W, pady=(0, 8))
-        self._labeled_spin(tab, "Output Width (final video width)", self.target_width_var, 360, 7680)
-        self._labeled_spin(tab, "Output Height (final video height)", self.target_height_var, 360, 7680)
+        self._labeled_slider(tab, "Output width", self.target_width_var, 360, 7680, resolution=2, value_format="{:.0f}")
+        self._labeled_slider(tab, "Output height", self.target_height_var, 360, 7680, resolution=2, value_format="{:.0f}")
 
         ttk.Separator(tab).pack(fill=X, pady=8)
-        self._labeled_spin(tab, "Quality (CRF: lower = cleaner)", self.crf_var, 12, 30)
-        self._labeled_combo(tab, "Encode Speed Preset (faster encode vs compression efficiency)", self.encode_preset_var, ENCODE_PRESETS)
+        self._labeled_slider(tab, "Quality (CRF — lower is cleaner)", self.crf_var, 12, 30, resolution=1, value_format="{:.0f}")
+        self._labeled_combo(tab, "Encode speed preset", self.encode_preset_var, ENCODE_PRESETS)
+        self._labeled_combo(tab, "Video codec", self.video_codec_var, VIDEO_CODEC_OPTIONS)
+        ttk.Checkbutton(tab, text="Prefer NVIDIA hardware encoding (NVENC)", variable=self.prefer_hardware_encode_var).pack(anchor=W, pady=(8, 2))
+        ttk.Checkbutton(
+            tab,
+            text="Preserve all compatible audio tracks, subtitles, chapters, attachments, and color metadata",
+            variable=self.preserve_media_var,
+        ).pack(anchor=W, pady=(2, 2))
+        ttk.Checkbutton(
+            tab,
+            text="Protect HDR/10-bit precision with the FP32 DirectML path (recommended)",
+            variable=self.protect_high_bit_precision_var,
+        ).pack(anchor=W, pady=(2, 2))
+        ttk.Checkbutton(tab, text="Checkpoint and resume interrupted jobs", variable=self.resume_job_var).pack(anchor=W, pady=(2, 2))
+        self._labeled_spin(tab, "Upscale batch size (frames)", self.chunk_size_var, 30, 1000)
 
-        ttk.Checkbutton(tab, text="Include source audio (copy original audio track)", variable=self.include_audio_var).pack(anchor=W, pady=(8, 4))
-        ttk.Checkbutton(tab, text="Keep intermediate files (debug/troubleshoot pipeline outputs)", variable=self.keep_intermediate_var).pack(anchor=W)
+        ttk.Checkbutton(tab, text="Include source audio", variable=self.include_audio_var).pack(anchor=W, pady=(8, 4))
+        ttk.Checkbutton(tab, text="Keep intermediate files", variable=self.keep_intermediate_var).pack(anchor=W)
 
     def _populate_billing_tab(self, tab: ttk.Frame) -> None:
         ttk.Label(
             tab,
             text=(
-                "Billing now runs inside v11b with a local credit ledger and optional Stripe checkout. "
-                "Checkout opens in an app window when pywebview is available."
+                "Credits are managed through Knight Account checkout. "
+                "Use Buy Credits on the main screen for the simplest purchase flow."
             ),
             style="Hint.TLabel",
             wraplength=760,
@@ -3219,15 +4366,15 @@ class V11BApp(tk.Tk):
         self._labeled_entry(tab, "Access Token", self.billing_token_var)
 
         ttk.Separator(tab).pack(fill=X, pady=8)
-        ttk.Label(tab, text="Recommended Intro Packages", style="Card.TLabelframe.Label").pack(anchor=W, pady=(0, 6))
+        ttk.Label(tab, text="Credit Packages", style="Card.TLabelframe.Label").pack(anchor=W, pady=(0, 6))
 
         package_row = ttk.Frame(tab)
         package_row.pack(fill=X, pady=(0, 6))
-        ttk.Button(package_row, text="Starter 25", command=lambda: self.checkout_credits_var.set(25)).pack(side=LEFT)
-        ttk.Button(package_row, text="Creator 75", command=lambda: self.checkout_credits_var.set(75)).pack(side=LEFT, padx=6)
-        ttk.Button(package_row, text="Pro 200", command=lambda: self.checkout_credits_var.set(200)).pack(side=LEFT)
+        ttk.Button(package_row, text="Starter 32 · $5", command=lambda: self.checkout_credits_var.set(32)).pack(side=LEFT)
+        ttk.Button(package_row, text="Creator 68 · $10", command=lambda: self.checkout_credits_var.set(68)).pack(side=LEFT, padx=6)
+        ttk.Button(package_row, text="Pro 144 · $20", command=lambda: self.checkout_credits_var.set(144)).pack(side=LEFT)
 
-        self._labeled_spin(tab, "Credits To Purchase", self.checkout_credits_var, 1, 1000)
+        self._labeled_spin(tab, "Credits to purchase", self.checkout_credits_var, 1, 1000)
         self._labeled_entry(tab, "Checkout Session ID", self.checkout_session_var)
         self._labeled_entry(tab, "Last Checkout URL", self.checkout_url_var)
 
@@ -3267,7 +4414,7 @@ class V11BApp(tk.Tk):
         )
 
     def _build_action_section(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="Estimator and Run", padding=10, style="Card.TLabelframe")
+        box = ttk.LabelFrame(parent, text="4 · Run", padding=12, style="Card.TLabelframe")
         box.pack(fill=X, pady=(10, 0))
 
         self.progress_container = ttk.Frame(box, style="Panel.TFrame")
@@ -3317,7 +4464,7 @@ class V11BApp(tk.Tk):
             balance_stack,
             textvariable=self.available_credits_var,
             fg="#7df6c7",
-            bg="#111b2f",
+            bg="#121a2b",
             font=("Segoe UI", 13, "bold"),
             justify="center",
             width=12,
@@ -3333,7 +4480,7 @@ class V11BApp(tk.Tk):
             right_actions,
             text="Access Codes",
             fg="#6de1ff",
-            bg="#111b2f",
+            bg="#121a2b",
             cursor="hand2",
             font=("Segoe UI", 10, "underline"),
         )
@@ -3673,6 +4820,7 @@ class V11BApp(tk.Tk):
             "waifu2x-anime-noise3":    0.90,
             "waifu2x-cunet-noise1":    1.75,
             "waifu2x-cunet-noise3":    1.90,
+            **ENGINE_COST_FACTORS,
         }.get(settings.model, 1.0)
         scale_factor = 0.78 if settings.scale <= 2 else 0.94 if settings.scale == 3 else 1.10
         format_factor = 1.08 if settings.image_format == "png" else 0.92
@@ -3772,39 +4920,90 @@ class V11BApp(tk.Tk):
         self._redeem_credit_code()
 
     def _build_compare_panel(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="Before/After Frame Compare", padding=8, style="Card.TLabelframe")
-        box.pack(fill=X, pady=(0, 10))
+        box = ttk.LabelFrame(parent, text="Before / After Preview", padding=10, style="Card.TLabelframe")
+        box.pack(fill=BOTH, expand=True, pady=(0, 8))
 
+        # Controls first so they stay visible (never clipped under a tall canvas).
         controls = ttk.Frame(box, style="Panel.TFrame")
-        controls.pack(fill=X, pady=(0, 8))
-        ttk.Label(
-            controls,
-            text="Preview frame position (% through clip):",
-            style="Hint.TLabel",
-        ).pack(side=LEFT)
-        ttk.Scale(
-            controls,
-            from_=0,
-            to=100,
-            variable=self.compare_frame_pct_var,
-            command=lambda _v: self._schedule_auto_compare(delay_ms=250),
-        ).pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
-        ttk.Label(
-            box,
-            text="Compare regenerates when settings change. Drag the separator to inspect before/after. Preview skips black frames when possible.",
-            style="Hint.TLabel",
-            wraplength=760,
-        ).pack(anchor=W, pady=(0, 6))
+        controls.pack(side="bottom", fill=X, pady=(8, 0))
 
+        frame_row = ttk.Frame(controls, style="Panel.TFrame")
+        frame_row.pack(fill=X, pady=(0, 4))
+        ttk.Label(frame_row, text="Video frame", style="Section.TLabel").pack(side=LEFT)
+        ttk.Label(frame_row, textvariable=self.compare_frame_label_var, style="Value.TLabel").pack(side=RIGHT)
+
+        jump_row = ttk.Frame(controls, style="Panel.TFrame")
+        jump_row.pack(fill=X, pady=(0, 4))
+        for col, pct in enumerate(self.filmstrip_pcts):
+            jump_row.columnconfigure(col, weight=1, uniform="frame_jump")
+            button = ttk.Button(
+                jump_row,
+                text=f"Sample {col + 1}\nLoading…",
+                style="Profile.TButton",
+                command=lambda p=pct: self._select_filmstrip_pct(p, regenerate=True),
+                compound="top",
+            )
+            button.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 4, 0))
+            self.filmstrip_buttons.append(button)
+
+        preview_row = ttk.Frame(controls, style="Panel.TFrame")
+        preview_row.pack(fill=X, pady=(4, 0))
+        ttk.Label(preview_row, text="Preview area", style="Hint.TLabel").pack(side=LEFT)
+        crop_picker = ttk.Combobox(
+            preview_row,
+            textvariable=self.preview_crop_mode_var,
+            values=("Detail crop (fast)", "Full frame"),
+            state="readonly",
+            width=20,
+        )
+        crop_picker.pack(side=LEFT, padx=(7, 8))
+        crop_picker.bind("<<ComboboxSelected>>", lambda _event: self._preview_crop_changed())
+        ttk.Progressbar(
+            preview_row,
+            variable=self.preview_progress_var,
+            maximum=100,
+            style="Total.Horizontal.TProgressbar",
+        ).pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        self.preview_cancel_button = ttk.Button(
+            preview_row,
+            text="Cancel preview",
+            command=self._cancel_preview,
+            style="Danger.TButton",
+            state=tk.DISABLED,
+        )
+        self.preview_cancel_button.pack(side=RIGHT)
+        ttk.Label(controls, textvariable=self.preview_status_var, style="Hint.TLabel").pack(anchor=W, pady=(4, 0))
+
+        top_copy = ttk.Frame(box, style="Panel.TFrame")
+        top_copy.pack(fill=X, pady=(0, 6))
+        ttk.Label(
+            top_copy,
+            text="Pick one of the three frames. In Detail crop mode, click the source preview to center the crop; drag the cyan line after generation to compare.",
+            style="Hint.TLabel",
+            wraplength=560,
+        ).pack(anchor=W)
+
+        self.compare_honesty_var = tk.StringVar(
+            value="Still preview of 1 sampled frame — not the full video."
+        )
+        ttk.Label(
+            top_copy,
+            textvariable=self.compare_honesty_var,
+            style="Hint.TLabel",
+            wraplength=560,
+        ).pack(anchor=W, pady=(2, 0))
+
+        canvas_frame = ttk.Frame(box, style="Panel.TFrame")
+        canvas_frame.pack(fill=BOTH, expand=True)
         self.compare_canvas = tk.Canvas(
-            box,
-            width=480,
-            height=280,
+            canvas_frame,
+            width=520,
+            height=300,
             bg="#090f1b",
             highlightthickness=1,
             highlightbackground="#355c93",
         )
-        self.compare_canvas.pack(fill=X)
+        self.compare_canvas.pack(fill=BOTH, expand=True)
         self.compare_canvas.bind("<Configure>", lambda _event: self._redraw_compare_canvas())
         self.compare_canvas.bind("<Double-Button-1>", lambda _event: self._open_large_compare_window())
         self.compare_canvas.bind("<Button-1>", lambda event: self._on_compare_mouse_press(event))
@@ -3813,11 +5012,36 @@ class V11BApp(tk.Tk):
         self.compare_canvas.bind("<Motion>", lambda event: self._on_compare_mouse_motion(event))
         self.compare_canvas.bind("<Leave>", lambda _event: self._on_compare_mouse_leave())
         self.compare_canvas.create_text(
-            240,
-            140,
-            text="Compare preview updates automatically from current settings.",
+            260,
+            150,
+            text="Load a video to preview three sample frames.",
             fill="#86a6d8",
             font=("Segoe UI", 11),
+            tags=("placeholder",),
+        )
+        self._update_compare_frame_label()
+
+    def _jump_compare_frame_pct(self, pct: float) -> None:
+        self._select_filmstrip_pct(pct)
+
+    def _post_render_feedback(self, output_path: Path | None) -> None:
+        if output_path is not None and output_path.exists():
+            try:
+                os.startfile(str(output_path.parent))  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        better = messagebox.askyesno(
+            "Was this better?",
+            "Did the enhanced output look better than the original?\n\n"
+            "Yes helps us keep defaults trusted. No flags the run for preset review.",
+        )
+        self._record_telemetry_event_async(
+            "render_quality_feedback",
+            {
+                "better": bool(better),
+                "content": getattr(self, "selected_upscaling_profile", ""),
+                "speed": getattr(self, "selected_speed_profile", ""),
+            },
         )
 
     def _build_log_panel(self, parent: ttk.Frame) -> None:
@@ -3826,7 +5050,7 @@ class V11BApp(tk.Tk):
         self.log_text = tk.Text(
             box,
             width=48,
-            height=12,
+            height=7,
             wrap="word",
             bg="#08101d",
             fg="#cde3ff",
@@ -3924,6 +5148,104 @@ class V11BApp(tk.Tk):
         ttk.Label(row, text=label, anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 5))
         ttk.Spinbox(row, textvariable=variable, from_=minimum, to=maximum, increment=step).grid(row=0, column=1, sticky="ew")
 
+    def _labeled_slider(
+        self,
+        parent: ttk.Frame,
+        label: str,
+        variable: tk.Variable,
+        minimum: float,
+        maximum: float,
+        resolution: float = 0.05,
+        value_format: str = "{:.2f}",
+        on_change: Callable[[float], None] | None = None,
+        display_formatter: Callable[[float], str] | None = None,
+    ) -> None:
+        row = ttk.Frame(parent, style="Panel.TFrame")
+        row.pack(fill=X, pady=(6, 2))
+        header = ttk.Frame(row, style="Panel.TFrame")
+        header.pack(fill=X)
+        ttk.Label(header, text=label, style="Hint.TLabel").pack(side=LEFT)
+        value_var = tk.StringVar(value="")
+
+        def _format_value(raw: float) -> str:
+            if isinstance(variable, tk.IntVar) or resolution >= 1.0:
+                return f"{int(round(raw))}"
+            return value_format.format(raw)
+
+        def _snap(raw: float) -> float:
+            if resolution <= 0:
+                return raw
+            steps = round((raw - minimum) / resolution)
+            snapped = minimum + steps * resolution
+            snapped = max(minimum, min(maximum, snapped))
+            if isinstance(variable, tk.IntVar) or resolution >= 1.0:
+                return float(int(round(snapped)))
+            return round(snapped, 6)
+
+        def _sync_label(*_args) -> None:
+            try:
+                raw = float(variable.get())
+                if display_formatter is not None:
+                    value_var.set(display_formatter(raw))
+                else:
+                    value_var.set(_format_value(raw))
+            except Exception:
+                value_var.set("—")
+
+        def _on_slide(raw: str) -> None:
+            try:
+                snapped = _snap(float(raw))
+            except Exception:
+                return
+            current = None
+            try:
+                current = float(variable.get())
+            except Exception:
+                pass
+            if isinstance(variable, tk.IntVar):
+                as_int = int(round(snapped))
+                if current is None or int(round(current)) != as_int:
+                    variable.set(as_int)
+            else:
+                if current is None or abs(current - snapped) > 1e-9:
+                    variable.set(snapped)
+            _sync_label()
+            if on_change is not None:
+                on_change(snapped)
+
+        ttk.Label(header, textvariable=value_var, style="Value.TLabel").pack(side=RIGHT)
+        try:
+            initial = float(variable.get())
+        except Exception:
+            initial = float(minimum)
+        scale = ttk.Scale(
+            row,
+            from_=minimum,
+            to=maximum,
+            orient="horizontal",
+            command=_on_slide,
+        )
+        scale.set(initial)
+        scale.pack(fill=X, pady=(2, 0))
+        _sync_label()
+
+        def _on_var_write(*_args) -> None:
+            try:
+                desired = _snap(float(variable.get()))
+            except Exception:
+                return
+            try:
+                if abs(float(scale.get()) - desired) > 1e-9:
+                    scale.set(desired)
+            except Exception:
+                pass
+            _sync_label()
+
+        try:
+            variable.trace_add("write", _on_var_write)
+        except Exception:
+            pass
+
     def _pick_input(self) -> None:
         file_path = filedialog.askopenfilename(
             title="Select input video or image",
@@ -3935,6 +5257,12 @@ class V11BApp(tk.Tk):
         )
         if not file_path:
             return
+        self._cancel_preview()
+        self.preview_cancel_event = threading.Event()
+        self._set_preview_cancel_enabled(True)
+        self.preview_progress_var.set(0.0)
+        self.preview_status_var.set("Reading source metadata…")
+        self.preview_crop_center = (0.5, 0.5)
         self.input_video_var.set(file_path)
         input_path = Path(file_path)
         if PipelineRunner.is_image_input(input_path):
@@ -3945,7 +5273,7 @@ class V11BApp(tk.Tk):
             self.output_video_var.set(str(input_path.with_name(output_name)))
 
         self._sync_target_dimensions_from_source(input_path)
-        self._sync_target_fps_to_source_if_needed(file_path)
+        self._apply_frame_rate_target(file_path)
         self._normalize_interpolation_choice(show_feedback=True)
 
         self._auto_prepare_after_input()
@@ -3996,6 +5324,36 @@ class V11BApp(tk.Tk):
         except Exception:
             pass
 
+    def _apply_frame_rate_target(self, input_path: str | Path | None = None) -> None:
+        candidate = str(input_path or self.input_video_var.get()).strip()
+        if not candidate:
+            return
+        path = Path(candidate)
+        if PipelineRunner.is_image_input(path):
+            self.frame_rate_target_var.set("Keep source")
+            self.target_fps_var.set(30)
+            self.enable_interpolation_var.set(False)
+            return
+        try:
+            source_fps = PipelineRunner.get_fps(path)
+        except Exception:
+            source_fps = 30.0
+        enabled, target_fps = frame_rate_choice(self.frame_rate_target_var.get(), source_fps)
+        self.target_fps_var.set(target_fps)
+        self.enable_interpolation_var.set(enabled)
+        if enabled:
+            self.interp_engine_var.set(INTERP_ENGINE_RIFE)
+            self.rife_model_var.set("rife-v4.25")
+            self._sync_rife_display_from_model()
+            self.log_queue.put(
+                f"[INFO] Smooth 60 FPS selected: RIFE will generate motion frames ({source_fps:.3f} -> 60 FPS)."
+            )
+        elif self.frame_rate_target_var.get() == "Smooth 60 FPS" and source_fps >= 59.5:
+            self.frame_rate_target_var.set("Keep source")
+            self.log_queue.put(
+                f"[INFO] Source is already {source_fps:.3f} FPS; PixelForge will preserve it without interpolation."
+            )
+
     def _recommend_realesrgan_threads(self, gpu_name: str | None = None) -> str:
         gpu_text = (gpu_name or self._detect_primary_gpu_name() or "").lower()
         if "rtx 50" in gpu_text or "rtx 40" in gpu_text:
@@ -4045,8 +5403,14 @@ class V11BApp(tk.Tk):
                 and not self._use_embedded_billing()
             ):
                 api_base = self.billing_api_default
-            if api_base and self._use_embedded_billing():
+            if api_base:
+                # Repair persisted bad migration target so the UI field matches the live API.
+                lowered = api_base.lower()
+                if "/api/knight-account" in lowered:
+                    api_base = re.sub(r"(?i)/api/knight-account", "/api/pixelforge-license", api_base)
                 self.billing_api_base_var.set(api_base)
+                if not self._use_embedded_billing():
+                    self.billing_backend = RemoteBillingBackend(api_base, self.machine_id, APP_VERSION)
             if last_session:
                 self.checkout_session_var.set(last_session)
             if last_url:
@@ -4095,14 +5459,19 @@ class V11BApp(tk.Tk):
         credits = int(status.get("credits", 0) or 0)
         paid = int(status.get("paid_credits", 0) or 0)
         trial = int(status.get("free_trial_remaining", 0) or 0)
+        pro_active = bool(status.get("pro_active", False) or status.get("unlimited", False))
+        plans = status.get("plans", [])
+        self._server_billing_plans = [item for item in plans if isinstance(item, dict)] if isinstance(plans, list) else []
         email_linked = bool(status.get("email_linked", False))
         linked_email = str(status.get("linked_email") or "").strip()
         self._set_header_registration_state(email_linked, linked_email)
-        self.available_credits_var.set(str(credits))
+        self.available_credits_var.set("PRO" if pro_active else str(credits))
         if self._use_embedded_billing():
             self.billing_status_var.set(
                 f"Billing: local developer token {token[:12]}... has {credits} credits (paid: {paid}, trial: {trial})."
             )
+        elif pro_active:
+            self.billing_status_var.set("Billing: PixelForge AI Pro lifetime entitlement active (unlimited local renders).")
         else:
             self.billing_status_var.set(
                 f"Billing: {credits} credits available ({paid} purchased + {trial} trial)."
@@ -4955,7 +6324,7 @@ class V11BApp(tk.Tk):
             return
 
         window = tk.Toplevel(self)
-        window.title("Buy Credits")
+        window.title("License & Credits")
         window.minsize(980, 560)
         window.configure(bg="#0a1220")
         window.transient(self)
@@ -4980,10 +6349,10 @@ class V11BApp(tk.Tk):
 
         hero_left = ttk.Frame(hero, style="BillingHero.TFrame")
         hero_left.pack(side=LEFT, fill=X, expand=True)
-        ttk.Label(hero_left, text="Purchase Processing Credits", style="BillingHeroTitle.TLabel").pack(anchor=W)
+        ttk.Label(hero_left, text="PixelForge License & Credits", style="BillingHeroTitle.TLabel").pack(anchor=W)
         ttk.Label(
             hero_left,
-            text="Secure checkout opens inside the app window. Pick a package and complete payment — credits are confirmed automatically.",
+            text="Secure checkout opens inside the app window. Available server-authorized licenses and credit packs are confirmed automatically.",
             style="BillingHeroSub.TLabel",
             wraplength=520,
             justify=LEFT,
@@ -5044,35 +6413,57 @@ class V11BApp(tk.Tk):
         return f"${cents / 100:,.2f}"
 
     def _get_billing_package_definitions(self) -> list[dict[str, object]]:
-        return [
+        packages: list[dict[str, object]] = [
             {
                 "title": "32 Credits",
+                "plan_id": "starter_32",
                 "credits": 32,
                 "price_cents": 500,
                 "accent": False,
                 "badge": "Starter",
-                "summary": "Great for one focused job or quick testing runs with reliable enhancement quality.",
+                "summary": "Cheapest entry pack for one focused job.",
             },
             {
                 "title": "68 Credits",
+                "plan_id": "creator_68",
                 "credits": 68,
                 "price_cents": 1000,
                 "accent": True,
                 "badge": "Most Popular",
-                "summary": "Better value per credit for regular creators handling multiple clips per session.",
+                "summary": "Best everyday value for creators running multiple clips per session.",
             },
             {
                 "title": "144 Credits",
+                "plan_id": "pro_144",
                 "credits": 144,
                 "price_cents": 2000,
                 "accent": False,
                 "badge": "Best Value",
-                "summary": "Highest value tier for bigger queues, reruns, and production-scale enhancement batches.",
+                "summary": "Lowest per-credit price for production queues and reruns.",
             },
         ]
+        for plan in getattr(self, "_server_billing_plans", []):
+            if str(plan.get("id") or "") != "pro_lifetime":
+                continue
+            amount = int(plan.get("amount_cents") or 0)
+            if amount < 1000:
+                continue
+            packages.append(
+                {
+                    "title": str(plan.get("label") or "PixelForge AI Pro"),
+                    "plan_id": "pro_lifetime",
+                    "credits": 0,
+                    "price_cents": amount,
+                    "accent": True,
+                    "badge": str(plan.get("badge") or "One-time license"),
+                    "summary": "Unlimited local renders on this licensed device; no per-render credit charge.",
+                }
+            )
+        return packages
 
     def _build_billing_package_card(self, parent: tk.Misc, package: dict[str, object]) -> tk.Frame:
         title = str(package["title"])
+        plan_id = str(package.get("plan_id") or "")
         credits = int(package["credits"])
         package_price_cents = int(package.get("price_cents", credits * max(1, int(self.billing_backend.price_per_credit_cents))))
         accent = bool(package.get("accent", False))
@@ -5099,7 +6490,11 @@ class V11BApp(tk.Tk):
         tk.Label(card, text=self._format_billing_price(total_cents), bg=bg, fg=price_fg, font=("Segoe UI", 21, "bold")).pack(anchor="w")
         tk.Label(
             card,
-            text=f"{self._format_billing_price(per_credit_cents)} per processing credit",
+            text=(
+                "One-time local Pro entitlement"
+                if plan_id == "pro_lifetime"
+                else f"{self._format_billing_price(per_credit_cents)} per processing credit"
+            ),
             bg=bg,
             fg=meta_fg,
             font=("Segoe UI", 9),
@@ -5117,7 +6512,7 @@ class V11BApp(tk.Tk):
         ttk.Button(
             card,
             text="Buy Now",
-            command=lambda: self._purchase_credit_package(credits, package_price_cents, title),
+            command=lambda: self._purchase_credit_package(credits, package_price_cents, plan_id),
             style="Accent.TButton" if accent else "TButton",
         ).pack(fill=X, pady=(16, 0))
         return card
@@ -5147,7 +6542,7 @@ class V11BApp(tk.Tk):
             return False
 
         credits = int(self.checkout_credits_var.get())
-        if credits <= 0:
+        if credits <= 0 and package_name != "pro_lifetime":
             messagebox.showwarning("Invalid Credits", "Credits must be greater than 0.")
             return False
 
@@ -5156,6 +6551,9 @@ class V11BApp(tk.Tk):
 
         # ── DEV MODE: bypass Stripe and add credits directly for local testing ──
         if self._is_dev_bypass_enabled():
+            if package_name == "pro_lifetime":
+                messagebox.showwarning("Dev Mode", "The local dev bypass cannot grant a server Pro entitlement.")
+                return False
             if not messagebox.askyesno(
                 "Dev Mode",
                 f"DEV MODE is active — no real payment will occur.\n\nAdd {credits} credits to token directly?",
@@ -5287,18 +6685,26 @@ class V11BApp(tk.Tk):
         self._checkout_pending = False
         credited = int(data.get("credited_credits", 0) or data.get("purchased_credits", 0) or 0)
         already_processed = bool(data.get("already_processed", False))
+        pro_active = bool(data.get("pro_active", False) or data.get("entitlement") == "pro_lifetime")
         token = self.billing_token_var.get().strip()
         self._save_billing_state()
         self._refresh_billing_status(silent=True)
 
-        msg = f"Payment confirmed. {credited} credits added." if not already_processed else "Payment confirmed (already processed)."
+        if pro_active:
+            msg = "Payment confirmed. PixelForge AI Pro is active."
+        else:
+            msg = f"Payment confirmed. {credited} credits added." if not already_processed else "Payment confirmed (already processed)."
         self.log_queue.put(f"[INFO] {msg}")
         self.billing_status_var.set(msg)
 
         parent = self.billing_window if self.billing_window and self.billing_window.winfo_exists() else self
         messagebox.showinfo(
             "Payment Complete",
-            f"Payment successful!\n\n{credited} credit{'s' if credited != 1 else ''} have been added to your account.\n\nYou can now start processing videos.",
+            (
+                "Payment successful!\n\nPixelForge AI Pro is active with unlimited local renders on this device."
+                if pro_active
+                else f"Payment successful!\n\n{credited} credit{'s' if credited != 1 else ''} have been added to your account.\n\nYou can now start processing videos."
+            ),
             parent=parent,
         )
 
@@ -5536,10 +6942,7 @@ class V11BApp(tk.Tk):
         if not self.advanced_overrides_active:
             return
         self.advanced_overrides_active = False
-        messagebox.showinfo(
-            "Advanced Settings Overridden",
-            "Selecting a speed profile or upscaling profile restores that profile's default settings and overrides your saved advanced adjustments.",
-        )
+        self.log_queue.put("[INFO] Profile defaults restored. Previous advanced overrides were cleared.")
 
     def _set_selected_speed_profile(self, profile_name: str, apply: bool = True) -> None:
         if apply:
@@ -5576,36 +6979,269 @@ class V11BApp(tk.Tk):
             "cas_strength": self.cas_strength_var,
             "unsharp1": self.unsharp1_var,
             "unsharp2": self.unsharp2_var,
-            "enable_interpolation": self.enable_interpolation_var,
-            "target_fps": self.target_fps_var,
+            "auto_deinterlace": self.auto_deinterlace_var,
             "apply_final_scale": self.apply_final_scale_var,
             "crf": self.crf_var,
             "encode_preset": self.encode_preset_var,
+            "rife_model": self.rife_model_var,
+            "nvidia_vsr_mode": self.nvidia_vsr_mode_var,
         }
         for setting_name, setting_value in preset.items():
             variable = variable_map.get(setting_name)
             if variable is not None:
                 variable.set(setting_value)
 
+        self._apply_cached_precision_guard()
+
         self._refresh_auto_thread_recommendation()
+        self._apply_output_target()
         self._sync_display_from_model()
         self._sync_rife_display_from_model()
         self._update_profile_summary()
         speed_label = {
-            "fast": "Quick Preview",
-            "balanced": "Balanced Workflow",
+            "fast": "Fast Preview",
+            "balanced": "Balanced",
             "quality": "Max Detail",
+            "nvidia": "NVIDIA RTX",
         }.get(speed_name, speed_name)
         upscaling_label = {
-            "live": "Natural Footage",
-            "animation": "Animation / Anime",
-            "restore": "Legacy / Noisy Repair",
+            "live": "People / camera",
+            "animation": "Anime / game",
+            "restore": "Old / noisy",
         }.get(upscaling_name, upscaling_name)
         self._sync_target_fps_to_source_if_needed()
         self.estimate_var.set(f"Profile set: {speed_label} + {upscaling_label}.")
         # Explicitly schedule a compare re-render so it always fires when a profile
         # is applied — even if all var values happened to already match.
+        self._invalidate_compare_cache()
         self._schedule_auto_compare(delay_ms=800)
+
+    def _maybe_show_first_run_content_picker(self) -> None:
+        """Content type is chosen on the main screen; skip the startup modal."""
+        marker = self.app_data_dir / "pixelforge_content_picker_seen"
+        if not marker.exists():
+            try:
+                marker.write_text("main_ui", encoding="utf-8")
+            except Exception:
+                pass
+
+    def _pct_for_frame_index(self, index: int | None = None) -> float:
+        idx = int(self.compare_frame_index_var.get()) if index is None else int(index)
+        idx = max(0, min(len(self.filmstrip_pcts) - 1, idx))
+        return float(self.filmstrip_pcts[idx])
+
+    def _index_for_frame_pct(self, pct: float) -> int:
+        nearest = min(self.filmstrip_pcts, key=lambda p: abs(float(p) - float(pct)))
+        return list(self.filmstrip_pcts).index(nearest)
+
+    def _update_compare_frame_label(self) -> None:
+        idx = int(self.compare_frame_index_var.get())
+        idx = max(0, min(len(self.filmstrip_pcts) - 1, idx))
+        pct = self._pct_for_frame_index(idx)
+        self.compare_frame_label_var.set(f"Sample {idx + 1} of {len(self.filmstrip_pcts)}")
+
+        frame_number = self.filmstrip_frame_numbers.get(float(pct))
+        if frame_number:
+            total = f" of {self.filmstrip_total_frames:,}" if self.filmstrip_total_frames else ""
+            self.compare_frame_label_var.set(f"Frame {frame_number:,}{total} · sample {idx + 1} of 3")
+        else:
+            self.compare_frame_label_var.set(f"Sample {idx + 1} of {len(self.filmstrip_pcts)}")
+
+    def _compare_settings_fingerprint(self) -> str:
+        source_path = Path(self.input_video_var.get().strip())
+        try:
+            source_stamp = f"{source_path.resolve()}:{source_path.stat().st_size}:{source_path.stat().st_mtime_ns}"
+        except OSError:
+            source_stamp = str(source_path)
+        return "|".join(
+            [
+                source_stamp,
+                str(self.model_var.get()),
+                str(self.scale_var.get()),
+                str(self.image_format_var.get()),
+                str(self.denoise_var.get()),
+                str(self.enable_color_var.get()),
+                str(self.vibrance_var.get()),
+                str(self.contrast_var.get()),
+                str(self.brightness_var.get()),
+                str(self.saturation_var.get()),
+                str(self.gamma_var.get()),
+                str(self.enable_sharpen_var.get()),
+                str(self.auto_deinterlace_var.get()),
+                str(self.cas_strength_var.get()),
+                str(self.unsharp1_var.get()),
+                str(self.unsharp2_var.get()),
+                str(self.apply_final_scale_var.get()),
+                str(self.target_width_var.get()),
+                str(self.target_height_var.get()),
+                str(self.start_time_var.get()),
+                str(self.clip_duration_var.get()),
+                str(self.preview_crop_mode_var.get()),
+                f"crop={self.preview_crop_center[0]:.4f},{self.preview_crop_center[1]:.4f}",
+            ]
+        )
+
+    def _compare_cache_key_for_pct(self, pct: float) -> str:
+        return f"{self._compare_settings_fingerprint()}|pct={float(pct):.1f}"
+
+    def _invalidate_compare_cache(self) -> None:
+        self._compare_cache.clear()
+        self._compare_cache_key = None
+
+    def _apply_cached_compare_if_available(self, pct: float) -> bool:
+        key = self._compare_cache_key_for_pct(pct)
+        cached = self._compare_cache.get(key)
+        if cached is None and PIL_AVAILABLE:
+            disk_root = Path(tempfile.gettempdir()) / "pixelforge_compare_cache" / hashlib.sha256(key.encode("utf-8")).hexdigest()
+            before_path = disk_root / "before.png"
+            after_path = disk_root / "after.png"
+            if before_path.is_file() and after_path.is_file():
+                try:
+                    cached = (Image.open(before_path).convert("RGB"), Image.open(after_path).convert("RGB"))
+                    self._compare_cache[key] = cached
+                except Exception:
+                    cached = None
+        if cached is None:
+            return False
+        before_img, after_img = cached
+        self._set_compare_images(before_img.copy(), after_img.copy())
+        self.compare_honesty_var.set(
+            "Cached AI preview — drag the cyan line to compare."
+        )
+        self.preview_progress_var.set(100.0)
+        self.preview_status_var.set("Cached preview ready instantly.")
+        self._set_preview_cancel_enabled(False)
+        return True
+
+    def _set_preview_cancel_enabled(self, enabled: bool) -> None:
+        button = self.preview_cancel_button
+        if button is None or not button.winfo_exists():
+            return
+        button.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _cancel_preview(self) -> None:
+        self.preview_cancel_event.set()
+        self._set_preview_cancel_enabled(False)
+        process = self.preview_current_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        self.preview_status_var.set("Canceling preview…")
+
+    def _preview_crop_changed(self) -> None:
+        self._invalidate_compare_cache()
+        pct = float(self.compare_frame_pct_var.get())
+        source = self.filmstrip_source_images.get(pct)
+        if source is not None:
+            self._show_source_preview_only(source)
+        self._schedule_auto_compare(delay_ms=250)
+
+    def _preview_crop_box(
+        self,
+        image: Image.Image,
+        center: tuple[float, float] | None = None,
+        crop_mode: str | None = None,
+    ) -> tuple[int, int, int, int]:
+        width, height = image.size
+        if (crop_mode or self.preview_crop_mode_var.get()) == "Full frame":
+            return (0, 0, width, height)
+        center_x, center_y = center or self.preview_crop_center
+        if width >= height:
+            crop_width = min(width, 768)
+            crop_height = min(height, 432)
+        else:
+            crop_width = min(width, 432)
+            crop_height = min(height, 768)
+        x0 = max(0, min(width - crop_width, int((center_x * width) - (crop_width / 2))))
+        y0 = max(0, min(height - crop_height, int((center_y * height) - (crop_height / 2))))
+        return (x0, y0, x0 + crop_width, y0 + crop_height)
+
+    def _run_preview_command(self, cmd: list[str], cancel_event: threading.Event) -> None:
+        if cancel_event.is_set():
+            raise RuntimeError("Preview canceled by user")
+        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=_NO_WINDOW)
+        self.preview_current_process = process
+        try:
+            while process.poll() is None:
+                if cancel_event.wait(0.05):
+                    process.terminate()
+                    process.wait(timeout=3)
+                    raise RuntimeError("Preview canceled by user")
+            if process.returncode != 0:
+                detail = (process.stderr.read() if process.stderr else b"").decode("utf-8", errors="replace")[-1200:]
+                raise RuntimeError(f"Preview command failed ({process.returncode}): {detail}")
+        finally:
+            if self.preview_current_process is process:
+                self.preview_current_process = None
+
+    def _on_frame_slider_drag(self, raw: str) -> None:
+        """While dragging: only swap the source preview — never kick off AI upscale."""
+        try:
+            idx = int(round(float(raw)))
+        except Exception:
+            return
+        idx = max(0, min(len(self.filmstrip_pcts) - 1, idx))
+        if int(self.compare_frame_index_var.get()) != idx:
+            self.compare_frame_index_var.set(idx)
+        pct = self._pct_for_frame_index(idx)
+        self.compare_frame_pct_var.set(pct)
+        self._update_compare_frame_label()
+        if self._apply_cached_compare_if_available(pct):
+            return
+        source = self.filmstrip_source_images.get(float(pct))
+        if source is not None:
+            self._show_source_preview_only(source)
+
+    def _on_frame_slider_release(self) -> None:
+        """AI compare only after the user finishes sliding."""
+        self._on_compare_frame_index_changed(regenerate=True)
+
+    def _on_compare_frame_index_changed(self, _value: float | None = None, regenerate: bool = True) -> None:
+        idx = int(round(float(self.compare_frame_index_var.get())))
+        idx = max(0, min(len(self.filmstrip_pcts) - 1, idx))
+        if int(self.compare_frame_index_var.get()) != idx:
+            self.compare_frame_index_var.set(idx)
+        pct = self._pct_for_frame_index(idx)
+        self.compare_frame_pct_var.set(pct)
+        self._update_compare_frame_label()
+        if self._apply_cached_compare_if_available(pct):
+            return
+        source = self.filmstrip_source_images.get(float(pct))
+        if source is not None:
+            self._show_source_preview_only(source)
+        if regenerate:
+            self._schedule_auto_compare(delay_ms=650)
+
+    def _select_filmstrip_pct(self, pct: float, regenerate: bool = True) -> None:
+        idx = self._index_for_frame_pct(pct)
+        for index, button in enumerate(self.filmstrip_buttons):
+            button.configure(style="ProfileSelected.TButton" if index == idx else "Profile.TButton")
+        self.compare_frame_index_var.set(idx)
+        self.compare_frame_pct_var.set(float(self.filmstrip_pcts[idx]))
+        self._update_compare_frame_label()
+        target_pct = float(self.filmstrip_pcts[idx])
+        if self._apply_cached_compare_if_available(target_pct):
+            return
+        source = self.filmstrip_source_images.get(target_pct)
+        if source is not None:
+            self._show_source_preview_only(source)
+        if regenerate:
+            self._schedule_auto_compare(delay_ms=400)
+
+    def _show_source_preview_only(self, image: Image.Image) -> None:
+        if not PIL_AVAILABLE or image is None:
+            return
+        self.compare_before_pil = None
+        self.compare_after_pil = None
+        self._source_preview_pil = image
+        self._redraw_compare_canvas()
+
+    def _schedule_filmstrip_extract(self, delay_ms: int = 250) -> None:
+        if self._filmstrip_after_id:
+            self.after_cancel(self._filmstrip_after_id)
+        self._filmstrip_after_id = self.after(delay_ms, lambda: self._extract_filmstrip_frames(silent=True))
 
     def _set_selected_profile(self, profile_name: str) -> None:
         # Backward-compatible shim for older calls.
@@ -5622,6 +7258,10 @@ class V11BApp(tk.Tk):
     def _handle_interpolation_toggle(self) -> None:
         self._normalize_interpolation_choice(show_feedback=True)
         self._sync_target_fps_to_source_if_needed()
+        if self.enable_interpolation_var.get() and int(self.target_fps_var.get()) == 60:
+            self.frame_rate_target_var.set("Smooth 60 FPS")
+        elif not self.enable_interpolation_var.get():
+            self.frame_rate_target_var.set("Keep source")
         self._schedule_auto_estimate()
 
     def _register_auto_estimate_watchers(self) -> None:
@@ -5644,12 +7284,18 @@ class V11BApp(tk.Tk):
             self.unsharp1_var,
             self.unsharp2_var,
             self.enable_interpolation_var,
+            self.auto_deinterlace_var,
+            self.protect_high_bit_precision_var,
             self.target_fps_var,
             self.apply_final_scale_var,
             self.target_width_var,
             self.target_height_var,
             self.crf_var,
             self.encode_preset_var,
+            self.video_codec_var,
+            self.prefer_hardware_encode_var,
+            self.preserve_media_var,
+            self.chunk_size_var,
             self.include_audio_var,
         ]
         for var in watched_vars:
@@ -5658,15 +7304,99 @@ class V11BApp(tk.Tk):
         self.enable_interpolation_var.trace_add("write", lambda *_args: self._handle_interpolation_toggle())
 
     def _auto_prepare_after_input(self) -> None:
-        self.log_queue.put("[INFO] New input selected. Running estimate and compare frame automatically...")
+        self.log_queue.put("[INFO] New input selected. Building filmstrip, estimate, and compare preview...")
+        candidate = self.input_video_var.get().strip()
+        self._current_media_properties = None
+        self._current_media_properties_path = ""
+        self.quality_guard_notice_var.set("Analyzing source quality safeguards...")
+        if candidate and not PipelineRunner.is_image_input(Path(candidate)):
+            threading.Thread(
+                target=self._source_quality_worker,
+                args=(Path(candidate),),
+                daemon=True,
+                name="pixelforge-source-quality",
+            ).start()
+        else:
+            self.quality_guard_notice_var.set("")
         self.after(120, lambda: self._estimate_time(silent=True))
-        self.after(300, lambda: self._generate_compare_frame(silent=True))
+        self.after(180, lambda: self._schedule_filmstrip_extract(delay_ms=50))
+
+    def _source_quality_worker(self, input_path: Path) -> None:
+        try:
+            properties = probe_media(input_path)
+        except Exception as exc:
+            self.log_queue.put(f"[WARN] Source quality analysis unavailable: {exc}")
+            self.after(0, lambda: self.quality_guard_notice_var.set("Source quality analysis unavailable; preview before rendering."))
+            return
+        self.after(0, lambda: self._apply_source_quality_guard(input_path, properties))
+
+    def _quality_assessment(self, properties):
+        return assess_quality(
+            properties,
+            model_key=self.model_var.get().strip(),
+            content_name=self.selected_upscaling_profile,
+            target_width=int(self.target_width_var.get()),
+            target_height=int(self.target_height_var.get()),
+        )
+
+    def _apply_source_quality_guard(self, input_path: Path, properties) -> None:
+        if self.input_video_var.get().strip() != str(input_path):
+            return
+        self._current_media_properties = properties
+        self._current_media_properties_path = str(input_path)
+        assessment = self._quality_assessment(properties)
+        routed = False
+        if (
+            self.protect_high_bit_precision_var.get()
+            and assessment.precision_model
+            and assessment.precision_scale
+        ):
+            self.model_var.set(assessment.precision_model)
+            self.scale_var.set(assessment.precision_scale)
+            self._sync_display_from_model()
+            routed = True
+
+        notices = list(assessment.notices)
+        if routed:
+            notices[0] = (
+                f"HDR/10-bit precision guard selected {assessment.precision_model}; "
+                "the bundled NCNN engines would quantize AI inference to 8-bit."
+            )
+            self.log_queue.put(f"[INFO] {notices[0]}")
+        for notice in notices[1 if routed else 0:]:
+            self.log_queue.put(f"[WARN] {notice}")
+        self.quality_guard_notice_var.set("Quality guard: " + " ".join(notices) if notices else "Quality guard: source path is safe.")
+        self._update_profile_summary()
+        if routed:
+            self._invalidate_compare_cache()
+            self._schedule_auto_compare(delay_ms=350)
+
+    def _apply_cached_precision_guard(self) -> None:
+        candidate = self.input_video_var.get().strip()
+        if (
+            not candidate
+            or not self.protect_high_bit_precision_var.get()
+            or self._current_media_properties is None
+            or self._current_media_properties_path != candidate
+        ):
+            return
+        assessment = self._quality_assessment(self._current_media_properties)
+        if assessment.precision_model and assessment.precision_scale:
+            self.model_var.set(assessment.precision_model)
+            self.scale_var.set(assessment.precision_scale)
+            self._sync_display_from_model()
 
     def _pick_output(self) -> None:
         file_path = filedialog.asksaveasfilename(
-            title="Select output video",
+            title="Select output media",
             defaultextension=".mp4",
-            filetypes=[("MP4", "*.mp4"), ("All files", "*.*")],
+            filetypes=[
+                ("MP4 video", "*.mp4"),
+                ("Matroska video (best stream preservation)", "*.mkv"),
+                ("QuickTime / ProRes", "*.mov"),
+                ("Images", "*.png *.jpg *.jpeg *.webp *.tif *.tiff"),
+                ("All files", "*.*"),
+            ],
         )
         if file_path:
             self.output_video_var.set(file_path)
@@ -5694,33 +7424,56 @@ class V11BApp(tk.Tk):
             return
         if width <= 0 or height <= 0:
             return
-        scale = max(1, int(self.scale_var.get()))
-        self.target_width_var.set(self._even_dimension(width * scale))
-        self.target_height_var.set(self._even_dimension(height * scale))
+        self._apply_output_target(source_width=width, source_height=height)
+
+    def _apply_output_target(self, source_width: int | None = None, source_height: int | None = None) -> None:
+        """Translate the customer-facing deliverable into final pipeline dimensions."""
+        width = int(source_width or 0)
+        height = int(source_height or 0)
+        if width <= 0 or height <= 0:
+            candidate = self.input_video_var.get().strip()
+            if not candidate or not Path(candidate).exists():
+                return
+            try:
+                width = int(PipelineRunner._ffprobe_value(Path(candidate), "width") or 0)
+                height = int(PipelineRunner._ffprobe_value(Path(candidate), "height") or 0)
+            except Exception:
+                return
+        try:
+            target_width, target_height = target_dimensions(width, height, self.output_target_var.get())
+        except ValueError:
+            return
+        self.target_width_var.set(target_width)
+        self.target_height_var.set(target_height)
+        self.apply_final_scale_var.set(True)
+        self.preserve_aspect_ratio_var.set(False)
+        self._update_profile_summary()
+        self._invalidate_compare_cache()
+        self._schedule_auto_compare(delay_ms=500)
 
     def _update_profile_summary(self) -> None:
         speed_label = {
-            "fast": "Quick Preview",
-            "balanced": "Balanced Workflow",
+            "fast": "Fast Preview",
+            "balanced": "Balanced",
             "quality": "Max Detail",
+            "nvidia": "NVIDIA RTX",
         }.get(self.selected_speed_profile, self.selected_speed_profile)
         upscaling_label = {
-            "live": "Natural Footage",
-            "animation": "Animation / Anime",
-            "restore": "Legacy / Noisy Repair",
+            "live": "People / camera",
+            "animation": "Anime / game",
+            "restore": "Old / noisy",
         }.get(self.selected_upscaling_profile, self.selected_upscaling_profile)
         model_label = MODEL_KEY_TO_LABEL.get(self.model_var.get().strip(), self.model_var.get().strip())
-        scale = int(self.scale_var.get())
-        final_scale = "on" if self.apply_final_scale_var.get() else "off"
+        target_label = self.output_target_var.get().strip() or "Same resolution"
         if self.apply_final_scale_var.get():
             aspect_note = "preserve aspect" if self.preserve_aspect_ratio_var.get() else "stretch to fit"
-            output_dims = f"{int(self.target_width_var.get())}x{int(self.target_height_var.get())} ({aspect_note})"
+            output_dims = f"{target_label} — {int(self.target_width_var.get())}x{int(self.target_height_var.get())} ({aspect_note})"
         else:
-            output_dims = f"native x{scale} upscale (no forced resize)"
-        interp = "on" if self.enable_interpolation_var.get() else "off"
+            output_dims = target_label
+        interp = "60 FPS (RIFE)" if self.enable_interpolation_var.get() and self.target_fps_var.get() == 60 else "source FPS"
         self.profile_summary_var.set(
             f"Active: {speed_label} + {upscaling_label} | model={model_label.split('(')[0].strip()} | "
-            f"scale={scale}x | final scale={final_scale} | output={output_dims} | interpolation={interp}"
+            f"output={output_dims} | motion={interp}"
         )
         guidance = {
             "live": "Recommended for phone/camera footage, people, products, and real-world scenes.",
@@ -5728,19 +7481,20 @@ class V11BApp(tk.Tk):
             "restore": "Use for visibly compressed, blocky, noisy, or older footage; it intentionally smooths artifacts.",
         }.get(self.selected_upscaling_profile, "")
         speed_guidance = {
-            "fast": "Quick Preview favors speed and a smaller 2x result.",
-            "balanced": "Balanced is the safest first run for most files.",
-            "quality": "Max Detail uses a native 4x model and can take substantially longer.",
+            "fast": "Fast Preview favors a faster model for testing.",
+            "balanced": "Balanced is the safest first full run for most files.",
+            "quality": "Max Detail uses the strongest model stack and can take substantially longer.",
+            "nvidia": "NVIDIA RTX uses the optional official VSR Ultra engine for compatible SDR media.",
         }.get(self.selected_speed_profile, "")
         self.profile_guidance_var.set(f"{guidance} {speed_guidance}".strip())
 
     def _sync_rife_model_from_display(self) -> None:
         label = self.rife_model_display_var.get().strip()
-        self.rife_model_var.set(RIFE_MODEL_LABEL_TO_KEY.get(label, "rife-v4.6"))
+        self.rife_model_var.set(RIFE_MODEL_LABEL_TO_KEY.get(label, "rife-v4.25"))
 
     def _sync_rife_display_from_model(self) -> None:
         key = self.rife_model_var.get().strip()
-        self.rife_model_display_var.set(RIFE_MODEL_KEY_TO_LABEL.get(key, RIFE_MODEL_KEY_TO_LABEL["rife-v4.6"]))
+        self.rife_model_display_var.set(RIFE_MODEL_KEY_TO_LABEL.get(key, RIFE_MODEL_KEY_TO_LABEL["rife-v4.25"]))
 
     def _sync_model_from_display(self) -> None:
         label = self.model_display_var.get().strip()
@@ -5750,7 +7504,175 @@ class V11BApp(tk.Tk):
 
     def _sync_display_from_model(self) -> None:
         key = self.model_var.get().strip()
-        self.model_display_var.set(MODEL_KEY_TO_LABEL.get(key, MODEL_KEY_TO_LABEL["waifu2x-cunet-noise1"]))
+        self.model_display_var.set(MODEL_KEY_TO_LABEL.get(key, MODEL_KEY_TO_LABEL["realesrgan-x4plus"]))
+
+    def _extract_filmstrip_frames(self, silent: bool = False) -> None:
+        input_path = self.input_video_var.get().strip()
+        if not input_path:
+            return
+        if not PIL_AVAILABLE:
+            if not silent:
+                messagebox.showerror("Missing dependency", "Install Pillow to enable filmstrip previews.")
+            return
+        path = Path(input_path)
+        if not path.exists():
+            return
+        if self.filmstrip_worker_thread and self.filmstrip_worker_thread.is_alive():
+            self._filmstrip_regen_pending = True
+            return
+
+        self.compare_canvas.delete("placeholder")
+        self.preview_progress_var.set(2.0)
+        self.preview_status_var.set("Loading three source frames in parallel…")
+        self.compare_canvas.create_text(
+            260,
+            210,
+            text="Loading sample frames…",
+            fill="#86a6d8",
+            font=("Segoe UI", 11),
+            tags=("placeholder",),
+        )
+
+        self.filmstrip_worker_thread = threading.Thread(
+            target=self._extract_filmstrip_worker,
+            args=(path, float(self.start_time_var.get()), float(self.clip_duration_var.get())),
+            daemon=True,
+        )
+        self.filmstrip_worker_thread.start()
+
+    def _extract_filmstrip_worker(self, input_path: Path, start_time: float, clip_duration: float) -> None:
+        try:
+            frame_numbers: dict[float, int] = {}
+            total_frames = 1
+            if PipelineRunner.is_image_input(input_path):
+                image = Image.open(input_path).convert("RGB")
+                images = {pct: image.copy() for pct in self.filmstrip_pcts}
+                frame_numbers = {float(pct): 1 for pct in self.filmstrip_pcts}
+                chosen = 50.0
+            else:
+                duration = PipelineRunner.get_video_duration(input_path)
+                fps = PipelineRunner.get_fps(input_path)
+                total_frames = PipelineRunner.get_frame_count(input_path)
+                plan = build_compare_timestamp_plan(
+                    duration,
+                    start_time=start_time,
+                    clip_duration=clip_duration,
+                    frame_pct=50.0,
+                    filmstrip_pcts=self.filmstrip_pcts,
+                )
+                compare_root = Path(tempfile.gettempdir()) / "pixelforge_compare" / self._safe_name(input_path.stem) / "filmstrip"
+                compare_root.mkdir(parents=True, exist_ok=True)
+                images = {}
+                brightness: dict[float, float] = {}
+                for pct, ts in zip(plan.filmstrip_pcts, plan.filmstrip_timestamps):
+                    frame_numbers[float(pct)] = min(total_frames, max(1, int(round(ts * fps)) + 1))
+
+                def _extract_one(pct: float, ts: float) -> tuple[float, Image.Image, float]:
+                    out_path = compare_root / f"thumb_{int(pct)}.png"
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-ss",
+                        str(max(0.0, ts)),
+                        "-i",
+                        str(input_path),
+                        "-frames:v",
+                        "1",
+                        str(out_path),
+                    ]
+                    subprocess.run(cmd, check=True, creationflags=_NO_WINDOW)
+                    with Image.open(out_path) as loaded:
+                        img = loaded.convert("RGB")
+                    return float(pct), img, mean_luma(img)
+
+                with ThreadPoolExecutor(max_workers=3, thread_name_prefix="pixelforge-filmstrip") as pool:
+                    futures = [
+                        pool.submit(_extract_one, float(pct), float(ts))
+                        for pct, ts in zip(plan.filmstrip_pcts, plan.filmstrip_timestamps)
+                    ]
+                    for completed, future in enumerate(as_completed(futures), start=1):
+                        pct, img, luma = future.result()
+                        images[pct] = img
+                        brightness[pct] = luma
+                        progress = 5.0 + (completed / len(futures) * 35.0)
+                        self.after(0, lambda value=progress: self.preview_progress_var.set(value))
+                chosen = pick_default_filmstrip_pct(brightness, candidates=self.filmstrip_pcts, preferred=50.0)
+
+            self.after(0, lambda: self._apply_filmstrip_images(images, chosen, frame_numbers, total_frames))
+        except Exception as exc:
+            self.log_queue.put(f"[ERROR] Filmstrip extract failed: {exc}")
+            self.after(0, self._reset_filmstrip_placeholders)
+        finally:
+            if self._filmstrip_regen_pending:
+                self._filmstrip_regen_pending = False
+                self.after(150, lambda: self._extract_filmstrip_frames(silent=True))
+
+    def _reset_filmstrip_placeholders(self) -> None:
+        self.filmstrip_source_images.clear()
+        self.filmstrip_frame_numbers.clear()
+        self.filmstrip_total_frames = 0
+        self.preview_progress_var.set(0.0)
+        self.preview_status_var.set("Could not load the three source frames.")
+        for index, button in enumerate(self.filmstrip_buttons):
+            self.filmstrip_button_photos[index] = None
+            button.configure(image="", text=f"Sample {index + 1}\nUnavailable", style="Profile.TButton")
+        self._source_preview_pil = None
+        self.compare_canvas.delete("all")
+        self.compare_canvas.create_text(
+            260,
+            210,
+            text="Could not load sample frames.",
+            fill="#86a6d8",
+            font=("Segoe UI", 11),
+            tags=("placeholder",),
+        )
+
+    def _apply_filmstrip_images(
+        self,
+        images: dict[float, Image.Image],
+        chosen_pct: float,
+        frame_numbers: dict[float, int] | None = None,
+        total_frames: int = 0,
+    ) -> None:
+        if not PIL_AVAILABLE:
+            return
+        self._invalidate_compare_cache()
+        self.filmstrip_source_images = {float(k): v for k, v in images.items()}
+        self.filmstrip_frame_numbers = dict(frame_numbers or {})
+        self.filmstrip_total_frames = int(total_frames)
+        for index, pct in enumerate(self.filmstrip_pcts):
+            if index >= len(self.filmstrip_buttons):
+                break
+            source_thumb = self.filmstrip_source_images.get(float(pct))
+            if source_thumb is None:
+                continue
+            thumb = source_thumb.copy()
+            thumb.thumbnail((180, 86), RESAMPLE_FILTER)
+            photo = ImageTk.PhotoImage(thumb)
+            self.filmstrip_button_photos[index] = photo
+            number = self.filmstrip_frame_numbers.get(float(pct), index + 1)
+            self.filmstrip_buttons[index].configure(image=photo, text=f"Frame {number:,}", compound="top")
+        chosen_idx = self._index_for_frame_pct(chosen_pct)
+        for index, button in enumerate(self.filmstrip_buttons):
+            button.configure(style="ProfileSelected.TButton" if index == chosen_idx else "Profile.TButton")
+        self.compare_frame_index_var.set(chosen_idx)
+        self.compare_frame_pct_var.set(float(self.filmstrip_pcts[chosen_idx]))
+        self._update_compare_frame_label()
+        source = self.filmstrip_source_images.get(float(self.filmstrip_pcts[chosen_idx]))
+        if source is not None:
+            self._show_source_preview_only(source)
+        self.compare_canvas.delete("placeholder")
+        self.preview_progress_var.set(45.0)
+        self.preview_status_var.set("Three source frames ready. Generating selected AI detail crop…")
+        frame_list = ", ".join(
+            f"{self.filmstrip_frame_numbers.get(float(p), index + 1):,}"
+            for index, p in enumerate(self.filmstrip_pcts)
+        )
+        self.log_queue.put(f"[INFO] Sample frames ready (source frames {frame_list}).")
+        self._schedule_auto_compare(delay_ms=250)
 
     def _generate_compare_frame(self, silent: bool = False) -> None:
         if not self.input_video_var.get().strip():
@@ -5762,10 +7684,16 @@ class V11BApp(tk.Tk):
             else:
                 messagebox.showerror("Missing dependency", msg)
             return
+
+        pct = float(self.compare_frame_pct_var.get())
+        if self._apply_cached_compare_if_available(pct):
+            return
+
         if self.compare_worker_thread and self.compare_worker_thread.is_alive():
             self._compare_regen_pending = True
+            self.preview_cancel_event.set()
             if not silent:
-                messagebox.showwarning("Busy", "Compare frame generation is running. It will regenerate again after completion.")
+                self.preview_status_var.set("Updating preview with the new selection…")
             return
 
         try:
@@ -5777,16 +7705,28 @@ class V11BApp(tk.Tk):
                 messagebox.showerror("Invalid settings", str(exc))
             return
 
+        cancel_event = threading.Event()
+        self.preview_cancel_event = cancel_event
+        crop_mode = self.preview_crop_mode_var.get()
+        crop_center = tuple(self.preview_crop_center)
+        cache_key = self._compare_cache_key_for_pct(pct)
+        self._set_preview_cancel_enabled(True)
+        self.preview_progress_var.set(max(45.0, self.preview_progress_var.get()))
+        self.preview_status_var.set("Preparing selected AI preview…")
         self.log_queue.put("[INFO] Preparing before/after compare frame...")
         self.compare_worker_thread = threading.Thread(
             target=self._generate_compare_worker,
-            args=(settings,),
+            args=(settings, crop_mode, crop_center, cancel_event, cache_key),
             daemon=True,
         )
         self.compare_worker_thread.start()
 
     def _schedule_auto_compare(self, delay_ms: int = 700) -> None:
         self._update_profile_summary()
+        self._update_compare_frame_label()
+        pct = float(self.compare_frame_pct_var.get())
+        if self._apply_cached_compare_if_available(pct):
+            return
         if self._compare_after_id:
             self.after_cancel(self._compare_after_id)
         self._compare_after_id = self.after(delay_ms, lambda: self._generate_compare_frame(silent=True))
@@ -5799,8 +7739,6 @@ class V11BApp(tk.Tk):
             self.model_var,
             self.scale_var,
             self.image_format_var,
-            self.start_time_var,
-            self.clip_duration_var,
             self.denoise_var,
             self.enable_color_var,
             self.vibrance_var,
@@ -5815,17 +7753,62 @@ class V11BApp(tk.Tk):
             self.apply_final_scale_var,
             self.target_width_var,
             self.target_height_var,
-            self.compare_frame_pct_var,
         ]
-        for var in watched_vars:
-            var.trace_add("write", lambda *_args: self._schedule_auto_compare())
 
-    def _generate_compare_worker(self, settings: PipelineSettings) -> None:
+        def _on_visual_setting_change(*_args) -> None:
+            self._invalidate_compare_cache()
+            self._schedule_auto_compare(delay_ms=900)
+
+        for var in watched_vars:
+            var.trace_add("write", _on_visual_setting_change)
+        for var in (self.start_time_var, self.clip_duration_var):
+            var.trace_add("write", lambda *_args: self._schedule_filmstrip_extract(delay_ms=450))
+
+    def _generate_compare_worker(
+        self,
+        settings: PipelineSettings,
+        crop_mode: str,
+        crop_center: tuple[float, float],
+        cancel_event: threading.Event,
+        cache_key: str,
+    ) -> None:
         try:
             model_key = settings.model
+            onnx_preview_runner: OnnxUpscaler | None = None
 
             # Select correct binary + build upscale command for the compare frame
-            if model_key.startswith("realsr-"):
+            if model_key == NVIDIA_MODEL_KEY:
+                worker = discover_nvidia_worker(_APP_DIR, _PERSISTENT_DATA_DIR)
+                if worker is None:
+                    raise FileNotFoundError("The optional NVIDIA RTX engine pack is not installed")
+                exe_label = "NVIDIA RTX VSR Ultra"
+                def _build_upscale_cmd(src, dst, scale):
+                    with Image.open(src) as preview_source:
+                        preview_w, preview_h = preview_source.size
+                    preview_scale = 2
+                    quality = {
+                        "auto-clean": "clean-ultra",
+                        "auto-restore": "ultra",
+                        "auto-standard": "ultra",
+                    }.get(settings.nvidia_vsr_mode, "ultra")
+                    return nvidia_worker_command(
+                        worker,
+                        [
+                            "--input-image", str(src),
+                            "--output-image", str(dst),
+                            "--output-width", str(preview_w * preview_scale),
+                            "--output-height", str(preview_h * preview_scale),
+                            "--quality", quality,
+                        ],
+                    )
+            elif model_key in ONNX_MODEL_CATALOG:
+                model = ONNX_MODEL_CATALOG[model_key]
+                model_path = _ONNX_MODELS_DIR / model.filename
+                onnx_preview_runner = OnnxUpscaler(model_path, model.scale, tile_size=256, context=16)
+                exe_label = "SPAN DirectML"
+                def _build_upscale_cmd(src, dst, scale):
+                    return []
+            elif model_key.startswith("realsr-"):
                 exe_path = _REALSR_EXE
                 exe_label = "RealSR"
                 if not exe_path.exists():
@@ -5855,6 +7838,41 @@ class V11BApp(tk.Tk):
                         "-n", waifu_noise, "-s", str(waifu_scale),
                         "-m", str(waifu_model_dir), "-f", "png", "-j", settings.threads,
                     ]
+            elif model_key.startswith("realcugan-"):
+                exe_path = _REALCUGAN_EXE
+                exe_label = "Real-CUGAN"
+                cfg = REALCUGAN_MODEL_CONFIGS.get(model_key)
+                if not cfg:
+                    raise ValueError(f"Unknown Real-CUGAN model: {model_key}")
+                family_dir = _REALCUGAN_MODELS_DIR / f"models-{cfg['family']}"
+                if not exe_path.exists():
+                    raise FileNotFoundError(f"realcugan-ncnn-vulkan.exe not found (final candidate: {exe_path})")
+                if not family_dir.exists():
+                    raise FileNotFoundError(f"Real-CUGAN models not found: {family_dir}")
+                def _build_upscale_cmd(src, dst, scale):
+                    return [
+                        str(exe_path), "-i", str(src), "-o", str(dst),
+                        "-m", str(family_dir),
+                        "-n", str(cfg["noise"]), "-s", str(cfg["scale"]),
+                        "-f", "png", "-j", settings.threads,
+                    ]
+            elif model_key.startswith("srmd-"):
+                exe_path = _SRMD_EXE
+                exe_label = "SRMD"
+                cfg = SRMD_MODEL_CONFIGS.get(model_key)
+                if not cfg:
+                    raise ValueError(f"Unknown SRMD model: {model_key}")
+                if not exe_path.exists():
+                    raise FileNotFoundError(f"srmd-ncnn-vulkan.exe not found (final candidate: {exe_path})")
+                if not _SRMD_MODELS_DIR.exists():
+                    raise FileNotFoundError(f"SRMD models not found: {_SRMD_MODELS_DIR}")
+                def _build_upscale_cmd(src, dst, scale):
+                    return [
+                        str(exe_path), "-i", str(src), "-o", str(dst),
+                        "-m", str(_SRMD_MODELS_DIR),
+                        "-n", str(cfg["noise"]), "-s", str(cfg["scale"]),
+                        "-f", "png", "-j", settings.threads,
+                    ]
             else:
                 exe_path = _REALESRGAN_EXE
                 exe_label = "Real-ESRGAN"
@@ -5869,9 +7887,10 @@ class V11BApp(tk.Tk):
                         "-s", str(scale), "-f", "png", "-j", settings.threads,
                     ]
 
-            compare_root = Path(tempfile.gettempdir()) / "pixelforge_compare" / self._safe_name(settings.input_video.stem)
+            compare_root = Path(tempfile.gettempdir()) / "pixelforge_compare_cache" / hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
             compare_root.mkdir(parents=True, exist_ok=True)
 
+            source_frame = compare_root / "source.png"
             before_frame = compare_root / "before.png"
             pre_frame = compare_root / "pre.png"
             upscaled_frame = compare_root / "upscaled.png"
@@ -5884,60 +7903,82 @@ class V11BApp(tk.Tk):
             if settings.clip_duration > 0:
                 effective_duration = min(effective_duration, settings.clip_duration)
 
+            plan = build_compare_timestamp_plan(
+                duration,
+                start_time=settings.start_time,
+                clip_duration=settings.clip_duration,
+                frame_pct=float(self.compare_frame_pct_var.get()),
+            )
             frame_pct = float(self.compare_frame_pct_var.get())
-            primary_ts = settings.start_time + effective_duration * (frame_pct / 100.0)
-            candidate_timestamps = [primary_ts]
-            for pct in (5, 15, 25, 40, 50, 60, 75, 85, 95):
-                ts = settings.start_time + effective_duration * (pct / 100.0)
-                if all(abs(ts - existing) > 0.04 for existing in candidate_timestamps):
-                    candidate_timestamps.append(ts)
-
-            best_candidate = compare_root / "candidate_best.png"
-            best_score = -1.0
-            for index, timestamp in enumerate(candidate_timestamps):
-                candidate_path = compare_root / f"candidate_{index:02d}.png"
+            reused_source = False
+            nearest_pct = min(self.filmstrip_pcts, key=lambda pct: abs(pct - frame_pct)) if self.filmstrip_pcts else frame_pct
+            frame_number = self.filmstrip_frame_numbers.get(float(nearest_pct), 0) if self.filmstrip_frame_numbers else 0
+            cached = self.filmstrip_source_images.get(float(nearest_pct))
+            if cached is not None and abs(frame_pct - float(nearest_pct)) < 0.51:
+                cached.convert("RGB").save(source_frame)
+                reused_source = True
+            else:
                 extract_cmd = [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-ss", str(max(0.0, timestamp)),
+                    "-ss", str(max(0.0, plan.primary_ts)),
                     "-i", str(settings.input_video),
                     "-frames:v", "1",
-                    str(candidate_path),
+                    str(source_frame),
                 ]
-                try:
-                    subprocess.run(extract_cmd, check=True, creationflags=_NO_WINDOW)
-                    with Image.open(candidate_path) as candidate_img:
-                        score = ImageStat.Stat(candidate_img.convert("L")).mean[0]
-                    if score > best_score:
-                        best_score = score
-                        best_candidate.write_bytes(candidate_path.read_bytes())
-                except Exception:
-                    continue
-
-            if best_score < 0:
-                extract_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-                if settings.start_time > 0:
-                    extract_cmd.extend(["-ss", str(settings.start_time)])
-                extract_cmd += ["-i", str(settings.input_video), "-frames:v", "1", str(before_frame)]
-                subprocess.run(extract_cmd, check=True, creationflags=_NO_WINDOW)
-            else:
-                before_frame.write_bytes(best_candidate.read_bytes())
-                self.log_queue.put(
-                    f"[INFO] Compare preview frame selected at ~{frame_pct:.0f}% through clip "
-                    f"(brightness score {best_score:.1f})."
+                self._run_preview_command(extract_cmd, cancel_event)
+            with Image.open(source_frame) as full_source:
+                full_source = full_source.convert("RGB")
+                crop_box = self._preview_crop_box(full_source, center=crop_center, crop_mode=crop_mode)
+                full_source.crop(crop_box).save(before_frame, format="PNG", compress_level=1)
+            self.after(0, lambda: self.preview_progress_var.set(52.0))
+            self.after(0, lambda: self.preview_status_var.set(f"Running {exe_label} on the selected crop…"))
+            self.log_queue.put(
+                f"[INFO] Compare preview uses source frame {frame_number or 'sample'} "
+                f"(t={plan.primary_ts:.2f}s"
+                f"{', filmstrip cache' if reused_source else ''}). Still preview only — not full video."
+            )
+            try:
+                note = (
+                    f"Still preview of source frame {frame_number or 'sample'} (1 of 3) — not the full video. "
+                    "Motion interpolation is not shown in still compare."
                 )
+                self.after(0, lambda n=note: self.compare_honesty_var.set(n))
+            except Exception:
+                pass
 
-            pre_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_pre_filter()
+            preview_media_props = None
+            if not PipelineRunner.is_image_input(settings.input_video):
+                try:
+                    preview_media_props = probe_media(settings.input_video)
+                except Exception:
+                    preview_media_props = None
+            pre_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_pre_filter(preview_media_props)
             source_for_upscale = before_frame
             if pre_filter:
                 pre_cmd = [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     "-i", str(before_frame), "-vf", pre_filter, str(pre_frame),
                 ]
-                subprocess.run(pre_cmd, check=True, creationflags=_NO_WINDOW)
+                self._run_preview_command(pre_cmd, cancel_event)
                 source_for_upscale = pre_frame
 
-            upscale_cmd = _build_upscale_cmd(source_for_upscale, upscaled_frame, settings.scale)
-            subprocess.run(upscale_cmd, check=True, creationflags=_NO_WINDOW)
+            if onnx_preview_runner is not None:
+                def _onnx_progress(done: int, total: int) -> None:
+                    value = 55.0 + ((done / max(1, total)) * 35.0)
+                    self.after(0, lambda progress_value=value: self.preview_progress_var.set(progress_value))
+
+                with Image.open(source_for_upscale) as source_image:
+                    enhanced_image = onnx_preview_runner.upscale_image(
+                        source_image,
+                        cancel_event=cancel_event,
+                        progress=_onnx_progress,
+                    )
+                enhanced_image.save(upscaled_frame, format="PNG", compress_level=1)
+                self.log_queue.put(f"[INFO] Preview AI provider: {onnx_preview_runner.provider}")
+            else:
+                upscale_cmd = _build_upscale_cmd(source_for_upscale, upscaled_frame, settings.scale)
+                self._run_preview_command(upscale_cmd, cancel_event)
+                self.after(0, lambda: self.preview_progress_var.set(90.0))
 
             post_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_post_filter()
             if post_filter:
@@ -5953,22 +7994,31 @@ class V11BApp(tk.Tk):
                     post_filter,
                     str(after_frame),
                 ]
-                subprocess.run(post_cmd, check=True, creationflags=_NO_WINDOW)
+                self._run_preview_command(post_cmd, cancel_event)
             else:
                 after_frame.write_bytes(upscaled_frame.read_bytes())
 
             before_img = Image.open(before_frame).convert("RGB")
             after_img = Image.open(after_frame).convert("RGB")
             self.after(0, lambda: self._set_compare_images(before_img, after_img))
+            self.after(0, lambda: self.preview_progress_var.set(100.0))
+            self.after(0, lambda: self.preview_status_var.set("AI preview ready. Drag the cyan line to compare."))
             self.log_queue.put("[INFO] Compare frame ready. Drag the separator line to inspect before/after.")
         except Exception as exc:
-            self.log_queue.put(f"[ERROR] Compare frame error: {exc}")
-            for hint in self._troubleshooting_hints(str(exc)):
-                self.log_queue.put(f"[HINT] {hint}")
+            if "canceled by user" in str(exc).lower():
+                self.log_queue.put("[INFO] Preview generation canceled.")
+                self.after(0, lambda: self.preview_status_var.set("Preview canceled."))
+            else:
+                self.log_queue.put(f"[ERROR] Compare frame error: {exc}")
+                self.after(0, lambda: self.preview_status_var.set(f"Preview failed: {exc}"))
+                for hint in self._troubleshooting_hints(str(exc)):
+                    self.log_queue.put(f"[HINT] {hint}")
         finally:
             if self._compare_regen_pending:
                 self._compare_regen_pending = False
                 self.after(120, lambda: self._generate_compare_frame(silent=True))
+            else:
+                self.after(0, lambda: self._set_preview_cancel_enabled(False))
 
     def _open_large_compare_window(self) -> None:
         if self.compare_window and self.compare_window.winfo_exists():
@@ -5987,23 +8037,15 @@ class V11BApp(tk.Tk):
 
         controls = ttk.Frame(top, style="Panel.TFrame")
         controls.pack(fill=X)
-        ttk.Label(controls, text="Before / After", style="Hint.TLabel").pack(side=LEFT)
-        ttk.Label(controls, text="Split", style="Hint.TLabel").pack(side=LEFT, padx=(12, 0))
-        ttk.Scale(
-            controls,
-            from_=0,
-            to=100,
-            variable=self.compare_slider_var,
-            command=lambda _v: self._redraw_compare_canvas(),
-        ).pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
-        ttk.Label(controls, text="Preview %", style="Hint.TLabel").pack(side=LEFT, padx=(8, 0))
-        ttk.Scale(
-            controls,
-            from_=0,
-            to=100,
-            variable=self.compare_frame_pct_var,
-            command=lambda _v: self._schedule_auto_compare(delay_ms=250),
-        ).pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
+        ttk.Label(controls, text="Drag the cyan separator on the image", style="Hint.TLabel").pack(side=LEFT)
+        for index, pct in enumerate(self.filmstrip_pcts):
+            ttk.Button(
+                controls,
+                text=f"Sample {index + 1}",
+                command=lambda p=pct: self._select_filmstrip_pct(p, regenerate=True),
+                style="Profile.TButton",
+            ).pack(side=LEFT, padx=(8 if index == 0 else 4, 0))
+        ttk.Label(controls, textvariable=self.compare_frame_label_var, style="Hint.TLabel").pack(side=LEFT, padx=(8, 0))
 
         ttk.Button(
             controls,
@@ -6019,24 +8061,73 @@ class V11BApp(tk.Tk):
         )
         canvas.pack(fill=BOTH, expand=True, pady=(8, 0))
         canvas.bind("<Configure>", lambda _event: self._redraw_compare_canvas())
+        canvas.bind("<Button-1>", lambda event: self._set_compare_split_from_canvas(canvas, event.x))
+        canvas.bind("<B1-Motion>", lambda event: self._set_compare_split_from_canvas(canvas, event.x))
         self.compare_canvas_large = canvas
         window.bind("<Escape>", lambda _event: window.attributes("-fullscreen", False))
         self._redraw_compare_canvas()
 
     def _set_compare_images(self, before_image: Image.Image, after_image: Image.Image) -> None:
-        self.compare_before_pil = before_image
-        self.compare_after_pil = after_image
+        aligned_before, aligned_after = align_before_after_images(before_image, after_image, RESAMPLE_FILTER)
+        self.compare_before_pil = aligned_before
+        self.compare_after_pil = aligned_after
+        self._source_preview_pil = None
         self.compare_slider_var.set(50.0)
+        try:
+            pct = float(self.compare_frame_pct_var.get())
+            key = self._compare_cache_key_for_pct(pct)
+            self._compare_cache[key] = (aligned_before.copy(), aligned_after.copy())
+            self._compare_cache_key = key
+        except Exception:
+            pass
         self._redraw_compare_canvas()
 
     def _render_compare_to_canvas(self, canvas: tk.Canvas, photo_attr: str) -> None:
         if not PIL_AVAILABLE:
             return
-        if self.compare_before_pil is None or self.compare_after_pil is None:
-            return
 
         canvas_w = max(2, canvas.winfo_width())
         canvas_h = max(2, canvas.winfo_height())
+
+        if self.compare_before_pil is None or self.compare_after_pil is None:
+            source = getattr(self, "_source_preview_pil", None)
+            if source is None:
+                return
+            fitted = source.resize((canvas_w, canvas_h), RESAMPLE_FILTER)
+            photo = ImageTk.PhotoImage(fitted)
+            setattr(self, photo_attr, photo)
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor=NW, image=photo)
+            canvas.create_text(
+                12,
+                12,
+                text="Source frame — generating AI compare…",
+                fill="#b8d4ff",
+                font=("Segoe UI", 9, "bold"),
+                anchor=NW,
+            )
+            if self.preview_crop_mode_var.get() != "Full frame":
+                x0, y0, x1, y1 = self._preview_crop_box(source)
+                sx = canvas_w / max(1, source.width)
+                sy = canvas_h / max(1, source.height)
+                canvas.create_rectangle(
+                    x0 * sx,
+                    y0 * sy,
+                    x1 * sx,
+                    y1 * sy,
+                    outline="#00e7ff",
+                    width=3,
+                    dash=(7, 4),
+                )
+                canvas.create_text(
+                    (x0 * sx) + 8,
+                    (y0 * sy) + 8,
+                    text="AI detail crop — click to move",
+                    fill="#d8fbff",
+                    font=("Segoe UI", 9, "bold"),
+                    anchor=NW,
+                )
+            return
 
         before_fit = self.compare_before_pil.resize((canvas_w, canvas_h), RESAMPLE_FILTER)
         after_fit = self.compare_after_pil.resize((canvas_w, canvas_h), RESAMPLE_FILTER)
@@ -6134,9 +8225,26 @@ class V11BApp(tk.Tk):
 
     def _on_compare_mouse_press(self, event) -> None:
         """Handle mouse press on compare canvas to start dragging separator."""
+        if (self.compare_before_pil is None or self.compare_after_pil is None) and self._source_preview_pil is not None:
+            if self.preview_crop_mode_var.get() != "Full frame":
+                canvas_w = max(1, self.compare_canvas.winfo_width())
+                canvas_h = max(1, self.compare_canvas.winfo_height())
+                self.preview_crop_center = (
+                    max(0.0, min(1.0, event.x / canvas_w)),
+                    max(0.0, min(1.0, event.y / canvas_h)),
+                )
+                self._invalidate_compare_cache()
+                self._redraw_compare_canvas()
+                self._schedule_auto_compare(delay_ms=200)
+            return
         self.compare_dragging = True
         self.compare_canvas.configure(cursor="hand2")
         self._on_compare_mouse_drag(event)
+
+    def _set_compare_split_from_canvas(self, canvas: tk.Canvas, x: int) -> None:
+        width = max(2, canvas.winfo_width())
+        self.compare_slider_var.set(max(0.0, min(100.0, (float(x) / width) * 100.0)))
+        self._redraw_compare_canvas()
 
     def _on_compare_mouse_drag(self, event) -> None:
         """Handle mouse drag on compare canvas to move separator."""
@@ -6190,7 +8298,7 @@ class V11BApp(tk.Tk):
         if "exit code" in text:
             hints.append("Review the command logs above; the failing stage and command are shown.")
         if not hints:
-            hints.append("Try Fast Draft profile and a short clip duration to isolate the issue quickly.")
+            hints.append("Try Fast Preview profile and a short clip duration to isolate the issue quickly.")
         return hints
 
     def _validate_settings(self) -> PipelineSettings:
@@ -6244,8 +8352,42 @@ class V11BApp(tk.Tk):
         if not output_path.parent.exists():
             raise ValueError("Output folder does not exist")
         model_key = self.model_var.get().strip()
+        if not PipelineRunner.is_image_input(input_path):
+            try:
+                properties = (
+                    self._current_media_properties
+                    if self._current_media_properties_path == str(input_path)
+                    else probe_media(input_path)
+                )
+                assessment = assess_quality(
+                    properties,
+                    model_key=model_key,
+                    content_name=self.selected_upscaling_profile,
+                    target_width=int(self.target_width_var.get()),
+                    target_height=int(self.target_height_var.get()),
+                )
+                if (
+                    self.protect_high_bit_precision_var.get()
+                    and assessment.precision_model
+                    and assessment.precision_scale
+                ):
+                    model_key = assessment.precision_model
+                    self.model_var.set(model_key)
+                    self.scale_var.set(assessment.precision_scale)
+                    self._sync_display_from_model()
+                    self.quality_guard_notice_var.set(
+                        f"Quality guard: HDR/10-bit source routed to {model_key} for FP32 DirectML inference."
+                    )
+            except Exception as exc:
+                self.log_queue.put(f"[WARN] Precision guard could not inspect the source: {exc}")
         if model_key not in MODEL_OPTIONS:
             raise ValueError("Select a valid upscale model")
+        if model_key == NVIDIA_MODEL_KEY:
+            hardware = detect_nvidia_hardware()
+            if not hardware.supported:
+                raise ValueError(f"NVIDIA RTX Video Super Resolution is unavailable: {hardware.reason}")
+            if discover_nvidia_worker(_APP_DIR, _PERSISTENT_DATA_DIR) is None:
+                raise ValueError("Install the optional PixelForge NVIDIA RTX engine pack before selecting this profile")
         selected_scale = int(self.scale_var.get())
         allowed_scales = MODEL_NATIVE_SCALES.get(model_key, {selected_scale})
         if selected_scale not in allowed_scales:
@@ -6289,8 +8431,15 @@ class V11BApp(tk.Tk):
             target_height=int(self.target_height_var.get()),
             crf=int(self.crf_var.get()),
             encode_preset=self.encode_preset_var.get().strip(),
+            video_codec=self.video_codec_var.get().strip(),
+            prefer_hardware_encode=bool(self.prefer_hardware_encode_var.get()),
+            preserve_media=bool(self.preserve_media_var.get()),
+            chunk_size=max(30, int(self.chunk_size_var.get())),
+            resume_job=bool(self.resume_job_var.get()),
             include_audio=bool(self.include_audio_var.get()),
             keep_intermediate=bool(self.keep_intermediate_var.get()),
+            auto_deinterlace=bool(self.auto_deinterlace_var.get()),
+            nvidia_vsr_mode=self.nvidia_vsr_mode_var.get().strip() or "auto-standard",
         )
 
     def _estimate_time(self, silent: bool = False) -> None:
@@ -6549,6 +8698,98 @@ class V11BApp(tk.Tk):
     def _apply_quality_profile(self) -> None:
         self._set_selected_speed_profile("quality")
 
+    def _apply_nvidia_profile(self) -> None:
+        self.nvidia_worker = discover_nvidia_worker(_APP_DIR, self.app_data_dir)
+        if not self.nvidia_hardware.supported:
+            messagebox.showinfo("NVIDIA RTX unavailable", self.nvidia_hardware.reason)
+            return
+        if self.nvidia_worker is None:
+            self._install_nvidia_pack_async()
+            return
+        self._set_selected_speed_profile("nvidia")
+
+    def _install_nvidia_pack_async(self) -> None:
+        if not self.nvidia_hardware.supported:
+            messagebox.showinfo("NVIDIA RTX unavailable", self.nvidia_hardware.reason)
+            return
+        confirmed = messagebox.askyesno(
+            "Install NVIDIA RTX engine",
+            "Install the optional NVIDIA RTX Video Super Resolution engine?\n\n"
+            "Download: about 585 MB\n"
+            "Installed size: about 1 GB\n"
+            f"Detected: {self.nvidia_hardware.name} ({self.nvidia_hardware.vram_mb // 1024} GB VRAM)\n\n"
+            "The RTX engine is for SDR media. HDR/10-bit sources continue to use PixelForge's precision-safe "
+            "DirectML path.",
+        )
+        if not confirmed:
+            return
+        button = self.nvidia_profile_button
+        if button is not None:
+            button.configure(text="Downloading 0%", state=tk.DISABLED)
+        self.profile_guidance_var.set("Downloading and verifying the NVIDIA RTX engine pack…")
+
+        def _progress(downloaded: int, total: int) -> None:
+            percent = int((downloaded / total) * 100) if total > 0 else 0
+            label = f"Downloading {percent}%" if total > 0 else f"Downloading {downloaded / 1024**2:.0f} MB"
+            self.after(0, lambda text=label: button.configure(text=text) if button is not None else None)
+
+        def _worker() -> None:
+            archive = self.app_data_dir / "PixelForge-NVIDIA-Pack.download.zip"
+            destination = self.app_data_dir / "nvidia-pack"
+            candidate = self.app_data_dir / "nvidia-pack-candidate"
+            try:
+                url = os.environ.get("PIXELFORGE_NVIDIA_PACK_URL", "").strip()
+                sha = os.environ.get("PIXELFORGE_NVIDIA_PACK_SHA256", "").strip()
+                kwargs = {"progress": _progress}
+                if url:
+                    kwargs["url"] = url
+                if sha:
+                    kwargs["expected_sha256"] = sha
+                download_nvidia_pack(archive, **kwargs)
+                candidate_worker = install_nvidia_pack(archive, candidate)
+                environment = os.environ.copy()
+                environment.setdefault("PIXELFORGE_NVIDIA_CACHE", str(self.app_data_dir / "nvidia-cache"))
+                probe = subprocess.run(
+                    [str(candidate_worker), "--probe"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                    check=False,
+                    env=environment,
+                    creationflags=_NO_WINDOW,
+                )
+                if probe.returncode != 0 or '"ok": true' not in (probe.stdout or "").lower():
+                    raise RuntimeError((probe.stderr or probe.stdout or "NVIDIA runtime probe failed")[-3000:])
+                installed_worker = activate_nvidia_pack(candidate, destination)
+                self.nvidia_worker = NvidiaWorker((str(installed_worker),), "installed RTX pack")
+                self.after(0, self._finish_nvidia_pack_install)
+            except Exception as exc:
+                self.log_queue.put(f"[ERROR] NVIDIA RTX pack install failed: {exc}")
+                self.after(0, lambda error=str(exc): self._finish_nvidia_pack_install(error))
+            finally:
+                archive.unlink(missing_ok=True)
+                if candidate.exists():
+                    shutil.rmtree(candidate, ignore_errors=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_nvidia_pack_install(self, error: str = "") -> None:
+        button = self.nvidia_profile_button
+        if error:
+            if button is not None:
+                button.configure(text="Install RTX", state=tk.NORMAL)
+            self.profile_guidance_var.set("NVIDIA RTX install failed; standard profiles are unchanged.")
+            messagebox.showerror("NVIDIA RTX install failed", error)
+            return
+        if button is not None:
+            button.configure(text="NVIDIA RTX", state=tk.NORMAL)
+            self.speed_profile_buttons["nvidia"] = button
+        self.profile_guidance_var.set("NVIDIA RTX engine verified and ready.")
+        messagebox.showinfo("NVIDIA RTX ready", "The NVIDIA RTX engine passed its GPU inference check and is ready.")
+        self._set_selected_speed_profile("nvidia")
+
     def _apply_live_profile(self) -> None:
         self._set_selected_upscaling_profile("live")
 
@@ -6581,6 +8822,28 @@ class V11BApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Billing estimate failed", f"Could not calculate processing credits: {exc}")
             return
+
+        if not PipelineRunner.is_image_input(settings.input_video):
+            try:
+                properties = probe_media(settings.input_video)
+                assessment = assess_quality(
+                    properties,
+                    model_key=settings.model,
+                    content_name=self.selected_upscaling_profile,
+                    target_width=settings.target_width,
+                    target_height=settings.target_height,
+                )
+            except Exception:
+                assessment = None
+            if assessment and assessment.requires_extreme_scale_confirmation:
+                proceed = messagebox.askyesno(
+                    "Extreme enlargement",
+                    f"This output is {assessment.enlargement_factor:.1f}x larger per dimension. The AI model "
+                    "recovers detail up to its native scale; remaining enlargement is high-quality final scaling "
+                    "and may not look better.\n\nGenerate the three detail previews first. Continue only if they look credible.\n\nContinue?",
+                )
+                if not proceed:
+                    return
 
         render_metadata = {
             "profile": self.selected_speed_profile,
@@ -6706,6 +8969,8 @@ class V11BApp(tk.Tk):
                 self._record_telemetry_event(
                     "render_completed", {"reservation_id": self._active_reservation_id, "outcome": "completed"}
                 )
+                out_path = self._current_run_output
+                self.after(0, lambda p=out_path: self._post_render_feedback(p))
             else:
                 release = self.billing_backend.release_reservation(
                     self._charged_token or "", self._active_reservation_id
@@ -6818,6 +9083,8 @@ def main() -> None:
     app = V11BApp()
     app._register_auto_estimate_watchers()
     app._register_auto_compare_watchers()
+    app.after(250, app._maybe_show_first_run_content_picker)
+    app.after(120, app._ensure_window_visible)
     app.mainloop()
 
 
