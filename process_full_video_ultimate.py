@@ -267,6 +267,11 @@ from pixelforge.nvidia import (  # noqa: E402
     install_nvidia_pack,
     nvidia_worker_command,
 )
+from pixelforge.distribution import (  # noqa: E402
+    ALLOW_RUNTIME_ENGINE_DOWNLOADS,
+    IS_STORE_BUILD,
+    STORE_PURCHASE_NOTE,
+)
 
 ENCODE_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
 IMAGE_FORMATS = ["png", "jpg"]
@@ -3298,6 +3303,10 @@ class V11BApp(tk.Tk):
 
     def _start_update_checks(self) -> None:
         """Run update check at startup, then periodically while the app is open."""
+        if IS_STORE_BUILD:
+            # Microsoft Store delivers updates; never self-update a packaged install.
+            self.log_queue.put("[INFO] Updates are delivered by the Microsoft Store.")
+            return
         if not UPDATER_AVAILABLE:
             self.log_queue.put("[WARN] Updater module unavailable; auto-update checks are disabled.")
             return
@@ -4356,6 +4365,7 @@ class V11BApp(tk.Tk):
             text=(
                 "Credits are managed through Knight Account checkout. "
                 "Use Buy Credits on the main screen for the simplest purchase flow."
+                + (" " + STORE_PURCHASE_NOTE if IS_STORE_BUILD else "")
             ),
             style="Hint.TLabel",
             wraplength=760,
@@ -6336,7 +6346,7 @@ class V11BApp(tk.Tk):
 
         self.update_idletasks()
         popup_width = 1080
-        popup_height = 560
+        popup_height = 600 if IS_STORE_BUILD else 560
         x = self.winfo_rootx() + max(0, (self.winfo_width() - popup_width) // 2)
         y = self.winfo_rooty() + max(0, (self.winfo_height() - popup_height) // 2)
         window.geometry(f"{popup_width}x{popup_height}+{x}+{y}")
@@ -6359,6 +6369,15 @@ class V11BApp(tk.Tk):
             wraplength=520,
             justify=LEFT,
         ).pack(anchor=W, pady=(6, 0))
+        if IS_STORE_BUILD:
+            # Store policy 10.8.2: identify the commerce provider at the time of purchase.
+            ttk.Label(
+                hero_left,
+                text=STORE_PURCHASE_NOTE,
+                style="BillingHeroSub.TLabel",
+                wraplength=520,
+                justify=LEFT,
+            ).pack(anchor=W, pady=(6, 0))
 
         hero_right = tk.Frame(hero, bg="#102038", highlightbackground="#2d4f7b", highlightthickness=1, bd=0)
         hero_right.pack(side=RIGHT, padx=(14, 0))
@@ -8752,6 +8771,8 @@ class V11BApp(tk.Tk):
             return
         if _env_is_truthy(os.environ.get("PIXELFORGE_DISABLE_NVIDIA_AUTO_SETUP", "0")):
             return
+        if not ALLOW_RUNTIME_ENGINE_DOWNLOADS:
+            return
         try:
             marker = json.loads(self.nvidia_auto_setup_marker.read_text(encoding="utf-8"))
             if str(marker.get("pack_version") or "") == NVIDIA_PACK_VERSION:
@@ -8780,6 +8801,14 @@ class V11BApp(tk.Tk):
     def _install_nvidia_pack_async(self, *, confirm_install: bool = True) -> None:
         if not self.nvidia_hardware.supported:
             messagebox.showinfo("NVIDIA RTX unavailable", self.nvidia_hardware.reason)
+            return
+        if not ALLOW_RUNTIME_ENGINE_DOWNLOADS:
+            messagebox.showinfo(
+                "NVIDIA RTX engine",
+                "The optional NVIDIA RTX engine is not included in the Microsoft Store edition yet.\n\n"
+                "Balanced and Max Detail run on every supported GPU, including yours.",
+                parent=self,
+            )
             return
         if confirm_install:
             confirmed = messagebox.askyesno(

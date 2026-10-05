@@ -447,6 +447,13 @@ def _show_update_dialog(
 
 def check_for_updates(parent: tk.Tk, current_version: str, *, silent: bool = True) -> None:
     """Check updates in background and prompt user if new release exists."""
+    try:
+        from pixelforge.distribution import IS_STORE_BUILD
+    except Exception:
+        IS_STORE_BUILD = False
+    if IS_STORE_BUILD:
+        _log_update("Store build: GitHub self-update disabled (Microsoft Store manages updates).")
+        return
 
     def _worker() -> None:
         payload = _fetch_latest_release()
