@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PixelForge AI - Microsoft Store MSIX manifest.
+  Replace the three PARTNER_CENTER_* values with the exact strings from
+  Partner Center > PixelForge AI > Product management > Product identity.
+  build_store.ps1 stamps Version from -Version (e.g. 1.0.22 -> 1.0.22.0).
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="PARTNER_CENTER_PACKAGE_IDENTITY_NAME"
+    Publisher="PARTNER_CENTER_PACKAGE_IDENTITY_PUBLISHER"
+    ProcessorArchitecture="x64"
+    Version="1.0.22.0" />
+
+  <Properties>
+    <DisplayName>PixelForge AI</DisplayName>
+    <PublisherDisplayName>PARTNER_CENTER_PUBLISHER_DISPLAY_NAME</PublisherDisplayName>
+    <Logo>Images\StoreLogo.png</Logo>
+    <Description>Local AI video and image upscaler for Windows.</Description>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="PixelForgeAI"
+      Executable="PixelForge-AI.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="PixelForge AI"
+        Description="Local AI video and image upscaler"
+        BackgroundColor="transparent"
+        Square150x150Logo="Images\Square150x150Logo.png"
+        Square44x44Logo="Images\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Images\Wide310x150Logo.png" Square310x310Logo="Images\Square310x310Logo.png" />
+        <uap:SplashScreen Image="Images\SplashScreen.png" BackgroundColor="#0b1220" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <Capability Name="internetClient" />
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
