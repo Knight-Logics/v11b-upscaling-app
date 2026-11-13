@@ -12,7 +12,6 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import re
 import subprocess
 import sys
 import threading
@@ -21,7 +20,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 
+import numpy as np
+from PIL import Image
+
 from benchmark_presets import contact_sheet
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from pixelforge.metrics import aligned_scores  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -201,35 +206,35 @@ def process_candidate(case: Case, candidate: Candidate, source: Path, reference:
     return elapsed, "\n".join(lines)
 
 
-def metric(reference: Path, candidate: Path, kind: str, report_dir: Path) -> float:
-    shared = (
-        "[0:v]setpts=PTS-STARTPTS,format=yuv420p[dist];"
-        "[1:v]setpts=PTS-STARTPTS,format=yuv420p[ref];"
+def extract_frames(video: Path, directory: Path, limit: int = 48) -> list[np.ndarray]:
+    directory.mkdir(parents=True, exist_ok=True)
+    for stale in directory.glob("frame_*.png"):
+        stale.unlink()
+    run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(video), "-vsync", "0", "-frames:v", str(limit),
+            str(directory / "frame_%04d.png"),
+        ]
     )
-    if kind == "vmaf":
-        log_path = (report_dir / f"vmaf-{candidate.stem}.json").as_posix().replace(":", "\\:")
-        graph = shared + f"[dist][ref]libvmaf=log_fmt=json:log_path='{log_path}':n_threads=8"
-        run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(candidate), "-i", str(reference), "-lavfi", graph, "-f", "null", "NUL"])
-        payload = json.loads((report_dir / f"vmaf-{candidate.stem}.json").read_text(encoding="utf-8"))
-        return float(payload["pooled_metrics"]["vmaf"]["mean"])
-    graph = shared + f"[dist][ref]{kind}"
-    completed = run(
-        ["ffmpeg", "-hide_banner", "-i", str(candidate), "-i", str(reference), "-lavfi", graph, "-f", "null", "NUL"],
-        capture=True,
-    )
-    pattern = r"All:([0-9.]+)" if kind == "ssim" else r"average:([0-9.]+)"
-    match = re.search(pattern, completed.stderr)
-    if not match:
-        raise RuntimeError(f"Unable to parse {kind} output for {candidate}")
-    return float(match.group(1))
+    frames: list[np.ndarray] = []
+    for path in sorted(directory.glob("frame_*.png")):
+        with Image.open(path) as image:
+            frames.append(np.asarray(image.convert("RGB")))
+    if not frames:
+        raise RuntimeError(f"No frames extracted from {video}")
+    return frames
 
 
-def evaluate(reference: Path, candidate: Path, report_dir: Path) -> dict[str, float]:
-    return {
-        "vmaf": round(metric(reference, candidate, "vmaf", report_dir), 4),
-        "ssim": round(metric(reference, candidate, "ssim", report_dir), 6),
-        "psnr": round(metric(reference, candidate, "psnr", report_dir), 4),
-    }
+def evaluate(reference: Path, candidate: Path, report_dir: Path) -> dict[str, object]:
+    """Score aligned frames. A raw PTS reset is not alignment."""
+    reference_frames = extract_frames(reference, report_dir / "aligned-frames" / reference.stem)
+    candidate_frames = extract_frames(candidate, report_dir / "aligned-frames" / candidate.stem)
+    scores = aligned_scores(reference_frames, candidate_frames)
+    scores["lpips_status"] = "computed" if scores.get("lpips") is not None else "not_installed"
+    scores["vmaf"] = None
+    scores["vmaf_status"] = "not_computed"
+    return scores
 
 
 def extract_frame(video: Path, destination: Path) -> None:
@@ -257,9 +262,12 @@ def main() -> int:
         directory.mkdir(parents=True, exist_ok=True)
 
     report: dict[str, object] = {
-        "method": "identical degraded video input with full-reference VMAF/SSIM/PSNR",
+        "method": "identical degraded video input, integer frame-offset search, then PSNR/SSIM/LPIPS/Tenengrad",
+        "withdrawn_history": "v1.0.20-v1.0.22 numbers from this script are withdrawn because they skipped frame alignment.",
         "limitations": [
             "Topaz results are included only when matching files exist in the topaz directory.",
+            "VMAF is not computed. The previous libvmaf call compared unaligned frames.",
+            "LPIPS is null unless the lpips and torch packages are installed.",
             "Objective metrics do not replace blind review for hallucination, identity, or temporal artifacts.",
             "Software H.264 output is used to make codec behavior reproducible across machines.",
         ],
@@ -295,7 +303,7 @@ def main() -> int:
         if topaz_path.is_file():
             entries.append({"candidate": "topaz", "seconds": None, **evaluate(reference, topaz_path, report_dir)})
             output_paths["topaz"] = topaz_path
-        entries.sort(key=lambda item: float(item["vmaf"]), reverse=True)
+        entries.sort(key=lambda item: float(item["psnr"]), reverse=True)
         frame_dir = report_dir / "frames" / case.name
         frame_dir.mkdir(parents=True, exist_ok=True)
         source_frame = frame_dir / "source.png"
@@ -307,7 +315,7 @@ def main() -> int:
             name = str(entry["candidate"])
             candidate_frame = frame_dir / f"{name}.png"
             extract_frame(output_paths[name], candidate_frame)
-            sheet_items.append((f"{name} | VMAF {entry['vmaf']}", candidate_frame))
+            sheet_items.append((f"{name} | PSNR {entry['psnr']} offset {entry.get('offset', 0)}", candidate_frame))
         contact_sheet(reference_frame, source_frame, sheet_items, report_dir / f"{case.name}-comparison.png")
         report["cases"][case.name] = {
             "source": str(source.relative_to(corpus)),
@@ -319,7 +327,10 @@ def main() -> int:
             "fps": APP.PipelineRunner.get_fps(reference),
             "results": entries,
         }
-        print(f"{case.name}: {entries[0]['candidate']} VMAF={entries[0]['vmaf']}", flush=True)
+        print(
+            f"{case.name}: {entries[0]['candidate']} PSNR={entries[0]['psnr']} offset={entries[0].get('offset')}",
+            flush=True,
+        )
 
     destination = report_dir / "results.json"
     destination.write_text(json.dumps(report, indent=2), encoding="utf-8")

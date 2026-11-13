@@ -1,0 +1,39 @@
+{
+  "engine": "realesrgan-x4plus",
+  "runtime": "ncnn-python-cpu",
+  "weights": "models/realesrgan-x4plus.param + .bin",
+  "degrade": "Lanczos 4x downsample, JPEG quality 40",
+  "scene": "synthetic_detail",
+  "slider": {
+    "before": "lanczos.png",
+    "after": "pixelforge.png"
+  },
+  "zoomed_crops": {
+    "text": {
+      "before": "zoom-text-lanczos.png",
+      "after": "zoom-text-pixelforge.png",
+      "ground_truth": "zoom-text-ground-truth.png"
+    },
+    "grating": {
+      "before": "zoom-grating-lanczos.png",
+      "after": "zoom-grating-pixelforge.png",
+      "ground_truth": "zoom-grating-ground-truth.png"
+    }
+  },
+  "metrics_vs_ground_truth": {
+    "psnr": 14.7063,
+    "ssim": 0.558751,
+    "lpips": null,
+    "sharpness_tenengrad": 557.6624,
+    "resized_to_reference": false
+  },
+  "lanczos_sharpness_tenengrad": 120.5407,
+  "sharpness_ratio_vs_lanczos": 4.6263,
+  "mean_abs_diff_vs_lanczos": 14.8398,
+  "lpips_status": "not_installed",
+  "not_claimed": [
+    "These stills are not the withdrawn v1.0.20-v1.0.22 video benchmark.",
+    "They are not the NVIDIA RTX path and not the Vulkan executable.",
+    "Regenerate on the owner machine with this script after RUN_QUALITY_GATE.vbs for that path."
+  ]
+}

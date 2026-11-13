@@ -48,6 +48,50 @@ class MediaProperties:
         return self.field_order.lower() not in {"", "unknown", "progressive"}
 
 
+def stream_rotation_degrees(stream: dict) -> float:
+    tags = stream.get("tags") or {}
+    raw = tags.get("rotate")
+    if raw not in (None, ""):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    for side in stream.get("side_data_list") or []:
+        if "rotation" in side:
+            try:
+                return float(side["rotation"])
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def stream_sample_aspect(stream: dict) -> float:
+    raw = str(stream.get("sample_aspect_ratio") or "1:1")
+    if ":" not in raw or raw in {"0:1", "N/A"}:
+        return 1.0
+    num, den = raw.split(":", 1)
+    try:
+        den_value = float(den)
+        return float(num) / den_value if den_value else 1.0
+    except ValueError:
+        return 1.0
+
+
+def display_size_from_stream(stream: dict) -> tuple[int, int]:
+    from pixelforge.targets import oriented_pixel_size
+
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return 0, 0
+    return oriented_pixel_size(
+        width,
+        height,
+        stream_rotation_degrees(stream),
+        stream_sample_aspect(stream),
+    )
+
+
 def probe_media(path: Path) -> MediaProperties:
     command = [
         "ffprobe", "-v", "error", "-print_format", "json",
@@ -55,11 +99,14 @@ def probe_media(path: Path) -> MediaProperties:
     ]
     payload = json.loads(subprocess.check_output(command, text=True, encoding="utf-8", errors="replace"))
     streams = payload.get("streams", [])
-    video = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
-    count = lambda kind: sum(1 for stream in streams if stream.get("codec_type") == kind)
+    video: dict = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+
+    def count(kind: str) -> int:
+        return sum(1 for stream in streams if stream.get("codec_type") == kind)
+    display_width, display_height = display_size_from_stream(video)
     return MediaProperties(
-        width=int(video.get("width") or 0),
-        height=int(video.get("height") or 0),
+        width=display_width,
+        height=display_height,
         pix_fmt=str(video.get("pix_fmt") or ""),
         color_space=str(video.get("color_space") or ""),
         color_transfer=str(video.get("color_transfer") or ""),

@@ -1,5 +1,5 @@
 param(
-  [string]$AppVersion = "1.0.22",
+  [string]$AppVersion = "1.0.23",
   [string]$PackPath = "",
   [string]$ModulePath = ""
 )
@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($AppVersion -notmatch '^\d+\.\d+\.\d+$') {
-  throw "AppVersion must use semantic form such as 1.0.22"
+  throw "AppVersion must use semantic form such as 1.0.23"
 }
 if ([string]::IsNullOrWhiteSpace($PackPath)) {
   $PackPath = Join-Path $root "release\PixelForge-NVIDIA-Pack_${AppVersion}_windows_x64.zip"

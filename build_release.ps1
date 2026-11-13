@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "1.0.22"
+  [string]$Version = "1.0.23"
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,7 +7,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
-  throw "Version must use semantic form such as 1.0.22"
+  throw "Version must use semantic form such as 1.0.23"
 }
 
 if (!(Test-Path ".venv")) {

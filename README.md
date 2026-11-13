@@ -18,12 +18,12 @@ Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, 
 - Direct in-app auto-update from GitHub Releases
 - Windows standalone EXE packaging
 
-## Engines (v1.0.22)
+## Engines (v1.0.23)
 
 | Content | Preferred free engine | Notes |
 |---|---|---|
-| People / camera | **SPAN Photo / RealSR DF2K** | Fast DirectML preview; quality-first RealSR final presets |
-| Anime / game | **ModernSpanimation / Real-CUGAN SE** | Fast current SPAN preview; conservative Real-CUGAN detail presets |
+| People / camera | **Real-ESRGAN x4plus** (Enhanced) / **RealSR DF2K** (Faithful) | Enhanced is the default. Faithful keeps the previous RealSR look. Fast Preview still uses SPAN Photo. |
+| Anime / game | **ModernSpanimation / Real-CUGAN SE** | Fast SPAN preview. Enhanced turns Real-CUGAN denoise off; Faithful keeps mild denoise. |
 | Old / noisy | **SRMD** (+ RealSR JPEG quality) | Fast denoise + restore |
 | Compatible NVIDIA RTX SDR | **NVIDIA VSR Ultra** (optional pack) | Measured speed/quality option; modes stay inside NVIDIA's valid operation combinations |
 | Frame interpolation | **RIFE v4.25** (recommended) | 4.22-lite for previews; 4.26 available as the newer optional model |
@@ -31,7 +31,7 @@ Local Windows video and image enhancement app using SPAN DirectML, Real-ESRGAN, 
 ## Recommended First Run
 
 - A first-run picker asks **People / camera**, **Anime / game**, or **Old / noisy**.
-- Default Balanced + People/camera uses **RealSR DF2K** after the local preset benchmark.
+- Default Balanced + People/camera + Enhanced uses **Real-ESRGAN x4plus**. Faithful keeps **RealSR DF2K**.
 - Anime profiles use ModernSpanimation or Real-CUGAN; restore profiles use SRMD or RealSR JPEG.
 - Choose the delivery target rather than an engine scale; PixelForge resolves the internal native model pass and final dimensions.
 - Choose **Keep source** or **Smooth 60 FPS** independently of the enhancement profile. Sources already near 60 FPS are preserved without unnecessary interpolation.
@@ -50,7 +50,7 @@ The engine uses NVIDIA VFX Video Super Resolution 0.1.0.1. NVIDIA VFX is proprie
 
 DirectML SPAN video processing preserves high-bit sources as RGB48 through FP32 ONNX inference and feeds RGB48 directly to the final 10-bit encoder. The directory-only NCNN/RIFE and Pillow still-preview paths remain 8-bit; HDR metadata is preserved, but the bundled SPAN models are not advertised as HDR-trained models.
 
-PixelForge does not make an unmeasured universal "better than Topaz" claim. The v1.0.20 matched-source video run covers live action, animation, restoration, interlacing, and 30-to-60 FPS motion with full-reference VMAF/SSIM/PSNR. It refined the RTX animation mode to Ultra, confirmed Real-CUGAN as the quality-first animation path, and quantified the RTX path's large speed advantage on supported live-action sources. See `QUALITY_BENCHMARK.md`, `tools/benchmark_representative_video.py`, and `tools/compare_topaz.py` for the evidence and reproducible claim gate.
+PixelForge does not make an unmeasured universal "better than Topaz" claim. The v1.0.20–v1.0.22 representative-video VMAF numbers are withdrawn because those runs did not align frames. The replacement gate is `tools/quality_gate.py` (PSNR, windowed SSIM, optional LPIPS, and Tenengrad sharpness, after an integer frame-offset search). It writes `_benchmarks/quality-gate/GATE_RESULTS.json`. `quality-gate.done` is written only when the shipping Vulkan executable actually runs. `RUN_QUALITY_GATE.vbs` is the owner-machine entry point. See `QUALITY_BENCHMARK.md`. The in-app Watch Demo link is not a quality-gate result.
 
 ## Secrets and Billing Configuration
 
@@ -69,17 +69,17 @@ python process_full_video_ultimate.py
 ## Build Standalone EXE
 
 ```powershell
-./build_release.ps1 -Version 1.0.22
+./build_release.ps1 -Version 1.0.23
 ```
 
 To reproducibly build the optional NVIDIA sidecar pack:
 
 ```powershell
-./build_nvidia_pack.ps1 -AppVersion 1.0.22
+./build_nvidia_pack.ps1 -AppVersion 1.0.23
 ```
 
 After both artifacts exist, the all-in-one archive can be regenerated without
-recompiling the worker by running `./build_nvidia_edition.ps1 -AppVersion 1.0.22`.
+recompiling the worker by running `./build_nvidia_edition.ps1 -AppVersion 1.0.23`.
 
 Build output is generated in `release/`:
 

@@ -102,7 +102,7 @@ def detect_nvidia_hardware(
             errors="replace",
             timeout=3,
             check=False,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return NvidiaHardware(False, reason=f"NVIDIA CUDA driver not detected: {exc}")
