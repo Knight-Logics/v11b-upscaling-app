@@ -8,7 +8,7 @@ from unittest import mock
 from pixelforge.media import MediaProperties, deinterlace_filter, estimate_workspace_bytes, video_encode_args
 from pixelforge.onnx_upscale import MODEL_CATALOG, OnnxUpscaler
 from pixelforge.quality import assess_quality, output_enlargement_factor
-from pixelforge.targets import OUTPUT_TARGETS, target_dimensions
+from pixelforge.targets import OUTPUT_TARGETS, preview_delivery_size, suggested_output_target, target_dimensions
 
 
 class OutputTargetTests(unittest.TestCase):
@@ -27,6 +27,16 @@ class OutputTargetTests(unittest.TestCase):
 
     def test_public_choices_are_deliverables_not_engine_scales(self) -> None:
         self.assertEqual(OUTPUT_TARGETS, ("Same resolution", "1080p", "1440p", "4K", "8K"))
+
+    def test_low_resolution_sources_suggest_an_enlargement(self) -> None:
+        self.assertEqual(suggested_output_target(1280, 720), "1440p")
+        self.assertEqual(suggested_output_target(1920, 1080), "4K")
+        self.assertEqual(suggested_output_target(3840, 2160), "Same resolution")
+
+    def test_preview_crop_uses_the_delivery_factor_not_the_full_frame(self) -> None:
+        self.assertEqual(preview_delivery_size(640, 360, 1280, 720, 2560, 1440, True), (1280, 720))
+        self.assertEqual(preview_delivery_size(640, 360, 1280, 720, 1280, 720, True), (640, 360))
+        self.assertIsNone(preview_delivery_size(640, 360, 1280, 720, 2560, 1440, False))
 
 
 class MediaPlanTests(unittest.TestCase):

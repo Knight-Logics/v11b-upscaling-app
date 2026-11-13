@@ -1,0 +1,231 @@
+{
+  "version": "1.0.23",
+  "default_model": "realesrgan-x4plus",
+  "default_fidelity": "enhanced",
+  "faithful_model": "realsr-df2k",
+  "host": {
+    "system": "Linux",
+    "machine": "x86_64",
+    "python": "3.12.3"
+  },
+  "visibility_rule": {
+    "sharpness_ratio_vs_lanczos_at_least": 1.25,
+    "mean_abs_diff_vs_lanczos_at_least": 2.0,
+    "psnr_ssim_lpips": "Reported against the ground-truth still. Beating Lanczos on PSNR is not required and is not claimed unless closer_psnr_than_lanczos is true."
+  },
+  "alignment_self_test": {
+    "passed": true,
+    "expected_offset": -2,
+    "measured_offset": -2,
+    "aligned_psnr": 99.0,
+    "unaligned_psnr": 10.6121,
+    "note": "Offset 0 is the v1.0.20-v1.0.22 failure mode: metrics compared different frames."
+  },
+  "lpips_status": "not_installed",
+  "ffmpeg_libvmaf": false,
+  "vulkan_executables": {
+    "realesrgan-ncnn-vulkan.exe": "windows-executable-not-run-on-this-host",
+    "realsr-ncnn-vulkan.exe": "windows-executable-not-run-on-this-host",
+    "realcugan-ncnn-vulkan.exe": "windows-executable-not-run-on-this-host",
+    "srmd-ncnn-vulkan.exe": "windows-executable-not-run-on-this-host",
+    "rife-ncnn-vulkan.exe": "windows-executable-not-run-on-this-host"
+  },
+  "scenes": [
+    {
+      "name": "synthetic_detail",
+      "truth_size": [
+        512,
+        288
+      ],
+      "low_res_size": [
+        128,
+        72
+      ],
+      "lanczos": {
+        "psnr": 14.3709,
+        "ssim": 0.455116,
+        "sharpness_tenengrad": 120.5407
+      },
+      "engines": [
+        {
+          "psnr": 14.2331,
+          "ssim": 0.414979,
+          "lpips": null,
+          "sharpness_tenengrad": 810.9756,
+          "resized_to_reference": false,
+          "lanczos_psnr": 14.3709,
+          "lanczos_ssim": 0.455116,
+          "lanczos_sharpness_tenengrad": 120.5407,
+          "sharpness_ratio_vs_lanczos": 6.7278,
+          "mean_abs_diff_vs_lanczos": 12.4698,
+          "closer_psnr_than_lanczos": false,
+          "closer_ssim_than_lanczos": false,
+          "visibly_different_from_lanczos": true,
+          "lpips_status": "not_installed",
+          "engine": "span-photo-x4",
+          "kind": "onnx-cpu",
+          "role": "fast-preview",
+          "seconds": 0.248,
+          "same_resolution_roundtrip": {
+            "mean_abs_diff_vs_input": 5.2656,
+            "psnr_vs_input": 30.9318,
+            "ssim_vs_input": 0.978232
+          }
+        },
+        {
+          "psnr": 14.7063,
+          "ssim": 0.558751,
+          "lpips": null,
+          "sharpness_tenengrad": 557.6624,
+          "resized_to_reference": false,
+          "lanczos_psnr": 14.3709,
+          "lanczos_ssim": 0.455116,
+          "lanczos_sharpness_tenengrad": 120.5407,
+          "sharpness_ratio_vs_lanczos": 4.6263,
+          "mean_abs_diff_vs_lanczos": 14.8398,
+          "closer_psnr_than_lanczos": true,
+          "closer_ssim_than_lanczos": true,
+          "visibly_different_from_lanczos": true,
+          "lpips_status": "not_installed",
+          "engine": "realesrgan-x4plus",
+          "kind": "ncnn-python-cpu",
+          "role": "default-enhanced",
+          "seconds": 1.142,
+          "same_resolution_roundtrip": {
+            "mean_abs_diff_vs_input": 10.8418,
+            "psnr_vs_input": 24.5139,
+            "ssim_vs_input": 0.935031
+          }
+        },
+        {
+          "psnr": 14.2309,
+          "ssim": 0.430755,
+          "lpips": null,
+          "sharpness_tenengrad": 590.3264,
+          "resized_to_reference": false,
+          "lanczos_psnr": 14.3709,
+          "lanczos_ssim": 0.455116,
+          "lanczos_sharpness_tenengrad": 120.5407,
+          "sharpness_ratio_vs_lanczos": 4.8973,
+          "mean_abs_diff_vs_lanczos": 9.9462,
+          "closer_psnr_than_lanczos": false,
+          "closer_ssim_than_lanczos": false,
+          "visibly_different_from_lanczos": true,
+          "lpips_status": "not_installed",
+          "engine": "realsr-df2k",
+          "kind": "ncnn-python-cpu",
+          "role": "faithful",
+          "seconds": 1.015,
+          "same_resolution_roundtrip": {
+            "mean_abs_diff_vs_input": 3.1889,
+            "psnr_vs_input": 35.3526,
+            "ssim_vs_input": 0.992037
+          }
+        }
+      ]
+    },
+    {
+      "name": "product_still_crop",
+      "truth_size": [
+        512,
+        288
+      ],
+      "low_res_size": [
+        128,
+        72
+      ],
+      "lanczos": {
+        "psnr": 27.8997,
+        "ssim": 0.837329,
+        "sharpness_tenengrad": 12.5617
+      },
+      "engines": [
+        {
+          "psnr": 27.001,
+          "ssim": 0.790841,
+          "lpips": null,
+          "sharpness_tenengrad": 37.7392,
+          "resized_to_reference": false,
+          "lanczos_psnr": 27.8997,
+          "lanczos_ssim": 0.837329,
+          "lanczos_sharpness_tenengrad": 12.5617,
+          "sharpness_ratio_vs_lanczos": 3.0043,
+          "mean_abs_diff_vs_lanczos": 3.6514,
+          "closer_psnr_than_lanczos": false,
+          "closer_ssim_than_lanczos": false,
+          "visibly_different_from_lanczos": true,
+          "lpips_status": "not_installed",
+          "engine": "span-photo-x4",
+          "kind": "onnx-cpu",
+          "role": "fast-preview",
+          "seconds": 0.264,
+          "same_resolution_roundtrip": {
+            "mean_abs_diff_vs_input": 2.9837,
+            "psnr_vs_input": 37.0424,
+            "ssim_vs_input": 0.994771
+          }
+        },
+        {
+          "psnr": 28.4682,
+          "ssim": 0.841866,
+          "lpips": null,
+          "sharpness_tenengrad": 16.469,
+          "resized_to_reference": false,
+          "lanczos_psnr": 27.8997,
+          "lanczos_ssim": 0.837329,
+          "lanczos_sharpness_tenengrad": 12.5617,
+          "sharpness_ratio_vs_lanczos": 1.311,
+          "mean_abs_diff_vs_lanczos": 4.5222,
+          "closer_psnr_than_lanczos": true,
+          "closer_ssim_than_lanczos": true,
+          "visibly_different_from_lanczos": true,
+          "lpips_status": "not_installed",
+          "engine": "realesrgan-x4plus",
+          "kind": "ncnn-python-cpu",
+          "role": "default-enhanced",
+          "seconds": 1.084,
+          "same_resolution_roundtrip": {
+            "mean_abs_diff_vs_input": 4.4078,
+            "psnr_vs_input": 31.9015,
+            "ssim_vs_input": 0.966023
+          }
+        },
+        {
+          "psnr": 27.4281,
+          "ssim": 0.78181,
+          "lpips": null,
+          "sharpness_tenengrad": 41.2782,
+          "resized_to_reference": false,
+          "lanczos_psnr": 27.8997,
+          "lanczos_ssim": 0.837329,
+          "lanczos_sharpness_tenengrad": 12.5617,
+          "sharpness_ratio_vs_lanczos": 3.286,
+          "mean_abs_diff_vs_lanczos": 2.5956,
+          "closer_psnr_than_lanczos": false,
+          "closer_ssim_than_lanczos": false,
+          "visibly_different_from_lanczos": true,
+          "lpips_status": "not_installed",
+          "engine": "realsr-df2k",
+          "kind": "ncnn-python-cpu",
+          "role": "faithful",
+          "seconds": 1.1,
+          "same_resolution_roundtrip": {
+            "mean_abs_diff_vs_input": 1.2042,
+            "psnr_vs_input": 43.7455,
+            "ssim_vs_input": 0.996183
+          }
+        }
+      ]
+    }
+  ],
+  "cpu_visibility_passed": true,
+  "vulkan_executable_ran": false,
+  "quality_gate_done": false,
+  "owner_must_run": [
+    "RUN_QUALITY_GATE.vbs on Windows with a Vulkan driver, so the shipping realesrgan-ncnn-vulkan.exe path is scored. Python NCNN on CPU is the same weights, not that executable.",
+    "An NVIDIA RTX GPU for the nvidia-rtx-vsr profile. This host did not run it.",
+    "ffmpeg built with libvmaf, if a VMAF number is required. This gate does not emit VMAF."
+  ],
+  "withdrawn_history": "v1.0.20 through v1.0.22 representative-video VMAF/SSIM/PSNR numbers are withdrawn. They were computed without a frame-offset search.",
+  "seconds": 5.529
+}

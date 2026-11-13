@@ -58,12 +58,65 @@ CONTENT_PICKER_COPY = {
 }
 
 
-def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
+FIDELITY_LABELS = {
+    "enhanced": "Enhanced",
+    "faithful": "Faithful",
+}
+
+# Enhanced is the default. It uses the full Real-ESRGAN output for camera footage.
+# Faithful keeps the previous RealSR / mild-denoise stack, which stays closer to a resize.
+_MODEL_TABLES: dict[str, dict[str, dict[str, tuple[str, int]]]] = {
+    "enhanced": {
+        "live": {
+            "fast": ("span-photo-x4", 4),
+            "balanced": ("realesrgan-x4plus", 4),
+            "quality": ("realesrgan-x4plus", 4),
+            "nvidia": ("nvidia-rtx-vsr", 4),
+        },
+        "animation": {
+            "fast": ("span-modern-animation-x2", 2),
+            "balanced": ("realcugan-se-x2-n0", 2),
+            "quality": ("realcugan-se-x2-n0", 2),
+            "nvidia": ("nvidia-rtx-vsr", 4),
+        },
+        "restore": {
+            "fast": ("srmd-x2-n5", 2),
+            "balanced": ("srmd-x4-n5", 4),
+            "quality": ("realsr-df2k-jpeg", 4),
+            "nvidia": ("nvidia-rtx-vsr", 4),
+        },
+    },
+    "faithful": {
+        "live": {
+            "fast": ("span-photo-x4", 4),
+            "balanced": ("realsr-df2k", 4),
+            "quality": ("realsr-df2k", 4),
+            "nvidia": ("nvidia-rtx-vsr", 4),
+        },
+        "animation": {
+            "fast": ("span-modern-animation-x2", 2),
+            "balanced": ("realcugan-se-x2-n1", 2),
+            "quality": ("realcugan-se-x2-n0", 2),
+            "nvidia": ("nvidia-rtx-vsr", 4),
+        },
+        "restore": {
+            "fast": ("srmd-x2-n5", 2),
+            "balanced": ("srmd-x4-n5", 4),
+            "quality": ("realsr-df2k-jpeg", 4),
+            "nvidia": ("nvidia-rtx-vsr", 4),
+        },
+    },
+}
+
+
+def get_profile_preset(speed_name: str, content_name: str, fidelity: str = "enhanced") -> dict[str, object]:
     """Return a tested, internally compatible preset without touching Tk state."""
     if speed_name not in {"fast", "balanced", "quality", "nvidia"}:
         raise ValueError(f"Unknown speed profile: {speed_name}")
     if content_name not in {"live", "animation", "restore"}:
         raise ValueError(f"Unknown content profile: {content_name}")
+    if fidelity not in _MODEL_TABLES:
+        raise ValueError(f"Unknown fidelity: {fidelity}")
 
     preset: dict[str, object] = {
         "denoise": 0.0,
@@ -93,32 +146,12 @@ def get_profile_preset(speed_name: str, content_name: str) -> dict[str, object]:
     else:
         preset.update(image_format="png", encode_preset="medium", crf=16)
 
-    content_presets: dict[str, dict[str, tuple[str, int]]] = {
-        "live": {
-            "fast": ("span-photo-x4", 4),
-            "balanced": ("realsr-df2k", 4),
-            "quality": ("realsr-df2k", 4),
-            "nvidia": ("nvidia-rtx-vsr", 4),
-        },
-        # Real-CUGAN is the preferred free anime stack (better line/texture retention than waifu2x).
-        "animation": {
-            "fast": ("span-modern-animation-x2", 2),
-            "balanced": ("realcugan-se-x2-n1", 2),
-            "quality": ("realcugan-se-x2-n0", 2),
-            "nvidia": ("nvidia-rtx-vsr", 4),
-        },
-        # SRMD for noisy/compressed sources; keep RealSR JPEG for max photo restore quality.
-        "restore": {
-            "fast": ("srmd-x2-n5", 2),
-            "balanced": ("srmd-x4-n5", 4),
-            "quality": ("realsr-df2k-jpeg", 4),
-            "nvidia": ("nvidia-rtx-vsr", 4),
-        },
-    }
-    model, scale = content_presets[content_name][speed_name]
+    # Real-CUGAN remains the anime stack. Enhanced turns denoise off so lines stay.
+    # Restore stays on SRMD / RealSR JPEG for both looks; denoise is the point of that path.
+    model, scale = _MODEL_TABLES[fidelity][content_name][speed_name]
     if scale not in MODEL_NATIVE_SCALES.get(model, {scale}):
         raise ValueError(f"Preset {speed_name}/{content_name} uses non-native scale {scale} for {model}")
-    preset.update(model=model, scale=scale)
+    preset.update(model=model, scale=scale, fidelity=fidelity)
     if speed_name == "nvidia":
         preset["nvidia_vsr_mode"] = {
             "live": "auto-standard",

@@ -1,8 +1,25 @@
 # PixelForge quality benchmark
 
-PixelForge does not claim to beat Topaz Video globally. The v1.0.20 presets are instead gated by repeatable, category-specific tests using the exact same degraded input for every candidate.
+PixelForge does not claim to beat Topaz Video globally.
 
-## v1.0.20 representative-video run
+## Withdrawn: v1.0.20–v1.0.22 video numbers
+
+The table below is kept so the old claim can be audited. It is not evidence. Those runs reset presentation timestamps and then computed VMAF, SSIM, and PSNR without searching for a frame offset. A one-frame seek difference makes every score describe the wrong pair of pictures. Do not quote the table.
+
+## v1.0.23 gate
+
+`python tools/quality_gate.py` builds a synthetic low-resolution still, upscales it with Lanczos and with whichever bundled weights can execute, and writes `_benchmarks/quality-gate/GATE_RESULTS.json`.
+
+- Frames are aligned before scoring. The gate fails its own self-test if a two-frame shift is not recovered.
+- Metrics are PSNR, windowed SSIM, Tenengrad sharpness, and LPIPS when `lpips` and `torch` are installed. A missing LPIPS package is recorded as `not_installed`, not as a number.
+- The default Enhanced model must be sharper than Lanczos and must differ from it by a visible mean absolute error. Beating Lanczos on PSNR is reported per scene and is not assumed.
+- `quality-gate.cpu.done` means the CPU/NCNN still check passed. `quality-gate.done` is written only when a shipping Vulkan executable also ran.
+- `RUN_QUALITY_GATE.vbs` is what the owner runs on Windows. NVIDIA RTX VSR and libvmaf are listed under `owner_must_run` until that machine produces them.
+- Comparison crops for the site slider are regenerated with `python tools/generate_comparison_crops.py`. The manifest names the runtime that produced them.
+
+The in-app Watch Demo link is not produced by this gate.
+
+## v1.0.20 representative-video run (withdrawn)
 
 The release run used six short, lossless reference clips covering live-action faces and texture, animation faces and architecture, 30-to-60 FPS motion, and interlaced motion. Each degraded H.264 source was processed at the reference dimensions by every applicable PixelForge profile and a conventional FFmpeg baseline. Full-reference VMAF, SSIM, and PSNR were calculated across the entire output, and comparison sheets were reviewed for obvious artifacts.
 

@@ -48,10 +48,14 @@ class ProfilePresetTests(unittest.TestCase):
                     self.assertIn(preset["scale"], MODEL_NATIVE_SCALES[preset["model"]])
                     self.assertTrue(preset["auto_deinterlace"])
 
-    def test_balanced_natural_uses_benchmark_winning_realsr(self) -> None:
+    def test_enhanced_live_default_uses_realesrgan(self) -> None:
         preset = get_profile_preset("balanced", "live")
-        self.assertEqual(preset["model"], "realsr-df2k")
+        self.assertEqual(preset["fidelity"], "enhanced")
+        self.assertEqual(preset["model"], "realesrgan-x4plus")
         self.assertEqual(preset["scale"], 4)
+        faithful = get_profile_preset("balanced", "live", "faithful")
+        self.assertEqual(faithful["model"], "realsr-df2k")
+        self.assertEqual(faithful["fidelity"], "faithful")
         self.assertFalse(preset["enable_color"])
         self.assertFalse(preset["enable_sharpen"])
         self.assertFalse(preset["enable_interpolation"])
@@ -66,7 +70,7 @@ class ProfilePresetTests(unittest.TestCase):
     def test_animation_presets_use_modern_span_then_conservative_realcugan(self) -> None:
         for speed, model in (
             ("fast", "span-modern-animation-x2"),
-            ("balanced", "realcugan-se-x2-n1"),
+            ("balanced", "realcugan-se-x2-n0"),
             ("quality", "realcugan-se-x2-n0"),
         ):
             with self.subTest(speed=speed):

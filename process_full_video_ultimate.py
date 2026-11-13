@@ -217,6 +217,7 @@ if str(_APP_DIR) not in sys.path:
 from pixelforge.presets import (  # noqa: E402
     CONTENT_LABELS as PRESET_CONTENT_LABELS,
     CONTENT_PICKER_COPY,
+    FIDELITY_LABELS,
     MODEL_NATIVE_SCALES,
     SPEED_LABELS as PRESET_SPEED_LABELS,
     get_profile_preset,
@@ -230,6 +231,7 @@ from pixelforge.compare import (  # noqa: E402
 from pixelforge.billing_client import (  # noqa: E402
     DEFAULT_KNIGHT_API,
     PIXELFORGE_PACKS,
+    BillingUnreachable,
     KnightAccountClient,
 )
 from pixelforge.engines import (  # noqa: E402
@@ -242,7 +244,12 @@ from pixelforge.onnx_upscale import (  # noqa: E402
     MODEL_CATALOG as ONNX_MODEL_CATALOG,
     OnnxUpscaler,
 )
-from pixelforge.targets import OUTPUT_TARGETS, target_dimensions  # noqa: E402
+from pixelforge.targets import (  # noqa: E402
+    OUTPUT_TARGETS,
+    preview_delivery_size,
+    suggested_output_target,
+    target_dimensions,
+)
 from pixelforge.media import (  # noqa: E402
     VIDEO_CODEC_OPTIONS,
     available_ffmpeg_encoders,
@@ -284,7 +291,7 @@ RIFE_MODEL_OPTIONS   = [key for key, _label in RIFE_MODEL_DETAILS]
 RIFE_MODEL_KEY_TO_LABEL = {key: label for key, label in RIFE_MODEL_DETAILS}
 RIFE_MODEL_LABEL_TO_KEY = {label: key for key, label in RIFE_MODEL_DETAILS}
 TOKEN_PATTERN = re.compile(r"^(?:v11b[-_][A-Za-z0-9]{12,128}|v11b2\.[A-Za-z0-9_-]{10,600}\.[0-9a-f]{32})$")
-APP_VERSION = "1.0.22"
+APP_VERSION = "1.0.23"
 
 # ---------------------------------------------------------------------------
 # Legacy recovery token helpers (developer mode only)
@@ -3110,6 +3117,10 @@ class V11BApp(tk.Tk):
         self.upscaling_profile_buttons: dict[str, ttk.Button] = {}
         self.selected_speed_profile: str = "balanced"
         self.selected_upscaling_profile: str = "live"
+        self.selected_fidelity: str = "enhanced"
+        self._output_target_user_pinned = False
+        self._cached_billing_status: dict = {}
+        self._cached_billing_status_at: float = 0.0
 
         self.app_data_dir = _PERSISTENT_DATA_DIR
         self.nvidia_hardware: NvidiaHardware = detect_nvidia_hardware()
@@ -3365,6 +3376,7 @@ class V11BApp(tk.Tk):
         self.include_audio_var = tk.BooleanVar(value=True)
         self.keep_intermediate_var = tk.BooleanVar(value=False)
         self.output_target_var = tk.StringVar(value="Same resolution")
+        self.fidelity_var = tk.StringVar(value="Enhanced")
 
         self.estimate_var = tk.StringVar(value="Select input to calculate expected processing time.")
         self.estimate_summary_var = tk.StringVar(value="")
@@ -3895,7 +3907,7 @@ class V11BApp(tk.Tk):
             width=14,
         )
         target_picker.pack(side=LEFT)
-        target_picker.bind("<<ComboboxSelected>>", lambda _event: self._apply_output_target())
+        target_picker.bind("<<ComboboxSelected>>", lambda _event: self._pin_output_target())
         ttk.Label(delivery_row, text="Frame rate", width=10).pack(side=LEFT, padx=(12, 0))
         frame_rate_picker = ttk.Combobox(
             delivery_row,
@@ -3908,7 +3920,7 @@ class V11BApp(tk.Tk):
         frame_rate_picker.bind("<<ComboboxSelected>>", lambda _event: self._apply_frame_rate_target())
         ttk.Label(
             box,
-            text="Target size is automatic. Keep source motion or create 60 FPS with RIFE.",
+            text="Low-resolution sources open larger so recovered detail is kept. Same resolution scales the model back down. Keep source motion, or create 60 FPS with RIFE.",
             style="Hint.TLabel",
             wraplength=520,
             justify=LEFT,
@@ -3920,8 +3932,8 @@ class V11BApp(tk.Tk):
         ttk.Label(
             speed_box,
             text=(
-                "Balanced = best overall · Max Detail = highest fidelity / slowest · "
-                "Fast Preview = quickest test · NVIDIA RTX = fastest compatible SDR"
+                "Balanced is the default Enhanced model. Max Detail keeps that model and uses a slower, "
+                "higher-bitrate encode. Fast Preview is a quick test. NVIDIA RTX is the fastest compatible SDR path."
             ),
             style="Hint.TLabel",
             wraplength=520,
@@ -3973,6 +3985,27 @@ class V11BApp(tk.Tk):
         anime_btn.grid(row=0, column=1, sticky="ew", padx=4)
         restore_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
+        fidelity_row = ttk.Frame(content_box, style="Panel.TFrame")
+        fidelity_row.pack(fill=X, pady=(8, 0))
+        fidelity_row.columnconfigure(1, weight=1, uniform="fidelity")
+        fidelity_row.columnconfigure(2, weight=1, uniform="fidelity")
+        ttk.Label(fidelity_row, text="Look", width=10).grid(row=0, column=0, sticky="w")
+        enhanced_btn = ttk.Button(
+            fidelity_row, text="Enhanced", command=lambda: self._set_fidelity("enhanced"), style="Profile.TButton"
+        )
+        faithful_btn = ttk.Button(
+            fidelity_row, text="Faithful", command=lambda: self._set_fidelity("faithful"), style="Profile.TButton"
+        )
+        enhanced_btn.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        faithful_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ttk.Label(
+            content_box,
+            text="Enhanced is the default and keeps the full model output. Faithful switches camera footage to RealSR, which stays closer to a resize.",
+            style="Hint.TLabel",
+            wraplength=780,
+        ).pack(anchor=W, pady=(4, 0))
+        self.fidelity_buttons = {"enhanced": enhanced_btn, "faithful": faithful_btn}
+
         self.speed_profile_buttons = {
             "fast": fast_btn,
             "balanced": balanced_btn,
@@ -3988,6 +4021,7 @@ class V11BApp(tk.Tk):
         }
         self._set_selected_speed_profile("balanced", apply=False)
         self._set_selected_upscaling_profile("live", apply=False)
+        self._set_selected_button_group(self.fidelity_buttons, "enhanced")
         self._apply_combined_profile()
 
         ttk.Label(
@@ -5419,6 +5453,10 @@ class V11BApp(tk.Tk):
                 self.checkout_url_var.set(last_url)
             if recovery_email:
                 self.recovery_email_var.set(recovery_email)
+            cached_status = data.get("cached_status")
+            if isinstance(cached_status, dict):
+                self._cached_billing_status = cached_status
+                self._cached_billing_status_at = float(data.get("cached_status_at") or 0.0)
         except Exception:
             pass
 
@@ -5429,6 +5467,8 @@ class V11BApp(tk.Tk):
             "last_session_id": self.checkout_session_var.get().strip(),
             "last_checkout_url": self.checkout_url_var.get().strip(),
             "recovery_email": self.recovery_email_var.get().strip(),
+            "cached_status": self._cached_billing_status,
+            "cached_status_at": self._cached_billing_status_at,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
         self.billing_state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -5450,14 +5490,53 @@ class V11BApp(tk.Tk):
             if self._use_embedded_billing():
                 self._ensure_free_trial_for_token(token)
             status = self.billing_backend.get_status(token)
-            self._apply_billing_status(status, token)
+            self._apply_billing_status(status, token, remember=True)
         except Exception as exc:
             self.available_credits_var.set("--")
             self._set_header_registration_state(False)
             if not silent:
                 self.billing_status_var.set(f"Billing status check failed: {exc}")
 
-    def _apply_billing_status(self, status: dict, token: str = "") -> None:
+    def _remember_billing_status(self, status: dict) -> None:
+        if not isinstance(status, dict):
+            return
+        self._cached_billing_status = {
+            "ok": True,
+            "credits": int(status.get("credits", 0) or 0),
+            "paid_credits": int(status.get("paid_credits", 0) or 0),
+            "free_trial_remaining": int(status.get("free_trial_remaining", 0) or 0),
+            "pro_active": bool(status.get("pro_active", False) or status.get("unlimited", False)),
+            "email_linked": bool(status.get("email_linked", False)),
+            "linked_email": str(status.get("linked_email") or ""),
+            "plans": status.get("plans") if isinstance(status.get("plans"), list) else [],
+        }
+        self._cached_billing_status_at = time.time()
+        try:
+            self._save_billing_state()
+        except Exception:
+            pass
+
+    def _offline_pro_grace_active(self) -> bool:
+        status = self._cached_billing_status or {}
+        if not status.get("pro_active"):
+            return False
+        age = time.time() - float(self._cached_billing_status_at or 0.0)
+        return 0 <= age <= 7 * 24 * 60 * 60
+
+    def _show_unreachable_billing(self, exc: Exception) -> None:
+        cached = self._cached_billing_status
+        if cached:
+            self._apply_billing_status(cached, self.billing_token_var.get().strip(), remember=False)
+            self.billing_status_var.set(
+                "Billing server unreachable. Showing the last saved balance. No new credits were added."
+            )
+        else:
+            self.available_credits_var.set("--")
+            self._set_header_registration_state(False)
+            self.billing_status_var.set("Billing server unreachable. No credits were changed.")
+        self.log_queue.put(f"[WARN] {exc}")
+
+    def _apply_billing_status(self, status: dict, token: str = "", remember: bool = True) -> None:
         credits = int(status.get("credits", 0) or 0)
         paid = int(status.get("paid_credits", 0) or 0)
         trial = int(status.get("free_trial_remaining", 0) or 0)
@@ -5478,6 +5557,8 @@ class V11BApp(tk.Tk):
             self.billing_status_var.set(
                 f"Billing: {credits} credits available ({paid} purchased + {trial} trial)."
             )
+        if remember and not self._use_embedded_billing():
+            self._remember_billing_status(status)
 
     def _refresh_billing_status_async(self) -> None:
         if self._use_embedded_billing():
@@ -5489,6 +5570,8 @@ class V11BApp(tk.Tk):
             try:
                 status = self.billing_backend.get_status(token)
                 self.after(0, lambda: self._apply_billing_status(status, token))
+            except BillingUnreachable as exc:
+                self.after(0, lambda exc=exc: self._show_unreachable_billing(exc))
             except Exception as exc:
                 self.log_queue.put(f"[WARN] Billing status unavailable: {exc}")
                 self.after(0, lambda: self.available_credits_var.set("--"))
@@ -6610,6 +6693,15 @@ class V11BApp(tk.Tk):
             )
             checkout_url = str(data.get("url", "")).strip()
             session_id = str(data.get("session_id", "")).strip()
+        except BillingUnreachable as exc:
+            err = "The license server could not be reached. No purchase was started and no card was charged."
+            self.billing_status_var.set(err)
+            self.log_queue.put(f"[WARN] {exc}")
+            self.checkout_amount_cents_override = None
+            self.checkout_package_name_override = ""
+            server.stop()
+            self._payment_result_server = None
+            return False
         except Exception as exc:
             err = str(exc)
             self.billing_status_var.set(f"Checkout failed: {err}")
@@ -6980,10 +7072,23 @@ class V11BApp(tk.Tk):
         if apply:
             self._apply_combined_profile()
 
+    def _set_fidelity(self, fidelity: str) -> None:
+        if fidelity not in {"enhanced", "faithful"}:
+            raise ValueError(fidelity)
+        self._clear_advanced_overrides_for_profile_selection()
+        self.selected_fidelity = fidelity
+        self.fidelity_var.set(FIDELITY_LABELS[fidelity])
+        self._set_selected_button_group(self.fidelity_buttons, fidelity)
+        self._apply_combined_profile()
+
+    def _pin_output_target(self) -> None:
+        self._output_target_user_pinned = True
+        self._apply_output_target()
+
     def _apply_combined_profile(self) -> None:
         speed_name = self.selected_speed_profile
         upscaling_name = self.selected_upscaling_profile
-        preset = get_profile_preset(speed_name, upscaling_name)
+        preset = get_profile_preset(speed_name, upscaling_name, self.selected_fidelity)
         variable_map = {
             "model": self.model_var,
             "scale": self.scale_var,
@@ -7149,6 +7254,31 @@ class V11BApp(tk.Tk):
             except Exception:
                 pass
         self.preview_status_var.set("Canceling preview…")
+
+    def _preview_post_filter(
+        self,
+        settings: PipelineSettings,
+        crop_size: tuple[int, int],
+        source_size: tuple[int, int],
+    ) -> str | None:
+        """Sharpen and scale a preview crop by the delivered enlargement, not the full-frame size."""
+        filters: list[str] = []
+        if settings.enable_sharpen:
+            filters.append(f"cas={settings.cas_strength}")
+            filters.append(f"unsharp=5:5:{settings.unsharp1}:5:5:0.0")
+            filters.append(f"unsharp=7:7:{settings.unsharp2}:7:7:0.0")
+        delivered = preview_delivery_size(
+            crop_size[0],
+            crop_size[1],
+            source_size[0],
+            source_size[1],
+            settings.target_width,
+            settings.target_height,
+            settings.apply_final_scale,
+        )
+        if delivered is not None:
+            filters.append(f"scale={delivered[0]}:{delivered[1]}:flags=lanczos")
+        return ",".join(filters) if filters else None
 
     def _preview_crop_changed(self) -> None:
         self._invalidate_compare_cache()
@@ -7459,6 +7589,10 @@ class V11BApp(tk.Tk):
                 height = int(PipelineRunner._ffprobe_value(Path(candidate), "height") or 0)
             except Exception:
                 return
+        if not self._output_target_user_pinned:
+            suggested = suggested_output_target(width, height)
+            if suggested != self.output_target_var.get():
+                self.output_target_var.set(suggested)
         try:
             target_width, target_height = target_dimensions(width, height, self.output_target_var.get())
         except ValueError:
@@ -7491,7 +7625,7 @@ class V11BApp(tk.Tk):
             output_dims = target_label
         interp = "60 FPS (RIFE)" if self.enable_interpolation_var.get() and self.target_fps_var.get() == 60 else "source FPS"
         self.profile_summary_var.set(
-            f"Active: {speed_label} · {upscaling_label} · {model_label.split('(')[0].strip()} · "
+            f"Active: {FIDELITY_LABELS.get(self.selected_fidelity, self.selected_fidelity)} · {speed_label} · {upscaling_label} · {model_label.split('(')[0].strip()} · "
             f"{output_dims} · {interp}"
         )
         guidance = {
@@ -7499,12 +7633,20 @@ class V11BApp(tk.Tk):
             "animation": "For animation, line art, anime, and game captures.",
             "restore": "For compressed, noisy, blocky, or older footage.",
         }.get(self.selected_upscaling_profile, "")
-        speed_guidance = {
-            "fast": "Favors speed for testing.",
-            "balanced": "Safest first full run.",
-            "quality": "Strongest model stack; substantially slower.",
-            "nvidia": "Fastest compatible SDR path; Max Detail is the highest-fidelity path.",
-        }.get(self.selected_speed_profile, "")
+        if self.selected_fidelity == "faithful":
+            speed_guidance = {
+                "fast": "Quick test on the fast DirectML model.",
+                "balanced": "Faithful keeps the previous RealSR look, which stays closer to a resize.",
+                "quality": "Faithful RealSR with a slower, higher-bitrate encode.",
+                "nvidia": "Fastest compatible SDR path when the RTX pack is installed.",
+            }.get(self.selected_speed_profile, "")
+        else:
+            speed_guidance = {
+                "fast": "Quick test on the fast DirectML model.",
+                "balanced": "Enhanced keeps the full Real-ESRGAN output.",
+                "quality": "Same Enhanced model with a slower, higher-bitrate encode.",
+                "nvidia": "Fastest compatible SDR path when the RTX pack is installed.",
+            }.get(self.selected_speed_profile, "")
         self.profile_guidance_var.set(f"{guidance} {speed_guidance}".strip())
 
     def _sync_rife_model_from_display(self) -> None:
@@ -7949,6 +8091,8 @@ class V11BApp(tk.Tk):
                 full_source = full_source.convert("RGB")
                 crop_box = self._preview_crop_box(full_source, center=crop_center, crop_mode=crop_mode)
                 full_source.crop(crop_box).save(before_frame, format="PNG", compress_level=1)
+                preview_source_size = full_source.size
+                preview_crop_size = (crop_box[2] - crop_box[0], crop_box[3] - crop_box[1])
             self.after(0, lambda: self.preview_progress_var.set(52.0))
             self.after(0, lambda: self.preview_status_var.set(f"Running {exe_label} on the selected crop…"))
             self.log_queue.put(
@@ -7999,7 +8143,7 @@ class V11BApp(tk.Tk):
                 self._run_preview_command(upscale_cmd, cancel_event)
                 self.after(0, lambda: self.preview_progress_var.set(90.0))
 
-            post_filter = PipelineRunner(settings, self.log_queue, self.stop_event)._build_post_filter()
+            post_filter = self._preview_post_filter(settings, preview_crop_size, preview_source_size)
             if post_filter:
                 post_cmd = [
                     "ffmpeg",
@@ -8766,13 +8910,13 @@ class V11BApp(tk.Tk):
             "Set up the verified NVIDIA RTX engine automatically now?\n\n"
             "Download: about 585 MB · Installed: about 1 GB\n"
             "NVIDIA RTX is the fastest option for compatible SDR video.\n"
-            "Balanced remains the best overall default; Max Detail is the highest-fidelity, slowest path.\n\n"
+            "Enhanced stays the default look. Max Detail uses that model with a slower encode.\n\n"
             "HDR/10-bit sources continue to use PixelForge's precision-safe DirectML path.",
             parent=self,
         )
         if not confirmed:
             self._write_nvidia_auto_setup_marker("declined")
-            self.profile_guidance_var.set("RTX setup skipped. Balanced remains the best overall default.")
+            self.profile_guidance_var.set("RTX setup skipped. Enhanced remains the default look.")
             return
         self._nvidia_auto_install_active = True
         self._install_nvidia_pack_async(confirm_install=False)
@@ -8788,8 +8932,8 @@ class V11BApp(tk.Tk):
                 "Download: about 585 MB\n"
                 "Installed size: about 1 GB\n"
                 f"Detected: {self.nvidia_hardware.name} ({self.nvidia_hardware.vram_mb // 1024} GB VRAM)\n\n"
-                "NVIDIA RTX is the fastest compatible SDR path. Balanced remains the best overall default, "
-                "and Max Detail is the highest-fidelity / slowest path. HDR/10-bit sources continue to use "
+                "NVIDIA RTX is the fastest compatible SDR path. Enhanced remains the default look, "
+                "and Max Detail uses that model with a slower encode. HDR/10-bit sources continue to use "
                 "PixelForge's precision-safe DirectML path.",
                 parent=self,
             )
@@ -8862,7 +9006,7 @@ class V11BApp(tk.Tk):
             button.configure(text="NVIDIA RTX", state=tk.NORMAL)
             self.speed_profile_buttons["nvidia"] = button
         self._write_nvidia_auto_setup_marker("installed")
-        self.profile_guidance_var.set("NVIDIA RTX verified: fastest SDR path. Max Detail remains the highest-fidelity path.")
+        self.profile_guidance_var.set("NVIDIA RTX verified: fastest SDR path. Enhanced remains the default look.")
         if not automatic:
             messagebox.showinfo("NVIDIA RTX ready", "The NVIDIA RTX engine passed its GPU inference check and is ready.")
         self._set_selected_speed_profile("nvidia")
@@ -8924,6 +9068,7 @@ class V11BApp(tk.Tk):
 
         render_metadata = {
             "profile": self.selected_speed_profile,
+            "fidelity": self.selected_fidelity,
             "content_type": self.selected_upscaling_profile,
             "model": settings.model,
             "scale": settings.scale,
@@ -8934,6 +9079,25 @@ class V11BApp(tk.Tk):
         }
         try:
             reservation = self.billing_backend.reserve_credits(token, required_credits, render_metadata)
+        except BillingUnreachable as exc:
+            if self._offline_pro_grace_active():
+                reservation = {
+                    "ok": True,
+                    "reservation_id": f"offline-grace-{uuid.uuid4().hex}",
+                    "credits": int(self._cached_billing_status.get("credits", 0) or 0),
+                    "offline_grace": True,
+                }
+                self.log_queue.put(
+                    "[WARN] License server unreachable. Using the cached Pro entitlement for this run. No new charge was created."
+                )
+            else:
+                messagebox.showerror(
+                    "Billing Unavailable",
+                    "The license server could not be reached, so this render did not start.\n\n"
+                    "No credits were charged. Check the connection and try again.",
+                )
+                self.log_queue.put(f"[WARN] {exc}")
+                return
         except Exception as exc:
             messagebox.showerror(
                 "Billing Unavailable",
@@ -8968,12 +9132,18 @@ class V11BApp(tk.Tk):
         self._reset_progress_state()
         self.credit_quote_var.set(f"Render cost locked: {required_credits} credit(s). Basis: {breakdown}.")
         self.start_button_credit_var.set(f"({required_credits} credits)")
-        self.billing_status_var.set(
-            f"Billing: {required_credits} credits reserved. They are returned automatically if the render fails or is cancelled. Available balance: {remaining}."
-        )
-        self.log_queue.put(
-            f"[INFO] Securely reserved {required_credits} credits for this run ({reservation_id})."
-        )
+        if reservation.get("offline_grace"):
+            self.billing_status_var.set(
+                "Billing server unreachable. Cached Pro entitlement is being used. This run will not be charged."
+            )
+            self.log_queue.put("[WARN] Offline Pro grace is active. Nothing was reserved on the server.")
+        else:
+            self.billing_status_var.set(
+                f"Billing: {required_credits} credits reserved. They are returned automatically if the render fails or is cancelled. Available balance: {remaining}."
+            )
+            self.log_queue.put(
+                f"[INFO] Securely reserved {required_credits} credits for this run ({reservation_id})."
+            )
         self._record_telemetry_event_async("render_reserved", {**render_metadata, "reservation_id": reservation_id})
 
         self.stop_event.clear()
@@ -9005,7 +9175,17 @@ class V11BApp(tk.Tk):
                 and output_path.exists()
                 and output_path.is_file()
             )
-            if was_canceled:
+            if str(self._active_reservation_id or "").startswith("offline-grace-"):
+                self.log_queue.put(
+                    "[WARN] License server was unreachable. This run used the cached Pro entitlement and was not charged."
+                )
+                self.after(
+                    0,
+                    lambda: self.billing_status_var.set(
+                        "Billing server unreachable. Cached Pro entitlement was used. No credits were charged."
+                    ),
+                )
+            elif was_canceled:
                 release = self.billing_backend.release_reservation(
                     self._charged_token or "", self._active_reservation_id
                 )

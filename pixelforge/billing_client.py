@@ -24,6 +24,15 @@ PIXELFORGE_PACKS = {
 # Server checkout is authoritative. This floor is used only to format local
 # fallback estimates when the plan catalog has not loaded yet.
 PRICE_PER_CREDIT_CENTS_FLOOR = 27
+UNREACHABLE_MESSAGE = "Knight Account billing is unreachable. Credits were not changed."
+
+
+class BillingUnreachable(RuntimeError):
+    """The license server did not answer. No credit balance was changed."""
+
+    def __init__(self, message: str = UNREACHABLE_MESSAGE, payload: dict | None = None):
+        super().__init__(message)
+        self.payload = payload or {"ok": False, "reachable": False, "error": message}
 
 
 def is_loopback_url(url: str) -> bool:
@@ -88,6 +97,13 @@ class KnightAccountClient:
                 data = {"ok": False, "error": f"Billing server returned HTTP {exc.code}."}
             data.setdefault("ok", False)
             data["http_status"] = int(exc.code)
+            if int(exc.code) in {502, 503, 504} or data.get("fail_open"):
+                data["reachable"] = False
+                data["ok"] = False
+                data.setdefault("error", UNREACHABLE_MESSAGE)
+                if allow_error:
+                    return data
+                raise BillingUnreachable(str(data.get("error") or UNREACHABLE_MESSAGE), data) from exc
             if allow_error:
                 return data
             raise RuntimeError(
@@ -98,7 +114,15 @@ class KnightAccountClient:
                 )
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"Could not reach Knight Account billing: {exc}") from exc
+            payload = {
+                "ok": False,
+                "reachable": False,
+                "error": UNREACHABLE_MESSAGE,
+                "detail": str(exc),
+            }
+            if allow_error:
+                return payload
+            raise BillingUnreachable(UNREACHABLE_MESSAGE, payload) from exc
         if not isinstance(data, dict):
             raise RuntimeError("Knight Account billing returned an invalid response.")
         if not data.get("ok", False) and not allow_error:

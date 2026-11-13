@@ -2,6 +2,7 @@
 
 from .presets import (
     CONTENT_LABELS,
+    FIDELITY_LABELS,
     MODEL_NATIVE_SCALES,
     SPEED_LABELS,
     get_profile_preset,
@@ -10,6 +11,7 @@ from .quality import QualityAssessment, assess_quality, output_enlargement_facto
 
 __all__ = [
     "CONTENT_LABELS",
+    "FIDELITY_LABELS",
     "MODEL_NATIVE_SCALES",
     "SPEED_LABELS",
     "get_profile_preset",

@@ -1,5 +1,5 @@
 param(
-  [string]$AppVersion = "1.0.22"
+  [string]$AppVersion = "1.0.23"
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,7 +7,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 if ($AppVersion -notmatch '^\d+\.\d+\.\d+$') {
-  throw "AppVersion must use semantic form such as 1.0.22"
+  throw "AppVersion must use semantic form such as 1.0.23"
 }
 
 $appReleaseDir = Join-Path $root "release\v$AppVersion"
@@ -39,8 +39,8 @@ PixelForge AI NVIDIA RTX Edition $AppVersion
 
 Extract the complete folder and run PixelForge-AI.exe. PixelForge detects the
 bundled NVIDIA engine automatically on compatible RTX/Tensor Core hardware.
-Balanced remains the best overall default. Choose NVIDIA RTX for the fastest
-compatible SDR path, or Max Detail for the highest-fidelity / slowest path.
+Enhanced is the default look. Choose NVIDIA RTX for the fastest compatible
+SDR path, or Max Detail for the same Enhanced model with a slower encode.
 "@ -Encoding utf8
 
 $nvidiaEditionZip = Join-Path $appReleaseDir "PixelForge-AI-NVIDIA_${AppVersion}_windows_x64.zip"
