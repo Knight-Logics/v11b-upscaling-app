@@ -65,7 +65,7 @@
           "engine": "span-photo-x4",
           "kind": "onnx-cpu",
           "role": "fast-preview",
-          "seconds": 0.248,
+          "seconds": 0.252,
           "same_resolution_roundtrip": {
             "mean_abs_diff_vs_input": 5.2656,
             "psnr_vs_input": 30.9318,
@@ -90,7 +90,7 @@
           "engine": "realesrgan-x4plus",
           "kind": "ncnn-python-cpu",
           "role": "default-enhanced",
-          "seconds": 1.142,
+          "seconds": 1.179,
           "same_resolution_roundtrip": {
             "mean_abs_diff_vs_input": 10.8418,
             "psnr_vs_input": 24.5139,
@@ -115,7 +115,7 @@
           "engine": "realsr-df2k",
           "kind": "ncnn-python-cpu",
           "role": "faithful",
-          "seconds": 1.015,
+          "seconds": 1.002,
           "same_resolution_roundtrip": {
             "mean_abs_diff_vs_input": 3.1889,
             "psnr_vs_input": 35.3526,
@@ -158,7 +158,7 @@
           "engine": "span-photo-x4",
           "kind": "onnx-cpu",
           "role": "fast-preview",
-          "seconds": 0.264,
+          "seconds": 0.275,
           "same_resolution_roundtrip": {
             "mean_abs_diff_vs_input": 2.9837,
             "psnr_vs_input": 37.0424,
@@ -183,7 +183,7 @@
           "engine": "realesrgan-x4plus",
           "kind": "ncnn-python-cpu",
           "role": "default-enhanced",
-          "seconds": 1.084,
+          "seconds": 1.111,
           "same_resolution_roundtrip": {
             "mean_abs_diff_vs_input": 4.4078,
             "psnr_vs_input": 31.9015,
@@ -208,7 +208,7 @@
           "engine": "realsr-df2k",
           "kind": "ncnn-python-cpu",
           "role": "faithful",
-          "seconds": 1.1,
+          "seconds": 0.993,
           "same_resolution_roundtrip": {
             "mean_abs_diff_vs_input": 1.2042,
             "psnr_vs_input": 43.7455,
@@ -227,5 +227,5 @@
     "ffmpeg built with libvmaf, if a VMAF number is required. This gate does not emit VMAF."
   ],
   "withdrawn_history": "v1.0.20 through v1.0.22 representative-video VMAF/SSIM/PSNR numbers are withdrawn. They were computed without a frame-offset search.",
-  "seconds": 5.529
+  "seconds": 5.486
 }

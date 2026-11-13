@@ -112,7 +112,7 @@ def main() -> None:
 
         output_dir = ROOT / "artifacts" / "ui-audit"
         output_dir.mkdir(parents=True, exist_ok=True)
-        screenshot = output_dir / "pixelforge-v1.0.21-loaded-layout.png"
+        screenshot = output_dir / "pixelforge-v1.0.23-loaded-layout.png"
         result = {
             "passed": all(checks.values()),
             "checks": checks,

@@ -9,7 +9,7 @@ The previous default was Balanced + People/camera on RealSR DF2K, with output si
 v1.0.23 changes two defaults:
 
 - Enhanced (the new default) uses Real-ESRGAN x4plus for camera footage and keeps the full network output. Faithful keeps RealSR DF2K.
-- A low-resolution source now opens at a larger delivery size (about 2x, capped at 4K). Same resolution is still in the output-size list.
+- A low-resolution source now opens at a larger delivery size. The automatic choice is the smallest standard size that enlarges by at least 1.8x, and it never goes past 4K. A tiny frame, including 360p and smaller, uses 1080p instead of falling back to Same resolution. A 4K or larger landscape source stays at its own size. Same resolution remains an explicit choice and is the one path that scales the model back to the source.
 
 Fast Preview still uses SPAN Photo. Anime Enhanced turns Real-CUGAN denoise off; Faithful keeps mild denoise. Old/noisy is unchanged. Max Detail uses the Enhanced model with a slower, higher-bitrate encode. It is not a different model, and it is not described as a measured fidelity winner.
 
@@ -24,7 +24,11 @@ Real-ESRGAN x4plus, via the NCNN Python package on CPU using the bundled `models
 | Synthetic detail | 4.63× | 14.84 | 14.71 / 14.37 | 0.559 / 0.455 |
 | Product-still crop | 1.31× | 4.52 | 28.47 / 27.90 | 0.842 / 0.837 |
 
-Those two stills are the whole measured set. The text crop is sharper than Lanczos and also shows doubled letter strokes. That crop is in `assets/comparisons/`. It is not a claim that text is reconstructed correctly, and it is not a video result.
+Those two stills are the whole measured set. A second CPU gate run after the delivery-plan fix reproduced the same four numbers for Real-ESRGAN on the synthetic still (4.63×, 14.84, 14.71, 0.559) and on the product-still crop (1.31×, 4.52, 28.47, 0.842).
+
+The doubled letter strokes are a Real-ESRGAN x4plus behavior, not a second sharpen pass and not a tile seam. Enhanced leaves sharpening off. The crop script runs the full frame through the NCNN weights, so there is no tile overlap. SPAN tiles of 64 and 1024 disagree by at most 1 level. On one text row, the ground truth has 32 rising edges, Lanczos has 4 or 5, and Real-ESRGAN has 38 without JPEG and 40 with JPEG quality 40. That extra edge response is why the letters look double. Removing it would mean blending back toward Lanczos, which is the bug this release is fixing, so it is left as a model limit. The crop is in `assets/comparisons/`. It is not a claim that text is reconstructed correctly, and it is not a video result.
+
+Stills with EXIF orientation are transposed before the model runs, and a PNG alpha channel is resized to the delivered frame and put back. Video keeps using FFmpeg's display size, including a 90-degree rotation, so the raw-frame plan matches the decoded picture.
 
 ## Withdrawn video numbers
 

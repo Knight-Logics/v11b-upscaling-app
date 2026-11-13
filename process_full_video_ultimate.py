@@ -246,9 +246,9 @@ from pixelforge.onnx_upscale import (  # noqa: E402
 )
 from pixelforge.targets import (  # noqa: E402
     OUTPUT_TARGETS,
+    final_scale_filter,
+    plan_delivery,
     preview_delivery_size,
-    suggested_output_target,
-    target_dimensions,
 )
 from pixelforge.media import (  # noqa: E402
     VIDEO_CODEC_OPTIONS,
@@ -1608,15 +1608,21 @@ class PipelineRunner:
             filters.append(f"unsharp=5:5:{self.settings.unsharp1}:5:5:0.0")
             filters.append(f"unsharp=7:7:{self.settings.unsharp2}:7:7:0.0")
         if self.settings.apply_final_scale:
-            w = self.settings.target_width
-            h = self.settings.target_height
-            if self.settings.preserve_aspect_ratio:
-                filters.append(
-                    f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
-                    f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
-                )
-            else:
-                filters.append(f"scale={w}:{h}:flags=lanczos")
+            # The target box was already resolved by plan_delivery. Same resolution,
+            # a named preset, and a frame batch all share this one scale string.
+            resolved = plan_delivery(
+                max(1, int(self.settings.target_width)),
+                max(1, int(self.settings.target_height)),
+                1,
+                target_name="Same resolution",
+                apply_final_scale=True,
+            )
+            scale_filter = final_scale_filter(
+                resolved,
+                preserve_aspect_ratio=self.settings.preserve_aspect_ratio,
+            )
+            if scale_filter:
+                filters.append(scale_filter)
         return ",".join(filters) if filters else None
 
     def _trim_input_args(self) -> list[str]:
@@ -2373,6 +2379,15 @@ class PipelineRunner:
         input_path = self.settings.input_video
         output_path = self.settings.output_video
         model_key = self.settings.model
+        alpha_plane = None
+        if self.is_image_input(input_path) and PIL_AVAILABLE:
+            from pixelforge.image_io import prepare_still
+
+            still_dir = Path(tempfile.gettempdir()) / "pixelforge_stills"
+            prepared_path, alpha_plane = prepare_still(input_path, still_dir / f"{input_path.stem}-upright.png")
+            if prepared_path != input_path:
+                self.log(f"[INFO] Still prepared upright RGB at {prepared_path.name} before upscale.")
+            input_path = prepared_path
 
         # Determine which binary family handles this model
         uses_onnx = model_key in ONNX_MODEL_CATALOG
@@ -2789,6 +2804,11 @@ class PipelineRunner:
             self._set_stage_progress(4, 1.0, stage_name="image export")
             self._set_stage_progress(5, 1.0, stage_name="interpolation (skipped)")
             self._export_single_frame_output(source_frame_dir, output_path)
+            if alpha_plane is not None:
+                from pixelforge.image_io import attach_alpha
+
+                attach_alpha(output_path, alpha_plane, output_path)
+                self.log("[INFO] Source alpha resized to the delivered frame and restored.")
             if not self.settings.keep_intermediate:
                 self.log("Cleaning intermediate work folder...")
                 for child in work_dir.rglob("*"):
@@ -7568,8 +7588,13 @@ class V11BApp(tk.Tk):
         if not path.exists():
             return
         try:
-            width = int(PipelineRunner._ffprobe_value(path, "width") or 0)
-            height = int(PipelineRunner._ffprobe_value(path, "height") or 0)
+            if PipelineRunner.is_image_input(path) and PIL_AVAILABLE:
+                from pixelforge.image_io import still_display_size
+
+                width, height = still_display_size(path)
+            else:
+                probed = probe_media(path)
+                width, height = probed.width, probed.height
         except Exception:
             return
         if width <= 0 or height <= 0:
@@ -7589,16 +7614,21 @@ class V11BApp(tk.Tk):
                 height = int(PipelineRunner._ffprobe_value(Path(candidate), "height") or 0)
             except Exception:
                 return
-        if not self._output_target_user_pinned:
-            suggested = suggested_output_target(width, height)
-            if suggested != self.output_target_var.get():
-                self.output_target_var.set(suggested)
+        chosen_name = None if not self._output_target_user_pinned else self.output_target_var.get()
         try:
-            target_width, target_height = target_dimensions(width, height, self.output_target_var.get())
+            plan = plan_delivery(
+                width,
+                height,
+                max(1, int(self.scale_var.get() or 1)),
+                target_name=chosen_name,
+                apply_final_scale=True,
+            )
         except ValueError:
             return
-        self.target_width_var.set(target_width)
-        self.target_height_var.set(target_height)
+        if plan.target_name != self.output_target_var.get():
+            self.output_target_var.set(plan.target_name)
+        self.target_width_var.set(plan.output_width)
+        self.target_height_var.set(plan.output_height)
         self.apply_final_scale_var.set(True)
         self.preserve_aspect_ratio_var.set(False)
         self._update_profile_summary()

@@ -141,9 +141,9 @@ def _image(args: argparse.Namespace) -> None:
     if not quality_member:
         raise ValueError(f"Unknown NVIDIA quality mode: {args.quality}")
     with Image.open(args.input_image) as source_image:
-        source_image = source_image.convert("RGB")
-        width, height = source_image.size
-        host = np.asarray(source_image, dtype=np.uint8)
+        rgb = source_image.convert("RGB")
+        width, height = rgb.size
+        host = np.asarray(rgb, dtype=np.uint8)
     output_width = int(args.output_width or width * 2)
     output_height = int(args.output_height or height * 2)
     normalized = np.ascontiguousarray(host.transpose(2, 0, 1), dtype=np.float32) / 255.0

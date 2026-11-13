@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
-from unittest import mock
 
 from pixelforge.media import MediaProperties, deinterlace_filter, estimate_workspace_bytes, video_encode_args
 from pixelforge.onnx_upscale import MODEL_CATALOG, OnnxUpscaler

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pixelforge.metrics import mean_abs_diff, psnr, score_pair, tenengrad
+from pixelforge.metrics import mean_abs_diff, score_pair, tenengrad
 from pixelforge.ncnn_infer import upscale_rgb
 from pixelforge.presets import get_profile_preset
 from pixelforge.reference_scenes import degrade, lanczos_upscale, make_detail_scene
